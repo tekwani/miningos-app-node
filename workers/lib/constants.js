@@ -110,6 +110,27 @@ const ENDPOINTS = {
   // WebSocket endpoint
   WEBSOCKET: '/ws',
 
+  // Finance endpoints
+  FINANCE_ENERGY_BALANCE: '/auth/finance/energy-balance',
+  FINANCE_EBITDA: '/auth/finance/ebitda',
+  FINANCE_COST_SUMMARY: '/auth/finance/cost-summary',
+
+  // Pools endpoints
+  POOLS: '/auth/pools',
+  POOLS_BALANCE_HISTORY: '/auth/pools/:pool/balance-history',
+
+  // Pool stats endpoints
+  POOL_STATS_AGGREGATE: '/auth/pool-stats/aggregate',
+
+  // Pool Manager endpoints
+  POOL_MANAGER_STATS: '/auth/pool-manager/stats',
+  POOL_MANAGER_POOLS: '/auth/pool-manager/pools',
+  POOL_MANAGER_MINERS: '/auth/pool-manager/miners',
+  POOL_MANAGER_UNITS: '/auth/pool-manager/units',
+  POOL_MANAGER_ALERTS: '/auth/pool-manager/alerts',
+  POOL_MANAGER_ASSIGN: '/auth/pool-manager/miners/assign',
+  POOL_MANAGER_POWER_MODE: '/auth/pool-manager/miners/power-mode',
+
   SITE_STATUS_LIVE: '/auth/site/status/live'
 }
 
@@ -155,8 +176,96 @@ const STATUS_CODES = {
   INTERNAL_SERVER_ERROR: 500
 }
 
+const LIST_THINGS = 'listThings'
+const APPLY_THINGS = 'applyThings'
+const GET_HISTORICAL_LOGS = 'getHistoricalLogs'
+
+const RPC_METHODS = {
+  TAIL_LOG_RANGE_AGGR: 'tailLogCustomRangeAggr',
+  GET_WRK_EXT_DATA: 'getWrkExtData',
+  LIST_THINGS: 'listThings',
+  TAIL_LOG: 'tailLog',
+  GLOBAL_CONFIG: 'getGlobalConfig'
+}
+
+const WORKER_TYPES = {
+  MINER: 'miner',
+  CONTAINER: 'container',
+  POWERMETER: 'powermeter',
+  MINERPOOL: 'minerpool',
+  MEMPOOL: 'mempool',
+  ELECTRICITY: 'electricity'
+}
+
+const CACHE_KEYS = {
+  POOL_MANAGER_STATS: 'pool-manager/stats',
+  POOL_MANAGER_POOLS: 'pool-manager/pools',
+  POOL_MANAGER_MINERS: 'pool-manager/miners',
+  POOL_MANAGER_UNITS: 'pool-manager/units',
+  POOL_MANAGER_ALERTS: 'pool-manager/alerts'
+}
+
+const POOL_ALERT_TYPES = [
+  'all_pools_dead',
+  'wrong_miner_pool',
+  'wrong_miner_subaccount',
+  'wrong_worker_name',
+  'ip_worker_name'
+]
+
+const MINER_POOL_STATUS = {
+  ONLINE: 'online',
+  OFFLINE: 'offline',
+  INACTIVE: 'inactive'
+}
+
+const POWER_MODES = {
+  LOW: 'low',
+  NORMAL: 'normal',
+  HIGH: 'high',
+  SLEEP: 'sleep'
+}
+
+const AGGR_FIELDS = {
+  HASHRATE_SUM: 'hashrate_mhs_5m_sum_aggr',
+  SITE_POWER: 'site_power_w',
+  ENERGY_AGGR: 'energy_aggr',
+  ACTIVE_ENERGY_IN: 'active_energy_in_aggr',
+  UTE_ENERGY: 'ute_energy_aggr'
+}
+
+const PERIOD_TYPES = {
+  DAILY: 'daily',
+  WEEKLY: 'weekly',
+  MONTHLY: 'monthly',
+  YEARLY: 'yearly'
+}
+
+const MINERPOOL_EXT_DATA_KEYS = {
+  TRANSACTIONS: 'transactions',
+  STATS: 'stats'
+}
+
+const NON_METRIC_KEYS = [
+  'ts',
+  'site',
+  'year',
+  'monthName',
+  'month',
+  'period'
+]
+
+const BTC_SATS = 100000000
+
+const RANGE_BUCKETS = {
+  '1D': 86400000,
+  '1W': 604800000,
+  '1M': 2592000000
+}
+
 const RPC_TIMEOUT = 15000
 const RPC_CONCURRENCY_LIMIT = 2
+const RPC_PAGE_LIMIT = 100
 
 module.exports = {
   SUPER_ADMIN_ROLE,
@@ -174,5 +283,21 @@ module.exports = {
   STATUS_CODES,
   RPC_TIMEOUT,
   RPC_CONCURRENCY_LIMIT,
-  USER_SETTINGS_TYPE
+  RPC_PAGE_LIMIT,
+  USER_SETTINGS_TYPE,
+  LIST_THINGS,
+  APPLY_THINGS,
+  GET_HISTORICAL_LOGS,
+  RPC_METHODS,
+  WORKER_TYPES,
+  CACHE_KEYS,
+  POOL_ALERT_TYPES,
+  MINER_POOL_STATUS,
+  POWER_MODES,
+  AGGR_FIELDS,
+  PERIOD_TYPES,
+  MINERPOOL_EXT_DATA_KEYS,
+  NON_METRIC_KEYS,
+  BTC_SATS,
+  RANGE_BUCKETS
 }

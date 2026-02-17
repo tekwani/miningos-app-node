@@ -475,6 +475,16 @@ test('Api security', { timeout: 90000 }, async (main) => {
     await testGetEndpointSecurity(n, httpClient, api, invalidToken, readonlyUser, encoding)
   })
 
+  await main.test('Api: get finance/ebitda', async (n) => {
+    const api = `${appNodeBaseUrl}${ENDPOINTS.FINANCE_EBITDA}?start=1700000000000&end=1700100000000`
+    await testGetEndpointSecurity(n, httpClient, api, invalidToken, readonlyUser, encoding)
+  })
+
+  await main.test('Api: get finance/cost-summary', async (n) => {
+    const api = `${appNodeBaseUrl}${ENDPOINTS.FINANCE_COST_SUMMARY}?start=1700000000000&end=1700100000000`
+    await testGetEndpointSecurity(n, httpClient, api, invalidToken, readonlyUser, encoding)
+  })
+
   await main.test('Api: get ext-data', async (n) => {
     const api = `${appNodeBaseUrl}${ENDPOINTS.EXT_DATA}?type=miner`
     await testGetEndpointSecurity(n, httpClient, api, invalidToken, readonlyUser, encoding)
@@ -523,7 +533,7 @@ test('Api security', { timeout: 90000 }, async (main) => {
 
     await n.test('api should fail due to invalid permissions', async (t) => {
       await testEndpointWithAuthAndError(t, httpClient, 'post', api, readonlyUser, 'ERR_AUTH_FAIL_NO_PERMS', {
-        body: { data: { email: 'dev@test.test', role: 'dev' } },
+        body: { data: { email: 'dev@test.test', role: 'read_only_user' } },
         encoding
       })
     })
@@ -537,7 +547,7 @@ test('Api security', { timeout: 90000 }, async (main) => {
 
     await n.test('api should succeed for valid permissions (admin)', async (t) => {
       await testEndpointWithAuth(t, httpClient, 'post', api, newCreatedUser, {
-        body: { data: { email: 'dev@test.test', role: 'dev' } },
+        body: { data: { email: 'dev@test.test', role: 'read_only_user' } },
         encoding
       })
     })
@@ -623,6 +633,11 @@ test('Api security', { timeout: 90000 }, async (main) => {
         encoding
       })
     })
+  })
+
+  await main.test('Api: get finance/energy-balance', async (n) => {
+    const api = `${appNodeBaseUrl}${ENDPOINTS.FINANCE_ENERGY_BALANCE}?start=1700000000000&end=1700100000000`
+    await testGetEndpointSecurity(n, httpClient, api, invalidToken, readonlyUser, encoding)
   })
 
   await main.test('Token expiration: api should fail due to token expiration', async (t) => {
