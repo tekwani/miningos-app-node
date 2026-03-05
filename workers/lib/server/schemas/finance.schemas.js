@@ -41,6 +41,27 @@ const schemas = {
         overwriteCache: { type: 'boolean' }
       },
       required: ['start', 'end']
+    },
+    revenue: {
+      type: 'object',
+      properties: {
+        start: { type: 'integer' },
+        end: { type: 'integer' },
+        period: { type: 'string', enum: ['daily', 'weekly', 'monthly', 'yearly'] },
+        pool: { type: 'string' },
+        overwriteCache: { type: 'boolean' }
+      },
+      required: ['start', 'end']
+    },
+    revenueSummary: {
+      type: 'object',
+      properties: {
+        start: { type: 'integer' },
+        end: { type: 'integer' },
+        period: { type: 'string', enum: ['daily', 'monthly', 'yearly'] },
+        overwriteCache: { type: 'boolean' }
+      },
+      required: ['start', 'end']
     }
   }
 }
