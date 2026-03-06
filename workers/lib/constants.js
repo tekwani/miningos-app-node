@@ -137,6 +137,11 @@ const ENDPOINTS = {
 
   SITE_STATUS_LIVE: '/auth/site/status/live',
 
+  // Device listing endpoints
+  CONTAINERS: '/auth/containers',
+  CABINETS: '/auth/cabinets',
+  CABINET_BY_ID: '/auth/cabinets/:id',
+
   // Metrics endpoints
   METRICS_HASHRATE: '/auth/metrics/hashrate',
   METRICS_CONSUMPTION: '/auth/metrics/consumption',
@@ -289,7 +294,9 @@ const LOG_KEYS = {
 
 const WORKER_TAGS = {
   MINER: 't-miner',
-  CONTAINER: 't-container'
+  CONTAINER: 't-container',
+  POWERMETER: 't-powermeter',
+  TEMP_SENSOR: 't-sensor-temp'
 }
 
 const DEVICE_LIST_FIELDS = {
