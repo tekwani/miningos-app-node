@@ -104,10 +104,17 @@ class WrkServerHttp extends TetherWrkBase {
         })
 
         httpd.addHook('onError', async (request, reply, error) => {
+          const isSafe = error.message && error.message.startsWith('ERR_')
+          const message = isSafe ? error.message : 'Bad Request'
+
+          if (!isSafe) {
+            debug('onError handler:', error.message)
+          }
+
           return reply.status(400).send({
             statusCode: 400,
             error: 'Bad Request',
-            message: error.message
+            message
           })
         })
 
