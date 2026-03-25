@@ -1,7 +1,8 @@
 {
-  "name": "miningos-app-node",
-  "version": "0.0.1",
-  "description": "MiningOS App Node",
+  "name": "@tetherto/miningos-app-node",
+  "version": "1.0.0",
+  "description": "MiningOS App Node service",
+  "main": "worker.js",
   "keywords": [
     "tether"
   ],
@@ -11,8 +12,19 @@
     "type": "git",
     "url": "git+https://github.com/tetherto/miningos-app-node.git"
   },
-  "engine": {
-    "node": ">=20.0"
+  "homepage": "https://github.com/tetherto/miningos-app-node#readme",
+  "bugs": {
+    "url": "https://github.com/tetherto/miningos-app-node/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "worker.js",
+    "lib/"
+  ],
+  "bin": {
+    "miningos-app-node": "worker.js"
   },
   "scripts": {
     "lint": "standard",
