@@ -21,8 +21,9 @@
   },
   "files": [
     "worker.js",
-    "lib/"
+    "workers/"
   ],
+  "type": "commonjs",
   "bin": {
     "miningos-app-node": "worker.js"
   },
@@ -41,7 +42,7 @@
     "start": "node worker.js --wtype wrk-node-http --env production --port 3000"
   },
   "dependencies": {
-    "@fastify/websocket": "8.3.1",
+    "@fastify/websocket": "11.2.0",
     "async": "3.2.6",
     "bfx-facs-db-sqlite": "git+https://github.com/bitfinexcom/bfx-facs-db-sqlite.git",
     "bfx-facs-http": "git+https://github.com/bitfinexcom/bfx-facs-http.git",
@@ -63,6 +64,9 @@
     "tether-svc-test-helper": "git+https://github.com/tetherto/tether-svc-test-helper.git"
   },
   "overrides": {
-    "tar": ">=7.5.4"
+    "tar": ">=7.5.4",
+    "fastify": "5.8.4",
+    "@fastify/static": "9.0.0",
+    "@fastify/oauth2": "8.2.0"
   }
 }
