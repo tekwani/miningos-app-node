@@ -24,16 +24,18 @@ test('Api security', { timeout: 90000 }, async (main) => {
   const tokenExpiredUser = 'tokenexpire@test'
   const invalidToken = 'invalid-token'
 
+  const cleanIntegrationArtifacts = () => {
+    for (const dir of ['store', 'status', 'config', 'db']) {
+      fs.rmSync(`./${baseDir}/${dir}`, { recursive: true, force: true })
+    }
+  }
+
   main.teardown(async () => {
     await httpClient.stop()
     await worker.stop()
     // wait for worker to stop
     await sleep(2000)
-    // delete store, status, config dirs after tests complete
-    fs.rmSync(`./${baseDir}/store`, { recursive: true, force: true })
-    fs.rmSync(`./${baseDir}/status`, { recursive: true, force: true })
-    fs.rmSync(`./${baseDir}/config`, { recursive: true, force: true })
-    fs.rmSync(`./${baseDir}/db`, { recursive: true, force: true })
+    cleanIntegrationArtifacts()
   })
 
   const createConfig = () => {
@@ -269,6 +271,7 @@ test('Api security', { timeout: 90000 }, async (main) => {
     }
   }
 
+  cleanIntegrationArtifacts()
   createConfig()
   await startWorker()
   await createHttpClient()
@@ -449,7 +452,7 @@ test('Api security', { timeout: 90000 }, async (main) => {
 
   await main.test('Api: delete actions/voting/cancel', async (n) => {
     const api = `${appNodeBaseUrl}${ENDPOINTS.ACTIONS_CANCEL}?ids=1`
-    await testDeleteEndpointSecurityWithPermissions(n, httpClient, api, invalidToken, readonlyUser, 'ERR_WRITE_PERM_REQUIRED', siteOperatorUser, {}, encoding)
+    await testDeleteEndpointSecurityWithPermissions(n, httpClient, api, invalidToken, readonlyUser, 'ERR_WRITE_PERM_REQUIRED', siteOperatorUser, { body: {} }, encoding)
   })
 
   await main.test('Api: post users', async (n) => {
@@ -471,7 +474,7 @@ test('Api security', { timeout: 90000 }, async (main) => {
 
     await n.test('api should succeed for valid permissions (admin)', async (t) => {
       await testEndpointWithAuth(t, httpClient, 'post', api, newCreatedUser, {
-        body: { data: { email: 'dev@test.test', role: 'dev' } },
+        body: { data: { email: 'dev@test.test', role: 'read_only_user' } },
         encoding
       })
     })

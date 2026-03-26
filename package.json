@@ -1,7 +1,8 @@
 {
-  "name": "miningos-app-node",
-  "version": "0.0.1",
-  "description": "MiningOS App Node",
+  "name": "@tetherto/miningos-app-node",
+  "version": "1.0.0",
+  "description": "MiningOS App Node service",
+  "main": "worker.js",
   "keywords": [
     "tether"
   ],
@@ -11,8 +12,20 @@
     "type": "git",
     "url": "git+https://github.com/tetherto/miningos-app-node.git"
   },
-  "engine": {
-    "node": ">=20.0"
+  "homepage": "https://github.com/tetherto/miningos-app-node#readme",
+  "bugs": {
+    "url": "https://github.com/tetherto/miningos-app-node/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "worker.js",
+    "workers/"
+  ],
+  "type": "commonjs",
+  "bin": {
+    "miningos-app-node": "worker.js"
   },
   "scripts": {
     "lint": "standard",
@@ -29,7 +42,7 @@
     "start": "node worker.js --wtype wrk-node-http --env production --port 3000"
   },
   "dependencies": {
-    "@fastify/websocket": "8.3.1",
+    "@fastify/websocket": "11.2.0",
     "async": "3.2.6",
     "bfx-facs-db-sqlite": "git+https://github.com/bitfinexcom/bfx-facs-db-sqlite.git",
     "bfx-facs-http": "git+https://github.com/bitfinexcom/bfx-facs-http.git",
@@ -51,6 +64,9 @@
     "tether-svc-test-helper": "git+https://github.com/tetherto/tether-svc-test-helper.git"
   },
   "overrides": {
-    "tar": ">=7.5.4"
+    "tar": ">=7.5.4",
+    "fastify": "5.8.4",
+    "@fastify/static": "9.0.0",
+    "@fastify/oauth2": "8.2.0"
   }
 }
