@@ -25,7 +25,6 @@ const {
   resolveInterval,
   getIntervalConfig
 } = require('../../metrics.utils')
-
 async function getHashrate (ctx, req) {
   const { start, end } = validateStartEnd(req)
 
