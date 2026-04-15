@@ -216,12 +216,12 @@ const createMockSnapData = () => ({
 
 function createMockCtx (featureEnabled = true, customDcsResponse = null) {
   const snapData = createMockSnapData()
-  const defaultResponse = [{
+  const defaultResponse = [[{
     id: 'dcs-1',
     type: 'dcs',
     tags: ['t-dcs'],
     last: { snap: snapData }
-  }]
+  }]]
 
   const featureConfig = {
     centralDCSSetup: {
@@ -235,8 +235,8 @@ function createMockCtx (featureEnabled = true, customDcsResponse = null) {
       featureConfig,
       orks: [{ rpcPublicKey: 'key1' }]
     },
-    net_r0: {
-      jRequest: async () => {
+    dataProxy: {
+      requestDataMap: async () => {
         return customDcsResponse !== null ? customDcsResponse : defaultResponse
       }
     }
@@ -250,9 +250,9 @@ test('isCentralDCSEnabled - returns true with new config', (t) => {
   t.pass()
 })
 
-test('isCentralDCSEnabled - returns true with legacy config', (t) => {
+test('isCentralDCSEnabled - ignores legacy config key', (t) => {
   const ctx = { conf: { featureConfig: { isCentralPCS7Setup: true } } }
-  t.is(isCentralDCSEnabled(ctx), true)
+  t.is(isCentralDCSEnabled(ctx), false)
   t.pass()
 })
 
