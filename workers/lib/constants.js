@@ -340,6 +340,7 @@ const COOLING_SYSTEM_PROJECTIONS = {
       'last.snap.stats.dcs_specific.equipment.valves': 1,
       'last.snap.stats.dcs_specific.equipment.tanks': 1,
       'last.snap.stats.dcs_specific.equipment.vibration_sensors': 1,
+      'last.snap.stats.dcs_specific.equipment.fans': 1,
       'last.snap.config.cooling_system': 1
     },
     layout: {
@@ -352,8 +353,11 @@ const COOLING_SYSTEM_PROJECTIONS = {
       'last.snap.stats.dcs_specific.equipment.cooling_towers': 1,
       'last.snap.stats.dcs_specific.equipment.valves': 1,
       'last.snap.stats.dcs_specific.equipment.tanks': 1,
+      'last.snap.stats.dcs_specific.equipment.vibration_sensors': 1,
+      'last.snap.stats.dcs_specific.equipment.fans': 1,
       'last.snap.stats.flow': 1,
-      'last.snap.config.cooling_system': 1
+      'last.snap.config.cooling_system': 1,
+      'last.snap.config.mining': 1
     }
   },
   hvac: {
@@ -432,6 +436,8 @@ const SITE_OVERVIEW_AGGR_FIELDS = {
   power_w_rack_group_sum_aggr: 1,
   efficiency_w_ths_container_group_avg_aggr: 1,
   efficiency_w_ths_pdu_rack_group_avg_aggr: 1,
+  hashrate_mhs_5m_pdu_rack_group_avg_aggr:1,
+  power_w_pdu_rack_group_sum_aggr: 1,
   offline_cnt: 1,
   error_cnt: 1,
   not_mining_cnt: 1,
