@@ -432,8 +432,9 @@ function processTailLogData (results) {
         for (const item of items) {
           const ts = getStartOfDay(item.ts || item.timestamp)
           if (!daily[ts]) daily[ts] = { powerW: 0, hashrateMhs: 0 }
-          daily[ts].powerW += (item[AGGR_FIELDS.SITE_POWER] || 0)
-          daily[ts].hashrateMhs += (item[AGGR_FIELDS.HASHRATE_SUM] || 0)
+          const val = item.val || item
+          daily[ts].powerW += (val[AGGR_FIELDS.SITE_POWER] || 0)
+          daily[ts].hashrateMhs += (val[AGGR_FIELDS.HASHRATE_SUM] || 0)
         }
       }
     }
@@ -449,19 +450,21 @@ function processEbitdaPrices (results) {
     if (!Array.isArray(data)) continue
     for (const entry of data) {
       if (!entry) continue
-      const items = entry.data || entry.prices || entry
+      const rawTs = entry.ts || entry.timestamp || entry.time
+      const items = rawTs ? [entry] : (entry.data || entry.prices || entry)
       if (Array.isArray(items)) {
         for (const item of items) {
           const ts = getStartOfDay(item.ts || item.timestamp || item.time)
-          if (ts && item.price) {
-            daily[ts] = item.price
+          const price = item.priceUSD || item.price
+          if (ts && price) {
+            daily[ts] = price
           }
         }
-      } else if (typeof items === 'object' && !Array.isArray(items)) {
+      } else if (typeof items === 'object') {
         for (const [key, val] of Object.entries(items)) {
           const ts = getStartOfDay(Number(key))
           if (ts) {
-            daily[ts] = typeof val === 'object' ? (val.USD || val.price || 0) : Number(val) || 0
+            daily[ts] = typeof val === 'object' ? (val.USD || val.priceUSD || val.price || 0) : Number(val) || 0
           }
         }
       }
@@ -518,7 +521,7 @@ async function getCostSummary (ctx, req) {
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
       type: WORKER_TYPES.MEMPOOL,
-      query: { key: 'prices', start, end }
+      query: { key: 'HISTORICAL_PRICES', start, end }
     }).then(r => cb(null, r)).catch(cb),
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.TAIL_LOG_RANGE_AGGR, {
@@ -628,7 +631,8 @@ async function getSubsidyFees (ctx, req) {
     log.push({
       ts,
       blockReward: block.blockReward,
-      blockTotalFees: block.blockTotalFees
+      blockTotalFees: block.blockTotalFees,
+      blockSize: block.blockSize
     })
   }
 
@@ -643,22 +647,27 @@ function calculateSubsidyFeesSummary (log) {
     return {
       totalBlockReward: 0,
       totalBlockTotalFees: 0,
+      totalBlockSize: 0,
       avgBlockReward: null,
-      avgBlockTotalFees: null
+      avgBlockTotalFees: null,
+      avgBlockSize: null
     }
   }
 
   const totals = log.reduce((acc, entry) => {
     acc.blockReward += entry.blockReward || 0
     acc.blockTotalFees += entry.blockTotalFees || 0
+    acc.blockSize += entry.blockSize || 0
     return acc
-  }, { blockReward: 0, blockTotalFees: 0 })
+  }, { blockReward: 0, blockTotalFees: 0, blockSize: 0 })
 
   return {
     totalBlockReward: totals.blockReward,
     totalBlockTotalFees: totals.blockTotalFees,
+    totalBlockSize: totals.blockSize,
     avgBlockReward: safeDiv(totals.blockReward, log.length),
-    avgBlockTotalFees: safeDiv(totals.blockTotalFees, log.length)
+    avgBlockTotalFees: safeDiv(totals.blockTotalFees, log.length),
+    avgBlockSize: safeDiv(totals.blockSize, log.length)
   }
 }
 
@@ -879,6 +888,7 @@ async function getRevenueSummary (ctx, req) {
       hashRevenueUSDPerPHsPerDay: safeDiv(revenueUSD, hashratePhs),
       blockReward: block.blockReward || 0,
       blockTotalFees: block.blockTotalFees || 0,
+      blockSize: block.blockSize || 0,
       curtailmentMWh,
       curtailmentRate,
       operationalIssuesRate,
@@ -1087,7 +1097,8 @@ function processHashrateData (results) {
           const ts = getStartOfDay(item.ts || item.timestamp)
           if (!ts) continue
           if (!daily[ts]) daily[ts] = 0
-          daily[ts] += (item[AGGR_FIELDS.HASHRATE_SUM] || 0)
+          const val = item.val || item
+          daily[ts] += (val[AGGR_FIELDS.HASHRATE_SUM] || 0)
         }
       }
     }
@@ -1103,18 +1114,19 @@ function processNetworkHashrateData (results) {
     if (!Array.isArray(data)) continue
     for (const entry of data) {
       if (!entry) continue
-      const items = entry.data || entry
+      const rawTs = entry.ts || entry.timestamp || entry.time
+      const items = rawTs ? [entry] : (entry.data || entry)
       if (Array.isArray(items)) {
         for (const item of items) {
           if (!item) continue
-          const rawTs = item.ts || item.timestamp || item.time
-          const ts = getStartOfDay(normalizeTimestampMs(rawTs))
+          const itemTs = item.ts || item.timestamp || item.time
+          const ts = getStartOfDay(normalizeTimestampMs(itemTs))
           if (!ts) continue
           if (item.avgHashrateMHs) {
             daily[ts] = item.avgHashrateMHs
           }
         }
-      } else if (typeof items === 'object' && !Array.isArray(items)) {
+      } else if (typeof items === 'object') {
         for (const [key, val] of Object.entries(items)) {
           const ts = getStartOfDay(Number(key))
           if (!ts) continue

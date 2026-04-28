@@ -355,6 +355,34 @@ test('processTailLogData - processes power and hashrate', (t) => {
   t.pass()
 })
 
+test('processTailLogData - drills into .val (production shape)', (t) => {
+  const results = [
+    [
+      {
+        type: 'powermeter',
+        data: [
+          { ts: 1700006400000, val: { site_power_w: 5000 } },
+          { ts: 1700092800000, val: { site_power_w: 6000 } }
+        ]
+      },
+      {
+        type: 'miner',
+        data: [
+          { ts: 1700006400000, val: { hashrate_mhs_5m_sum_aggr: 100000 } },
+          { ts: 1700092800000, val: { hashrate_mhs_5m_sum_aggr: 120000 } }
+        ]
+      }
+    ]
+  ]
+
+  const daily = processTailLogData(results)
+  t.is(daily[1700006400000].powerW, 5000, 'extracts powerW from .val on day 1')
+  t.is(daily[1700006400000].hashrateMhs, 100000, 'extracts hashrateMhs from .val on day 1')
+  t.is(daily[1700092800000].powerW, 6000, 'extracts powerW from .val on day 2')
+  t.is(daily[1700092800000].hashrateMhs, 120000, 'extracts hashrateMhs from .val on day 2')
+  t.pass()
+})
+
 test('processTailLogData - handles error results', (t) => {
   const results = [{ error: 'timeout' }]
   const daily = processTailLogData(results)
@@ -368,6 +396,19 @@ test('processEbitdaPrices - processes valid data', (t) => {
   ]
   const daily = processEbitdaPrices(results)
   t.ok(typeof daily === 'object', 'should return object')
+  t.pass()
+})
+
+test('processEbitdaPrices - flat per-ork items with priceUSD (production shape)', (t) => {
+  const results = [
+    [
+      { ts: 1700006400000, priceUSD: 40000 },
+      { ts: 1700092800000, priceUSD: 41500 }
+    ]
+  ]
+  const daily = processEbitdaPrices(results)
+  t.is(daily[1700006400000], 40000, 'should extract priceUSD for first day')
+  t.is(daily[1700092800000], 41500, 'should extract priceUSD for second day')
   t.pass()
 })
 
@@ -569,16 +610,18 @@ test('getSubsidyFees - empty ork results', async (t) => {
 
 test('calculateSubsidyFeesSummary - calculates from log entries', (t) => {
   const log = [
-    { blockReward: 6.25, blockTotalFees: 0.5 },
-    { blockReward: 6.25, blockTotalFees: 0.3 }
+    { blockReward: 6.25, blockTotalFees: 0.5, blockSize: 1500000 },
+    { blockReward: 6.25, blockTotalFees: 0.3, blockSize: 1300000 }
   ]
 
   const summary = calculateSubsidyFeesSummary(log)
   t.is(summary.totalBlockReward, 12.5, 'should sum block rewards')
   t.is(summary.totalBlockTotalFees, 0.8, 'should sum block fees')
+  t.is(summary.totalBlockSize, 2800000, 'should sum block sizes')
   t.ok(summary.avgBlockReward !== null, 'should calculate avg block reward')
   t.is(summary.avgBlockReward, 6.25, 'should calculate correct avg block reward')
   t.ok(summary.avgBlockTotalFees !== null, 'should calculate avg block fees')
+  t.is(summary.avgBlockSize, 1400000, 'should calculate correct avg block size')
   t.pass()
 })
 
@@ -990,6 +1033,24 @@ test('processHashrateData - processes array data', (t) => {
   t.pass()
 })
 
+test('processHashrateData - drills into .val (production shape)', (t) => {
+  const results = [
+    [
+      {
+        type: 'miner',
+        data: [
+          { ts: 1700006400000, val: { hashrate_mhs_5m_sum_aggr: 500000 } },
+          { ts: 1700092800000, val: { hashrate_mhs_5m_sum_aggr: 600000 } }
+        ]
+      }
+    ]
+  ]
+  const daily = processHashrateData(results)
+  t.is(daily[1700006400000], 500000, 'extracts hashrate from .val on day 1')
+  t.is(daily[1700092800000], 600000, 'extracts hashrate from .val on day 2')
+  t.pass()
+})
+
 test('processHashrateData - handles error results', (t) => {
   const results = [{ error: 'timeout' }]
   const daily = processHashrateData(results)
@@ -1007,6 +1068,19 @@ test('processNetworkHashrateData - processes array data', (t) => {
   t.ok(Object.keys(daily).length > 0, 'should have entries')
   const key = Object.keys(daily)[0]
   t.is(daily[key], 500000000000000, 'should extract avgHashrateMHs')
+  t.pass()
+})
+
+test('processNetworkHashrateData - flat per-ork items (production shape)', (t) => {
+  const results = [
+    [
+      { ts: 1700006400000, avgHashrateMHs: 1019725948656278 },
+      { ts: 1700092800000, avgHashrateMHs: 1029591824888537 }
+    ]
+  ]
+  const daily = processNetworkHashrateData(results)
+  t.is(daily[1700006400000], 1019725948656278, 'extracts avgHashrateMHs day 1')
+  t.is(daily[1700092800000], 1029591824888537, 'extracts avgHashrateMHs day 2')
   t.pass()
 })
 
