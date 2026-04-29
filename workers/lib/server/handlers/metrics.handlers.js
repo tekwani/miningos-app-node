@@ -82,7 +82,9 @@ async function getGoupedHashrate (ctx, req) {
     return aggr
   }, [])
 
-  return { log, summary: {} }
+  const summary = calculateGroupedHashrateSummary(log, groupBy)
+
+  return { log, summary }
 }
 
 function processHashrateData (results) {
@@ -109,6 +111,45 @@ function calculateHashrateSummary (log) {
   return {
     avgHashrateMhs: safeDiv(total, log.length),
     totalHashrateMhs: total
+  }
+}
+
+function calculateGroupedHashrateSummary (log, groupBy) {
+  if (!log.length) {
+    return {
+      avgHashrateMhs: null,
+      totalHashrateMhs: 0
+    }
+  }
+
+  const groupTotals = {}
+  const groupCounts = {}
+
+  for (const entry of log) {
+    const hashrate = entry.hashrateMhs
+    if (typeof hashrate === 'object' && hashrate !== null) {
+      for (const [name, val] of Object.entries(hashrate)) {
+        const v = Number(val) || 0
+        groupTotals[name] = (groupTotals[name] || 0) + v
+        groupCounts[name] = (groupCounts[name] || 0) + 1
+      }
+    }
+  }
+
+  const byGroup = {}
+  let siteTotal = 0
+  for (const [name, total] of Object.entries(groupTotals)) {
+    byGroup[name] = {
+      avgHashrateMhs: safeDiv(total, groupCounts[name]),
+      totalHashrateMhs: total
+    }
+    siteTotal += total
+  }
+
+  return {
+    avgHashrateMhs: safeDiv(siteTotal, log.length),
+    totalHashrateMhs: siteTotal,
+    groupedBy: byGroup
   }
 }
 
@@ -728,6 +769,7 @@ module.exports = {
   getHashrate,
   processHashrateData,
   calculateHashrateSummary,
+  calculateGroupedHashrateSummary,
   getConsumption,
   processConsumptionData,
   calculateConsumptionSummary,
