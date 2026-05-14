@@ -9,6 +9,12 @@ class AuthLib {
     this._auth = auth
   }
 
+  _permsMatch (perms, perm) {
+    const [key, required] = perm.split(':')
+    const av = perms.find(p => p.startsWith(`${key}:`))?.split(':')[1] ?? ''
+    return [...required].every(c => av.includes(c))
+  }
+
   async migrateUsers (httpdAuth) {
     const users = await this._auth.listUsers()
     if (users.length > 1) {
@@ -65,7 +71,7 @@ class AuthLib {
 
   async getTokenPerms (token) {
     const { superadmin: superAdmin, perms = [] } = this._auth.getTokenPerms(token)
-    const write = superAdmin || (await this._auth.tokenHasPerms(token, 'actions:w'))
+    const write = superAdmin || this._permsMatch(perms, 'actions:w')
     const applicablePerms = superAdmin ? (this._auth.conf.superAdminPerms ?? []) : perms
     const caps = applicablePerms.map(perm => perm.split(':')[0])
 
@@ -82,7 +88,7 @@ class AuthLib {
       return false
     }
 
-    const resolved = await Promise.all(requestedPerms.map(perm => this._auth.tokenHasPerms(token, perm)))
+    const resolved = requestedPerms.map(perm => this._permsMatch(perms.permissions, perm))
 
     return matchAll
       ? resolved.every(res => res)
