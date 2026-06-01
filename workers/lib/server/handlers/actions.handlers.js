@@ -142,6 +142,60 @@ async function cancelActionsBatch (ctx, req) {
   })
 }
 
+// Action result contains only metadata (coreKey, byteLength, expiresAt) — actual bytes
+// come directly from wrk-miner over Hypercore/Hyperswarm, bypassing the HRPC pipeline.
+async function downloadLogFile (ctx, req, reply) {
+  const { id } = req.params
+
+  const results = await ctx.dataProxy.requestData('getAction', { id, type: 'done' })
+  const action = Array.isArray(results) ? results.find(r => r && !r.error) : results
+
+  if (!action || !action.targets) {
+    return reply.code(404).send({ error: 'ERR_ACTION_NOT_FOUND' })
+  }
+
+  let meta = null
+  for (const rack of Object.values(action.targets)) {
+    for (const call of (rack.calls || [])) {
+      if (call.result?.success && call.result?.data?.coreKey) {
+        meta = call.result.data
+        break
+      }
+    }
+    if (meta) break
+  }
+
+  if (!meta) {
+    return reply.code(404).send({ error: 'ERR_LOG_NOT_AVAILABLE' })
+  }
+
+  if (meta.expiresAt && Date.now() > meta.expiresAt) {
+    return reply.code(410).send({ error: 'ERR_LOG_EXPIRED' })
+  }
+
+  let stream
+  try {
+    stream = await ctx.logDownloader.stream(meta.coreKey, meta.byteLength)
+  } catch (err) {
+    const code = err.message === 'ERR_LOG_PEER_TIMEOUT' || err.message === 'ERR_LOG_PEER_NOT_FOUND'
+      ? 503
+      : 500
+    return reply.code(code).send({ error: err.message })
+  }
+
+  // Set headers only after stream is ready — if set before the try-catch and stream()
+  // throws, the error response would carry application/octet-stream content-type and
+  // Fastify would refuse to serialize the JSON error object.
+  const filename = `miner-log-${meta.minerId || 'unknown'}-${id}.log`
+  reply.header('Content-Type', 'application/octet-stream')
+  reply.header('Content-Disposition', `attachment; filename="${filename}"`)
+  reply.header('Content-Length', meta.byteLength)
+  reply.header('Cache-Control', 'no-store')
+
+  // Fastify pipes a Readable stream directly to the HTTP response — no buffering
+  return reply.send(stream)
+}
+
 module.exports = {
   queryActionsBatch,
   queryActions,
@@ -149,5 +203,6 @@ module.exports = {
   pushAction,
   voteAction,
   cancelActionsBatch,
-  pushActionsBatch
+  pushActionsBatch,
+  downloadLogFile
 }
