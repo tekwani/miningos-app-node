@@ -42,11 +42,11 @@
     "start": "node worker.js --wtype wrk-node-http --env production --port 3000"
   },
   "dependencies": {
+    "@bitfinex/bfx-svc-boot-js": "1.2.0",
     "@bitfinex/bfx-facs-db-sqlite": "git+https://github.com/bitfinexcom/bfx-facs-db-sqlite.git",
     "@bitfinex/bfx-facs-http": "git+https://github.com/bitfinexcom/bfx-facs-http.git",
     "@bitfinex/bfx-facs-interval": "git+https://github.com/bitfinexcom/bfx-facs-interval.git",
     "@bitfinex/bfx-facs-lru": "git+https://github.com/bitfinexcom/bfx-facs-lru.git",
-    "@bitfinex/bfx-svc-boot-js": "1.2.0",
     "@bitfinex/lib-js-util-base": "git+https://github.com/bitfinexcom/lib-js-util-base.git",
     "@fastify/multipart": "^10.0.0",
     "@fastify/websocket": "11.2.0",
@@ -63,7 +63,7 @@
     "brittle": "3.18.0",
     "http-server": "14.1.1",
     "standard": "17.1.0",
-    "tether-svc-test-helper": "git+https://github.com/tetherto/tether-svc-test-helper.git"
+    "@tetherto/tether-svc-test-helper": "git+https://github.com/tetherto/tether-svc-test-helper.git#v1.0.0"
   },
   "overrides": {
     "@tootallnate/once": "3.0.1",
