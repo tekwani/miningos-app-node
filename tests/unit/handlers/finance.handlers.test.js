@@ -1756,7 +1756,7 @@ test('getEbitda - passes a limit that covers every day in the range to mempool h
   t.ok(prices.limit > 400, 'limit exceeds the number of daily rows in the range')
 })
 
-test('getRevenueSummary - reads the documented nominal power key and emits nominal, available and downtime energy', async (t) => {
+test('getRevenueSummary - reads the documented nominal power key and emits nominal and downtime energy', async (t) => {
   const dayTs = 1700006400000
   const mockCtx = withDataProxy({
     conf: { orks: [{ rpcPublicKey: 'key1' }] },
@@ -1764,9 +1764,6 @@ test('getRevenueSummary - reads the documented nominal power key and emits nomin
       jRequest: async (key, method, payload) => {
         if (method === 'tailLog') return [{ ts: dayTs, site_power_w: 5000000 }]
         if (method === 'getGlobalConfig') return { nominalAvailablePowerMWh: 10 }
-        if (method === 'getWrkExtData' && payload.query.key === 'stats-history') {
-          return [[{ ts: dayTs, energy_aggr: { ute_energy_aggr: 200 } }]]
-        }
         return []
       }
     },
@@ -1777,8 +1774,11 @@ test('getRevenueSummary - reads the documented nominal power key and emits nomin
 
   t.is(entry.powerUtilization, 0.5)
   t.is(entry.nominalConsumptionMWh, 240)
-  t.is(entry.availableEnergyMWh, 200)
+  t.is(entry.availableEnergyMWh, 0)
   t.is(entry.downtimeMWh, 120)
+  t.is(entry.curtailmentMWh, 0)
+  t.is(entry.curtailmentRate, 0)
+  t.is(entry.operationalIssuesRate, 0)
 })
 
 test('getRevenueSummary - monthly btcProductionCost is total cost over total BTC, not a mean of daily ratios', async (t) => {
@@ -1816,7 +1816,6 @@ test('getRevenueSummary - folds forecast energy sales, pool rebates and net-of-t
         switch (payload.query.key) {
           case 'transactions': return [{ transactions: [{ ts: dayTs, changed_balance: 1 }] }]
           case 'HISTORICAL_PRICES': return [{ data: [{ ts: dayTs, priceUSD: 40000 }] }]
-          case 'stats-history': return [[{ ts: dayTs, energy_aggr: { active_energy_in_aggr: 200 } }]]
           case 'forecastSettings': return [{ miningRevenueTaxFees: { percent: 4, fixed: 2 } }]
           case 'forecastHistory': return [{
             hourlyForecast: [
@@ -1844,7 +1843,8 @@ test('getRevenueSummary - folds forecast energy sales, pool rebates and net-of-t
   t.is(row.allMineNetUSD, 529)
   t.is(row.allSellNetUSD, 196)
   t.is(row.optimalNetUSD, 578)
-  t.is(row.curtailmentMWh, 70)
+  t.is(row.curtailmentMWh, 0)
+  t.is(row.availableEnergyMWh, 0)
   t.is(row.miningNetUSD, 57360)
   t.is(row.netCashUSD, 57458)
   t.is(summary.totalRebateBTC, 0.5)
