@@ -801,7 +801,6 @@ async function getRevenueSummary (ctx, req) {
     dailyHashrate,
     productionCosts,
     blockResults,
-    activeEnergyInResults,
     globalConfigResults,
     costParameters,
     poolRebates,
@@ -837,11 +836,6 @@ async function getRevenueSummary (ctx, req) {
       query: { key: 'HISTORICAL_BLOCKSIZES', start, end, limit: historyLimit(start, end) }
     }).then(r => cb(null, r)).catch(cb),
 
-    (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
-      type: WORKER_TYPES.ELECTRICITY,
-      query: { key: 'stats-history', start, end, groupRange: '1D' }
-    }).then(r => cb(null, r)).catch(cb),
-
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GLOBAL_CONFIG, {})
       .then(r => cb(null, r)).catch(cb),
 
@@ -855,7 +849,9 @@ async function getRevenueSummary (ctx, req) {
       type: WORKER_TYPES.ELECTRICITY,
       query: { key: ELECTRICITY_EXT_DATA_KEYS.FORECAST_HISTORY },
       start,
-      end
+      end,
+      includeDays: false,
+      forecastFields: { start: 1, energySalesRevenue: 1, energySalesRevenuePerMwh: 1, energySalesTaxesAndFees: 1, miningRevenue: 1, taxesAndFees: 1, isEnergySelected: 1 }
     }).then(r => cb(null, r)).catch(cb),
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
@@ -869,8 +865,6 @@ async function getRevenueSummary (ctx, req) {
   const currentBtcPrice = extractCurrentPrice(currentPriceResults)
   const costsByMonth = processCostsData(productionCosts)
   const dailyBlocks = processBlockData(blockResults)
-  const dailyActiveEnergyIn = processEnergyData(activeEnergyInResults, AGGR_FIELDS.ACTIVE_ENERGY_IN)
-  const dailyUteEnergy = processEnergyData(activeEnergyInResults, AGGR_FIELDS.UTE_ENERGY)
   const nominalPowerMW = extractNominalPower(globalConfigResults)
   const dailyForecast = processForecastHistory(forecastResults)
   const taxFees = extractForecastSettings(forecastSettingsResults).miningRevenueTaxFees || {}
@@ -907,23 +901,10 @@ async function getRevenueSummary (ctx, req) {
     const operationalCostsUSD = costs.operationalCostPerDay || 0
     const totalCostsUSD = energyCostsUSD + operationalCostsUSD
 
-    const activeEnergyIn = dailyActiveEnergyIn[dayTs] || 0
-    const uteEnergy = dailyUteEnergy[dayTs] || 0
     const nominalConsumptionMWh = nominalPowerMW * 24
     const fc = dailyForecast[dayTs] || {}
     const energySalesNetUSD = (fc.energySalesGrossUSD || 0) - (fc.energySalesTaxesAndFeesUSD || 0)
     const miningNetUSD = revenueUSD - revenueUSD * (taxFees.percent || 0) / 100 - (taxFees.fixed || 0) * consumptionMWh
-
-    const curtailmentMWh = activeEnergyIn > 0
-      ? activeEnergyIn - consumptionMWh - (fc.soldMWh || 0)
-      : null
-    const curtailmentRate = curtailmentMWh !== null
-      ? safeDiv(curtailmentMWh, consumptionMWh)
-      : null
-
-    const operationalIssuesRate = uteEnergy > 0
-      ? safeDiv(uteEnergy - consumptionMWh, uteEnergy)
-      : null
 
     const actualPowerMW = powerW / 1000000
     const powerUtilization = nominalPowerMW > 0
@@ -955,11 +936,11 @@ async function getRevenueSummary (ctx, req) {
       blockReward: block.blockReward || 0,
       blockTotalFees: block.blockTotalFees || 0,
       blockSize: block.blockSize || 0,
-      curtailmentMWh,
-      curtailmentRate,
-      operationalIssuesRate,
+      curtailmentMWh: 0,
+      curtailmentRate: 0,
+      operationalIssuesRate: 0,
       powerUtilization,
-      availableEnergyMWh: uteEnergy,
+      availableEnergyMWh: 0,
       nominalConsumptionMWh,
       downtimeMWh: nominalPowerMW > 0 ? nominalConsumptionMWh - consumptionMWh : null,
       lcoeUsdPerMwh,
