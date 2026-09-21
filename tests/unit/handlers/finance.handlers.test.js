@@ -30,8 +30,12 @@ const {
   processDailyRevenueBtc,
   processDailyAvgPrices,
   processNetworkHashrateData,
-  calculateHashRevenueSummary
+  calculateHashRevenueSummary,
+  getDailySeries,
+  sumCostsByMonth,
+  localMonthStart
 } = require('../../../workers/lib/server/handlers/finance.handlers')
+const { getConsumption } = require('../../../workers/lib/server/handlers/metrics.handlers')
 const { withDataProxy } = require('../helpers/mockHelpers')
 
 // ==================== Energy Balance Tests ====================
@@ -289,6 +293,91 @@ test('calculateSummary - handles empty log', (t) => {
   t.is(summary.totalRevenueBTC, 0, 'should be zero')
   t.is(summary.totalRevenueUSD, 0, 'should be zero')
   t.is(summary.avgCostPerMWh, null, 'should be null')
+  t.pass()
+})
+
+// ==================== getDailySeries Tests ====================
+
+test('getDailySeries - requests the hourly interval and rolls up by the local calendar day', async (t) => {
+  let capturedKey = null
+  // 02:00 UTC on Sep 1 is 22:00 on Aug 31 in America/Campo_Grande (UTC-4) - still the
+  // previous LOCAL day, even though it's the same UTC calendar day as the other sample.
+  const sampleAugUtc = Date.UTC(2026, 8, 1, 2)
+  const sampleSepUtc = Date.UTC(2026, 8, 1, 6)
+
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'tailLog') {
+          capturedKey = payload.key
+          return [
+            { ts: sampleAugUtc, site_power_w: 1000000 },
+            { ts: sampleSepUtc, site_power_w: 3000000 }
+          ]
+        }
+        return []
+      }
+    }
+  })
+
+  const byDay = await getDailySeries(
+    mockCtx,
+    Date.UTC(2026, 7, 31),
+    Date.UTC(2026, 8, 2),
+    getConsumption,
+    'powerW',
+    'America/Campo_Grande'
+  )
+
+  t.is(capturedKey, 'stat-30m', 'requests the 30m-backed hourly source, not the 3h daily one')
+
+  const aug31Local = Date.UTC(2026, 7, 31, 4) // Campo_Grande midnight Aug 31 = 04:00 UTC
+  const sep1Local = Date.UTC(2026, 8, 1, 4) // Campo_Grande midnight Sep 1 = 04:00 UTC
+  t.is(byDay[aug31Local], 1000000, '02:00 UTC sample lands on local Aug 31, not UTC Sep 1')
+  t.is(byDay[sep1Local], 3000000, '06:00 UTC sample lands on local Sep 1')
+  t.pass()
+})
+
+test('getDailySeries - caches a completed month on ctx and does not refetch it', async (t) => {
+  let tailLogCalls = 0
+  const ts = Date.UTC(2024, 0, 15, 12)
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method) => {
+        if (method === 'tailLog') {
+          tailLogCalls++
+          return [{ ts, site_power_w: 2000000 }]
+        }
+        return []
+      }
+    }
+  })
+
+  const start = Date.UTC(2024, 0, 1)
+  const end = Date.UTC(2024, 1, 1)
+  const first = await getDailySeries(mockCtx, start, end, getConsumption, 'powerW', 'UTC')
+  const second = await getDailySeries(mockCtx, start, end, getConsumption, 'powerW', 'UTC')
+
+  t.is(tailLogCalls, 1, 'the second call for the same completed month is served from cache')
+  t.alike(first, second, 'cached result matches the freshly-fetched one')
+  t.pass()
+})
+
+test('getDailySeries - a different ctx gets its own cache (no cross-request leakage)', async (t) => {
+  const ts = Date.UTC(2024, 0, 15, 12)
+  const buildCtx = (powerW) => withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: { jRequest: async (key, method) => (method === 'tailLog' ? [{ ts, site_power_w: powerW }] : []) }
+  })
+
+  const start = Date.UTC(2024, 0, 1)
+  const end = Date.UTC(2024, 1, 1)
+  const ctxA = await getDailySeries(buildCtx(1000000), start, end, getConsumption, 'powerW', 'UTC')
+  const ctxB = await getDailySeries(buildCtx(9000000), start, end, getConsumption, 'powerW', 'UTC')
+
+  t.not(Object.values(ctxA)[0], Object.values(ctxB)[0], 'a fresh ctx is not served the other ctx\'s cached data')
   t.pass()
 })
 
@@ -1599,6 +1688,43 @@ test('getPowerCost - empty results', async (t) => {
   const mockCtx = createPowerCostCtx()
   const result = await getPowerCost(mockCtx, { query: { start: JAN_1, end: JAN_31 } })
   t.alike(result.log, [], 'should return empty log')
+  t.pass()
+})
+
+test('getPowerCost - a local month boundary keeps a UTC-Jan-1 sample in December for a west-of-UTC zone', async (t) => {
+  const sampleUtc = JAN_1 + 2 * 3600000 // Jan 1 02:00 UTC = Dec 31 22:00 in America/Campo_Grande
+  const mockCtx = createPowerCostCtx({
+    power: [{ ts: sampleUtc, site_power_w: 2000000 }],
+    transactions: [{ ts: sampleUtc, transactions: [{ changed_balance: 0.5 }] }],
+    prices: [{ ts: sampleUtc, priceUSD: 40000 }]
+  })
+
+  const result = await getPowerCost(mockCtx, {
+    query: {
+      start: Date.UTC(2025, 10, 1),
+      end: Date.UTC(2026, 1, 15),
+      timezone: 'America/Campo_Grande'
+    }
+  })
+
+  t.is(result.log.length, 1, 'one monthly bucket')
+  const decemberLocalStart = Date.UTC(2025, 11, 1, 4) // Campo_Grande midnight Dec 1 2025 = 04:00 UTC
+  t.is(result.log[0].ts, decemberLocalStart, 'the Dec-31-local sample is attributed to December, not UTC January')
+  t.ok(result.log[0].revenueUSD > 0, 'revenue still computed for that bucket')
+  t.pass()
+})
+
+test('sumCostsByMonth - buckets by local month start, not the UTC label', (t) => {
+  const startMonthTs = localMonthStart(Date.UTC(2025, 11, 1), 'America/Campo_Grande')
+  const endMonthTs = localMonthStart(Date.UTC(2026, 0, 1), 'America/Campo_Grande')
+  const byMonth = sumCostsByMonth(
+    [{ site: 's1', year: 2025, month: 12, energyCost: 1000, operationalCost: 500 }],
+    startMonthTs,
+    endMonthTs,
+    'America/Campo_Grande'
+  )
+  const decemberLocalStart = Date.UTC(2025, 11, 1, 4)
+  t.is(byMonth[decemberLocalStart], 1500, 'costs land on the local December month start')
   t.pass()
 })
 

@@ -4,6 +4,46 @@ const { PERIOD_TYPES, NON_METRIC_KEYS } = require('./constants')
 
 const getStartOfDay = (ts) => Math.floor(ts / 86400000) * 86400000
 
+// Milliseconds to add to a UTC instant to read it as wall-clock time in `timeZone`.
+function zoneOffsetMs (ts, timeZone) {
+  const parts = {}
+  const formatted = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  }).formatToParts(new Date(ts))
+  for (const { type, value } of formatted) parts[type] = value
+
+  const asUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second)
+  return asUtc - ts
+}
+
+// First instant of the local calendar day (in `timeZone`) containing `ts`. DST-safe:
+// resolved twice because the naive guess can land on the wrong side of a shift.
+// Keep using getStartOfDay for callers that must stay on the UTC grid (e.g. a store
+// bucket that is itself UTC-aligned); use this one wherever a "day" bucket has to line
+// up with the site's own calendar instead.
+const localDayStart = (ts, timeZone) => {
+  console.log('localdaystart', timeZone)
+  if (!timeZone || timeZone === 'UTC') return getStartOfDay(ts)
+
+  const parts = {}
+  const formatted = new Intl.DateTimeFormat('en-US', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(new Date(ts))
+  for (const { type, value } of formatted) parts[type] = value
+
+  const wallClock = Date.UTC(+parts.year, +parts.month - 1, +parts.day)
+  const asTs = wallClock - zoneOffsetMs(wallClock, timeZone)
+  const settled = zoneOffsetMs(asTs, timeZone)
+  return settled === zoneOffsetMs(wallClock, timeZone) ? asTs : wallClock - settled
+}
+
 const convertMsToSeconds = (timestampMs) => {
   return Math.floor(timestampMs / 1000)
 }
@@ -194,6 +234,7 @@ const getFilteredPeriodData = (
 
 module.exports = {
   getStartOfDay,
+  localDayStart,
   convertMsToSeconds,
   getPeriodEndDate,
   aggregateByPeriod,

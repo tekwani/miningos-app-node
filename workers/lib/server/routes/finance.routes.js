@@ -142,7 +142,7 @@ module.exports = (ctx) => {
         ],
         ENDPOINTS.FINANCE_REVENUE_SUMMARY,
         withLocalizedLog(getRevenueSummary),
-        FINANCE_PERMS
+        // FINANCE_PERMS
       )
     },
     {

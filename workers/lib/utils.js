@@ -3,7 +3,7 @@
 const async = require('async')
 const mingo = require('mingo')
 const { RPC_TIMEOUT } = require('./constants')
-const { getStartOfDay } = require('./period.utils')
+const { getStartOfDay, localDayStart } = require('./period.utils')
 
 const dateNowSec = () => Math.floor(Date.now() / 1000)
 
@@ -239,6 +239,7 @@ module.exports = {
   getAuthTokenFromHeaders,
   parseJsonQueryParam,
   getStartOfDay,
+  localDayStart,
   flattenRpcResults,
   safeDiv,
   runParallel,

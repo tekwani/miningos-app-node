@@ -1,7 +1,7 @@
 'use strict'
 
 const { BTC_SATS } = require('../../constants')
-const { getStartOfDay } = require('../../utils')
+const { localDayStart } = require('../../utils')
 const {
   assertTimezone,
   resolveTimezone,
@@ -30,7 +30,7 @@ function historyLimit (start, end) {
 
 // Worker timestamps arrive in whatever shape the upstream pool API uses: unix seconds
 // (f2pool `created_at`), unix ms, or an ISO-8601 string (ocean `ts`, e.g. "2026-05-28T16:46:30").
-// Anything this returns unparsed becomes NaN in getStartOfDay and the record is dropped without
+// Anything this returns unparsed becomes NaN in localDayStart and the record is dropped without
 // a trace, so every shape has to be handled here rather than at the call sites.
 function normalizeTimestampMs (ts) {
   if (!ts) return 0
@@ -51,7 +51,7 @@ function normalizeTimestampMs (ts) {
   return ts < 1e12 ? ts * 1000 : ts
 }
 
-function processTransactions (results, opts) {
+function processTransactions (results, opts, timezone = 'UTC') {
   const trackFees = opts && opts.trackFees
   const daily = {}
   for (const res of results) {
@@ -65,8 +65,9 @@ function processTransactions (results, opts) {
       for (const t of txList) {
         if (!t) continue
         const rawTs = t.mining_extra?.mining_date || t.ts || t.created_at || t.timestamp || t.time
-        const ts = getStartOfDay(normalizeTimestampMs(rawTs))
-        if (!ts) continue
+        const rawMs = normalizeTimestampMs(rawTs)
+        if (!rawMs) continue
+        const ts = localDayStart(rawMs, timezone)
         const day = daily[ts] ??= trackFees
           ? { revenueBTC: 0, feesBTC: 0 }
           : { revenueBTC: 0 }
@@ -87,11 +88,11 @@ function processTransactions (results, opts) {
   return daily
 }
 
-function addRebates (daily, rebates) {
+function addRebates (daily, rebates, timezone = 'UTC') {
   for (const day of Object.values(daily)) day.payoutBTC = day.revenueBTC
   for (const r of rebates) {
     if (!Number.isFinite(r?.ts) || !Number.isFinite(r?.amountBTC)) continue
-    const ts = getStartOfDay(r.ts)
+    const ts = localDayStart(r.ts, timezone)
     const day = daily[ts] ??= { revenueBTC: 0, payoutBTC: 0 }
     day.revenueBTC += r.amountBTC
     day.rebateBTC = (day.rebateBTC || 0) + r.amountBTC
@@ -126,7 +127,7 @@ function extractCurrentPrice (results) {
   return 0
 }
 
-function processBlockData (results) {
+function processBlockData (results, timezone = 'UTC') {
   const daily = {}
   for (const res of results) {
     if (!res || res.error) continue
@@ -140,8 +141,9 @@ function processBlockData (results) {
         for (const item of items) {
           if (!item) continue
           const itemTs = item.ts || item.timestamp || item.time
-          const ts = getStartOfDay(normalizeTimestampMs(itemTs))
-          if (!ts) continue
+          const itemMs = normalizeTimestampMs(itemTs)
+          if (!itemMs) continue
+          const ts = localDayStart(itemMs, timezone)
           if (!daily[ts]) daily[ts] = { blockReward: 0, blockTotalFees: 0, blockSize: 0 }
           daily[ts].blockReward += (item.blockReward || item.block_reward || item.subsidy || 0)
           daily[ts].blockTotalFees += (item.blockTotalFees || item.block_total_fees || item.totalFees || item.total_fees || 0)
@@ -149,8 +151,9 @@ function processBlockData (results) {
         }
       } else if (typeof items === 'object') {
         for (const [key, val] of Object.entries(items)) {
-          const ts = getStartOfDay(Number(key))
-          if (!ts) continue
+          const keyMs = Number(key)
+          if (!keyMs) continue
+          const ts = localDayStart(keyMs, timezone)
           if (!daily[ts]) daily[ts] = { blockReward: 0, blockTotalFees: 0, blockSize: 0 }
           if (typeof val === 'object') {
             daily[ts].blockReward += (val.blockReward || val.block_reward || val.subsidy || 0)
