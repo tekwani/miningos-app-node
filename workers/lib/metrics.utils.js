@@ -1,7 +1,7 @@
 'use strict'
 
 const { getStartOfDay } = require('./period.utils')
-const { METRICS_TIME, LOG_KEYS } = require('./constants')
+const { METRICS_TIME, LOG_KEYS, LOCKED_TIMEZONE_DEFAULT } = require('./constants')
 
 /**
  * Parse timestamp from RPC entry.
@@ -41,6 +41,42 @@ function validateStartEnd (req) {
   }
 
   return { start, end }
+}
+
+function assertTimezone (timezone) {
+  try {
+    Intl.DateTimeFormat('en-US', { timeZone: timezone })
+    return timezone
+  } catch (err) {
+    throw new Error('ERR_INVALID_TIMEZONE')
+  }
+}
+
+// A request's `timezone` param wins; otherwise the site's locked timezone from
+// common.json, falling back to the constants default when neither is set.
+function resolveTimezone (ctx, req) {
+  const timezone = req.query.timezone || ctx.conf?.featureConfig?.lockedTimezone || LOCKED_TIMEZONE_DEFAULT
+  return assertTimezone(timezone)
+}
+
+// `ms` arrives as the wall-clock time in `timeZone` (expressed as if it were UTC ms)
+// and is shifted here to the real UTC instant it represents.
+function convertLocalToUtcMs (ms, timeZone) {
+  if (!timeZone || timeZone === 'UTC') return ms
+  return ms - zoneOffsetMs(ms, timeZone)
+}
+
+// validateStartEnd plus the timezone conversion described above, for routes where
+// start/end are required and always mean wall-clock time in the resolved zone.
+function resolveStartEnd (ctx, req) {
+  const { start, end } = validateStartEnd(req)
+  const timezone = resolveTimezone(ctx, req)
+
+  return {
+    start: convertLocalToUtcMs(start, timezone),
+    end: convertLocalToUtcMs(end, timezone),
+    timezone
+  }
 }
 
 function * iterateRpcEntries (results) {
@@ -398,6 +434,10 @@ module.exports = {
   parseEntryTs,
   parseEntryTimeRange,
   validateStartEnd,
+  assertTimezone,
+  resolveTimezone,
+  convertLocalToUtcMs,
+  resolveStartEnd,
   iterateRpcEntries,
   forEachRangeAggrItem,
   sumObjectValues,
@@ -405,6 +445,7 @@ module.exports = {
   extractKeyEntry,
   resolveInterval,
   getIntervalConfig,
+  zoneOffsetMs,
   rollupLocalDays,
   rollupLocalMonths,
   localMonthsInRange,

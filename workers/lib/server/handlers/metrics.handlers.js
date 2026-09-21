@@ -31,6 +31,9 @@ const {
   parseEntryTs,
   parseEntryTimeRange,
   validateStartEnd,
+  resolveTimezone,
+  convertLocalToUtcMs,
+  resolveStartEnd,
   iterateRpcEntries,
   sumObjectValues,
   extractContainerFromMinerKey,
@@ -442,7 +445,10 @@ function rollupMonthly (log) {
 }
 
 async function getConsumption (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
+  // Downstream grouped/by-meter/rack paths read start/end straight off req.query,
+  // so the converted UTC values have to replace the raw ones here for those to see them.
+  req = { ...req, query: { ...req.query, start, end } }
 
   if (req.query.groupBy) return getGroupedConsumption(ctx, req)
 
@@ -711,7 +717,10 @@ function calculateGroupedConsumptionSummary (log, groupBy) {
 }
 
 async function getEfficiency (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
+  // Downstream grouped/rack paths read start/end straight off req.query, so the
+  // converted UTC values have to replace the raw ones here for those to see them.
+  req = { ...req, query: { ...req.query, start, end } }
 
   if (req.query.groupBy) return getGroupedEfficiency(ctx, req)
 
@@ -897,7 +906,10 @@ function calculateGroupedEfficiencySummary (log, groupBy) {
 }
 
 async function getMinerStatus (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
+  // getGroupedMinerStatus reads start/end straight off req.query, so the converted
+  // UTC values have to replace the raw ones here for it to see them.
+  req = { ...req, query: { ...req.query, start, end } }
 
   if (req.query.groupBy) return getGroupedMinerStatus(ctx, req)
 
@@ -1428,7 +1440,7 @@ async function getInventoryMinerDistribution (ctx, req) {
 }
 
 async function getPowerMode (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
 
   const interval = resolveInterval(start, end, req.query.interval)
   const config = getIntervalConfig(interval)
@@ -1545,8 +1557,15 @@ function resolvePowerModeTimelineInterval (start, end, requested) {
 
 async function getPowerModeTimeline (ctx, req) {
   const now = Date.now()
-  const start = Number(req.query.start) || (now - METRICS_TIME.ONE_MONTH_MS)
-  const end = Number(req.query.end) || now
+  const timezone = resolveTimezone(ctx, req)
+  // Only an explicit start/end is wall-clock time to convert - the computed
+  // defaults below are already real UTC instants relative to "now".
+  const start = req.query.start !== undefined
+    ? convertLocalToUtcMs(Number(req.query.start), timezone)
+    : (now - METRICS_TIME.ONE_MONTH_MS)
+  const end = req.query.end !== undefined
+    ? convertLocalToUtcMs(Number(req.query.end), timezone)
+    : now
   const container = req.query.container || null
 
   if (start >= end) {
@@ -1666,7 +1685,7 @@ function processPowerModeTimelineData (results, containerFilter) {
 }
 
 async function getTemperature (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
 
   const interval = resolveInterval(start, end, req.query.interval)
   const config = getIntervalConfig(interval)
@@ -1859,8 +1878,15 @@ async function getContainerHistory (ctx, req) {
   }
 
   const now = Date.now()
-  const start = Number(req.query.start) || (now - METRICS_TIME.ONE_DAY_MS)
-  const end = Number(req.query.end) || now
+  const timezone = resolveTimezone(ctx, req)
+  // Only an explicit start/end is wall-clock time to convert - the computed
+  // defaults below are already real UTC instants relative to "now".
+  const start = req.query.start !== undefined
+    ? convertLocalToUtcMs(Number(req.query.start), timezone)
+    : (now - METRICS_TIME.ONE_DAY_MS)
+  const end = req.query.end !== undefined
+    ? convertLocalToUtcMs(Number(req.query.end), timezone)
+    : now
   const limit = Number(req.query.limit) || METRICS_DEFAULTS.CONTAINER_HISTORY_LIMIT
 
   if (start >= end) {
@@ -1925,7 +1951,7 @@ async function getCooling (ctx, req) {
     throw new Error('ERR_FEATURE_NOT_ENABLED')
   }
 
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
 
   const requested = COOLING_INTERVAL_ALIASES[req.query.interval] || req.query.interval
   const interval = resolveInterval(start, end, requested)
@@ -2133,7 +2159,7 @@ function calculateDowntimeSummary (log, nominalPowerW, hasForecastData) {
 }
 
 async function getDowntime (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
   const interval = req.query.interval ||
     ((end - start) <= METRICS_TIME.TWO_DAYS_MS ? '1h' : '1d')
 

@@ -55,6 +55,42 @@ test('metrics routes - schema integration', (t) => {
   t.pass()
 })
 
+test('metrics routes - timezone query param on every start/end route', (t) => {
+  const routes = createRoutesForTest(ROUTES_PATH)
+
+  // hashrate is deliberately excluded: its timezone param picks the 1M rollup's
+  // calendar-month boundary, not a start/end conversion, so it keeps its own schema.
+  const startEndUrls = new Set([
+    '/auth/metrics/consumption',
+    '/auth/metrics/efficiency',
+    '/auth/metrics/miner-status',
+    '/auth/metrics/revenue/hourly',
+    '/auth/metrics/power-mode',
+    '/auth/metrics/power-mode/timeline',
+    '/auth/metrics/temperature',
+    '/auth/metrics/cooling',
+    '/auth/metrics/downtime',
+    '/auth/metrics/containers/:id/history'
+  ])
+
+  routes.forEach(route => {
+    if (!startEndUrls.has(route.url)) return
+    const props = route.schema?.querystring?.properties
+    t.ok(props?.timezone, `route ${route.url} should accept a timezone param`)
+    t.alike(props.timezone, { type: 'string', maxLength: 100 }, `route ${route.url} timezone param should be a bounded string`)
+  })
+
+  t.pass()
+})
+
+test('metrics routes - hashrate keeps its own timezone semantics', (t) => {
+  const routes = createRoutesForTest(ROUTES_PATH)
+  const hashrate = routes.find(route => route.url === '/auth/metrics/hashrate')
+
+  t.alike(hashrate.schema.querystring.properties.timezone, { type: 'string' }, 'unchanged - used only for the 1M rollup boundary')
+  t.pass()
+})
+
 test('metrics routes - handler functions', (t) => {
   const routes = createRoutesForTest(ROUTES_PATH)
   testHandlerFunctions(t, routes, 'metrics')

@@ -50,7 +50,7 @@
     "isReportingEnabled": true,
     "projectFinancials": true,
     "poolRebates": true,
-    "lockedTimeZone": "-03:00",
+    "lockedTimezone": "America/Campo_Grande",
     "centralDCSSetup": {
       "enabled": false,
       "tag": "t-dcs"

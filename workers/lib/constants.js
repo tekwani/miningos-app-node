@@ -318,6 +318,10 @@ const DEFAULTS = {
   OPERATION_COUNT: 1
 }
 
+// Fallback IANA timezone used to interpret request-supplied start/end when neither the
+// request nor common.json's featureConfig.lockedTimezone specifies one.
+const LOCKED_TIMEZONE_DEFAULT = 'America/Campo_Grande'
+
 const STATUS_CODES = {
   OK: 200,
   BAD_REQUEST: 400,
@@ -1415,6 +1419,7 @@ module.exports = {
   HTTP_METHODS,
   OPERATIONS,
   DEFAULTS,
+  LOCKED_TIMEZONE_DEFAULT,
   STATUS_CODES,
   RPC_TIMEOUT,
   RPC_CONCURRENCY_LIMIT,

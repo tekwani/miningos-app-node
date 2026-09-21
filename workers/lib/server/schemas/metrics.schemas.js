@@ -33,6 +33,7 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         interval: { type: 'string', enum: METRICS_INTERVALS },
+        timezone: { type: 'string', maxLength: 100 },
         groupBy: { type: 'string', enum: ['miner', 'container', 'rack'] },
         byMeter: { type: 'boolean' },
         racks: { type: 'string' },
@@ -46,6 +47,7 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         interval: { type: 'string', enum: METRICS_INTERVALS },
+        timezone: { type: 'string', maxLength: 100 },
         groupBy: { type: 'string', enum: ['miner', 'container', 'rack'] },
         racks: { type: 'string' },
         overwriteCache: { type: 'boolean' }
@@ -57,6 +59,7 @@ const schemas = {
       properties: {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
+        timezone: { type: 'string', maxLength: 100 },
         groupBy: { type: 'string', enum: ['type'] },
         overwriteCache: { type: 'boolean' }
       },
@@ -97,6 +100,7 @@ const schemas = {
       properties: {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
+        timezone: { type: 'string', maxLength: 100 },
         pool: { type: 'string' },
         overwriteCache: { type: 'boolean' }
       },
@@ -108,6 +112,7 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         interval: { type: 'string', enum: METRICS_INTERVALS },
+        timezone: { type: 'string', maxLength: 100 },
         overwriteCache: { type: 'boolean' }
       },
       required: ['start', 'end']
@@ -118,6 +123,7 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         interval: { type: 'string', enum: ['1m', '5m', '30m', '3h'] },
+        timezone: { type: 'string', maxLength: 100 },
         container: { type: 'string' },
         overwriteCache: { type: 'boolean' }
       }
@@ -128,6 +134,7 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         interval: { type: 'string', enum: METRICS_INTERVALS },
+        timezone: { type: 'string', maxLength: 100 },
         container: { type: 'string' },
         overwriteCache: { type: 'boolean' }
       },
@@ -139,6 +146,7 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         interval: { type: 'string', enum: [...METRICS_INTERVALS, 'hourly', 'daily', 'weekly'] },
+        timezone: { type: 'string', maxLength: 100 },
         overwriteCache: { type: 'boolean' }
       },
       required: ['start', 'end']
@@ -149,6 +157,7 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         interval: { type: 'string', enum: ['1h', '1d'] },
+        timezone: { type: 'string', maxLength: 100 },
         overwriteCache: { type: 'boolean' }
       },
       required: ['start', 'end']
@@ -165,6 +174,7 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         interval: { type: 'string', enum: ['20s', '1m', '5m', '30m', '3h', '1d'] },
+        timezone: { type: 'string', maxLength: 100 },
         limit: { type: 'integer', minimum: 1, maximum: 1000 },
         overwriteCache: { type: 'boolean' }
       }

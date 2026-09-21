@@ -2,6 +2,12 @@
 
 const { BTC_SATS } = require('../../constants')
 const { getStartOfDay } = require('../../utils')
+const {
+  assertTimezone,
+  resolveTimezone,
+  convertLocalToUtcMs,
+  resolveStartEnd
+} = require('../../metrics.utils')
 
 function validateStartEnd (req) {
   const start = Number(req.query.start)
@@ -160,6 +166,10 @@ function processBlockData (results) {
 
 module.exports = {
   validateStartEnd,
+  assertTimezone,
+  resolveTimezone,
+  convertLocalToUtcMs,
+  resolveStartEnd,
   normalizeTimestampMs,
   processTransactions,
   extractCurrentPrice,

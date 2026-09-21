@@ -8,7 +8,8 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         period: { type: 'string', enum: ['daily', 'weekly', 'monthly', 'yearly'] },
-        overwriteCache: { type: 'boolean' }
+        overwriteCache: { type: 'boolean' },
+        timezone: { type: 'string', maxLength: 100 }
       },
       required: ['start', 'end']
     },
@@ -18,7 +19,8 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         period: { type: 'string', enum: ['daily', 'weekly', 'monthly', 'yearly'] },
-        overwriteCache: { type: 'boolean' }
+        overwriteCache: { type: 'boolean' },
+        timezone: { type: 'string', maxLength: 100 }
       },
       required: ['start', 'end']
     },
@@ -28,7 +30,8 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         period: { type: 'string', enum: ['daily', 'monthly', 'yearly'] },
-        overwriteCache: { type: 'boolean' }
+        overwriteCache: { type: 'boolean' },
+        timezone: { type: 'string', maxLength: 100 }
       },
       required: ['start', 'end']
     },
@@ -38,7 +41,8 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         period: { type: 'string', enum: ['daily', 'weekly', 'monthly'] },
-        overwriteCache: { type: 'boolean' }
+        overwriteCache: { type: 'boolean' },
+        timezone: { type: 'string', maxLength: 100 }
       },
       required: ['start', 'end']
     },
@@ -49,7 +53,8 @@ const schemas = {
         end: { type: 'integer', minimum: 0 },
         period: { type: 'string', enum: ['daily', 'weekly', 'monthly', 'yearly'] },
         pool: { type: 'string' },
-        overwriteCache: { type: 'boolean' }
+        overwriteCache: { type: 'boolean' },
+        timezone: { type: 'string', maxLength: 100 }
       },
       required: ['start', 'end']
     },
@@ -59,7 +64,8 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         period: { type: 'string', enum: ['daily', 'monthly', 'yearly'] },
-        overwriteCache: { type: 'boolean' }
+        overwriteCache: { type: 'boolean' },
+        timezone: { type: 'string', maxLength: 100 }
       },
       required: ['start', 'end']
     },
@@ -69,7 +75,8 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         period: { type: 'string', enum: ['daily', 'monthly', 'yearly'] },
-        overwriteCache: { type: 'boolean' }
+        overwriteCache: { type: 'boolean' },
+        timezone: { type: 'string', maxLength: 100 }
       },
       required: ['start', 'end']
     },
@@ -78,7 +85,8 @@ const schemas = {
       properties: {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
-        overwriteCache: { type: 'boolean' }
+        overwriteCache: { type: 'boolean' },
+        timezone: { type: 'string', maxLength: 100 }
       },
       required: ['start', 'end']
     }

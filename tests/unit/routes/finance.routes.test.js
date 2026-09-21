@@ -51,6 +51,18 @@ test('finance routes - schema integration', (t) => {
   t.pass()
 })
 
+test('finance routes - timezone query param', (t) => {
+  const routes = createRoutesForTest(ROUTES_PATH)
+
+  routes.forEach(route => {
+    const props = route.schema?.querystring?.properties
+    t.ok(props?.timezone, `route ${route.url} should accept a timezone param`)
+    t.alike(props.timezone, { type: 'string', maxLength: 100 }, `route ${route.url} timezone param should be a bounded string`)
+  })
+
+  t.pass()
+})
+
 test('finance routes - handler functions', (t) => {
   const routes = createRoutesForTest(ROUTES_PATH)
   testHandlerFunctions(t, routes, 'finance')

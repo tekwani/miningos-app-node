@@ -16,6 +16,7 @@ const { aggregateByPeriod } = require('../../period.utils')
 const { getConsumption, getHashrate } = require('./metrics.handlers')
 const {
   validateStartEnd,
+  resolveStartEnd,
   normalizeTimestampMs,
   processTransactions,
   extractCurrentPrice,
@@ -35,7 +36,7 @@ async function getDailySeries (ctx, start, end, handler, field) {
 // ==================== Energy Balance ====================
 
 async function getEnergyBalance (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
   const period = req.query.period || PERIOD_TYPES.DAILY
 
   const [
@@ -362,7 +363,7 @@ function calculateSummary (log) {
 // ==================== EBITDA ====================
 
 async function getEbitda (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
   const period = req.query.period || PERIOD_TYPES.MONTHLY
 
   const [transactionResults, dailyPower, dailyHashrate, priceResults, currentPriceResults, productionCosts, costParameters, poolRebates] = await runParallel([
@@ -525,7 +526,7 @@ function calculateEbitdaSummary (log, currentBtcPrice) {
 // ==================== Cost Summary ====================
 
 async function getCostSummary (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
   const period = req.query.period || PERIOD_TYPES.MONTHLY
 
   const [productionCosts, priceResults, dailyConsumption, costParameters] = await runParallel([
@@ -623,7 +624,7 @@ function calculateCostSummary (log) {
 // ==================== Subsidy Fees ====================
 
 async function getSubsidyFees (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
   const period = req.query.period || PERIOD_TYPES.DAILY
 
   const blockResults = await ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
@@ -683,7 +684,7 @@ function calculateSubsidyFeesSummary (log) {
 // ==================== Revenue ====================
 
 async function getRevenue (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
   const period = req.query.period || PERIOD_TYPES.DAILY
   const pool = req.query.pool || null
 
@@ -746,7 +747,7 @@ function calculateRevenueSummary (log) {
 // produces hourlyRevenues (BTC per hour) when queried with aggrHourly; this
 // exposes it directly rather than fanning the tail-log call out on the client.
 async function getRevenueHourly (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
   const pool = req.query.pool || null
 
   const type = pool ? WORKER_TYPES.MINERPOOL + '-' + pool : WORKER_TYPES.MINERPOOL
@@ -790,7 +791,7 @@ function calculateHourlyRevenueSummary (log) {
 // ==================== Revenue Summary ====================
 
 async function getRevenueSummary (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
   const period = req.query.period || PERIOD_TYPES.DAILY
 
   const [
@@ -1113,7 +1114,7 @@ function calculateDetailedRevenueSummary (log, currentBtcPrice) {
 // ==================== Hash Revenue ====================
 
 async function getHashRevenue (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
   const period = req.query.period || PERIOD_TYPES.DAILY
 
   const [
@@ -1338,7 +1339,7 @@ function getStartOfMonthUtc (ts) {
 }
 
 async function getPowerCost (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
   const startMonthTs = getStartOfMonthUtc(start)
   const endMonthTs = getStartOfMonthUtc(end)
 
@@ -1575,6 +1576,7 @@ module.exports = {
   calculateHashRevenueSummary,
   // Re-export from finance.utils
   validateStartEnd,
+  resolveStartEnd,
   normalizeTimestampMs,
   processTransactions,
   extractCurrentPrice,

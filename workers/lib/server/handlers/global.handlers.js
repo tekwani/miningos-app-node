@@ -1,5 +1,5 @@
 'use strict'
-const { GLOBAL_DATA_TYPES } = require('../../constants')
+const { GLOBAL_DATA_TYPES, LOCKED_TIMEZONE_DEFAULT } = require('../../constants')
 const { parseJsonQueryParam } = require('../../utils')
 
 async function getGlobalData (ctx, req) {
@@ -46,7 +46,11 @@ async function setGlobalData (ctx, req) {
 }
 
 async function getFeatureConfig (ctx) {
-  return ctx.conf.featureConfig
+  const featureConfig = ctx.conf.featureConfig || {}
+  return {
+    ...featureConfig,
+    lockedTimezone: featureConfig.lockedTimezone || LOCKED_TIMEZONE_DEFAULT
+  }
 }
 
 async function getFeatures (ctx) {

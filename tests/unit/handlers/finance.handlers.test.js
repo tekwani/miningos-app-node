@@ -1301,6 +1301,26 @@ test('getRevenueHourly - queries the pool with aggrHourly and shapes the log', a
   t.pass()
 })
 
+test('getRevenueHourly - timezone param converts start/end before querying', async (t) => {
+  let payload = null
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'k' }] },
+    net_r0: { jRequest: async (key, method, p) => { payload = p; return [] } }
+  })
+
+  const localStart = Date.UTC(2026, 5, 1, 0, 0, 0)
+  const localEnd = Date.UTC(2026, 5, 1, 1, 0, 0)
+
+  await getRevenueHourly(mockCtx, {
+    query: { start: localStart, end: localEnd, timezone: 'America/Campo_Grande' }
+  })
+
+  // America/Campo_Grande is UTC-4 with no DST, so local midnight is 04:00 UTC.
+  t.is(payload.query.start, localStart + 4 * 3600000, 'should shift start to real UTC')
+  t.is(payload.query.end, localEnd + 4 * 3600000, 'should shift end to real UTC')
+  t.pass()
+})
+
 test('getRevenueHourly - no pool param falls back to the generic minerpool type', async (t) => {
   let payload = null
   const mockCtx = withDataProxy({

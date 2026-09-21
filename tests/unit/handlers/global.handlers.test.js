@@ -89,6 +89,39 @@ test('getFeatureConfig - returns feature config from context', async (t) => {
   t.pass()
 })
 
+test('getFeatureConfig - passes through a configured lockedTimezone', async (t) => {
+  const mockCtx = {
+    conf: {
+      featureConfig: { lockedTimezone: 'America/Campo_Grande' }
+    }
+  }
+
+  const result = await getFeatureConfig(mockCtx)
+  t.is(result.lockedTimezone, 'America/Campo_Grande')
+  t.pass()
+})
+
+test('getFeatureConfig - defaults lockedTimezone when common.json omits it', async (t) => {
+  const mockCtx = {
+    conf: {
+      featureConfig: { feature1: true }
+    }
+  }
+
+  const result = await getFeatureConfig(mockCtx)
+  t.is(result.lockedTimezone, 'UTC')
+  t.is(result.feature1, true, 'other feature flags still pass through')
+  t.pass()
+})
+
+test('getFeatureConfig - defaults lockedTimezone when featureConfig is missing entirely', async (t) => {
+  const mockCtx = { conf: {} }
+
+  const result = await getFeatureConfig(mockCtx)
+  t.is(result.lockedTimezone, 'UTC')
+  t.pass()
+})
+
 test('getFeatures - returns features from globalDataLib', async (t) => {
   const mockCtx = {
     globalDataLib: {
