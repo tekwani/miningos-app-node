@@ -79,6 +79,50 @@ function resolveStartEnd (ctx, req) {
   }
 }
 
+// Reverse of convertLocalToUtcMs: shifts a true UTC instant to the ms value that
+// carries the same wall-clock digits as `timeZone`'s local time, so a caller that
+// renders the timestamp with no further timezone math sees local time.
+function convertUtcToLocalMs (ms, timeZone) {
+  if (!timeZone || timeZone === 'UTC' || !Number.isFinite(ms)) return ms
+  return ms + zoneOffsetMs(ms, timeZone)
+}
+
+// Output-side mirror of resolveStartEnd's input conversion: shifts every entry's
+// `ts` (and `timeRange.startTs`/`endTs`, when present) from the true UTC instant
+// the store holds to the local-wall-clock-as-ms form described above.
+function localizeLogTimestamps (log, timeZone) {
+  if (!Array.isArray(log) || !timeZone || timeZone === 'UTC') return log
+
+  return log.map((entry) => {
+    if (!entry || typeof entry !== 'object') return entry
+    const out = { ...entry }
+    if (typeof out.ts === 'number') out.ts = convertUtcToLocalMs(out.ts, timeZone)
+    if (out.timeRange && typeof out.timeRange === 'object') {
+      out.timeRange = {
+        ...out.timeRange,
+        startTs: convertUtcToLocalMs(out.timeRange.startTs, timeZone),
+        endTs: convertUtcToLocalMs(out.timeRange.endTs, timeZone)
+      }
+    }
+    return out
+  })
+}
+
+// Wraps a routed (ctx, req, rep) handler so a response `log` array has its
+// timestamps localized - but only when the caller explicitly sent `timezone`.
+// A timezone resolved from the site's lockedTimezone or the hardcoded default
+// must not change the response for a caller who never mentioned timezone at all.
+// `mapLog` defaults to the `ts`/`timeRange` shape most log entries use; pass a
+// custom one for a response whose entries carry timestamps differently.
+function withLocalizedLog (handler, mapLog = localizeLogTimestamps) {
+  return async (ctx, req, rep) => {
+    const result = await handler(ctx, req, rep)
+    const timezone = req.query && req.query.timezone
+    if (!timezone || !result || !Array.isArray(result.log)) return result
+    return { ...result, log: mapLog(result.log, timezone) }
+  }
+}
+
 function * iterateRpcEntries (results) {
   for (const res of results) {
     if (!res || res.error) continue
@@ -438,6 +482,9 @@ module.exports = {
   resolveTimezone,
   convertLocalToUtcMs,
   resolveStartEnd,
+  convertUtcToLocalMs,
+  localizeLogTimestamps,
+  withLocalizedLog,
   iterateRpcEntries,
   forEachRangeAggrItem,
   sumObjectValues,

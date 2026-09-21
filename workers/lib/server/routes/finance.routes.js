@@ -15,6 +15,7 @@ const {
   getHashRevenue,
   getPowerCost
 } = require('../handlers/finance.handlers')
+const { withLocalizedLog } = require('../../metrics.utils')
 const { createCachedAuthRoute } = require('../lib/routeHelpers')
 
 const FINANCE_PERMS = [AUTH_PERMISSIONS.REVENUE]
@@ -35,10 +36,11 @@ module.exports = (ctx) => {
           'finance/energy-balance',
           req.query.start,
           req.query.end,
-          req.query.period
+          req.query.period,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_ENERGY_BALANCE,
-        getEnergyBalance,
+        withLocalizedLog(getEnergyBalance),
         FINANCE_PERMS
       )
     },
@@ -54,10 +56,11 @@ module.exports = (ctx) => {
           'finance/ebitda',
           req.query.start,
           req.query.end,
-          req.query.period
+          req.query.period,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_EBITDA,
-        getEbitda,
+        withLocalizedLog(getEbitda),
         FINANCE_PERMS
       )
     },
@@ -73,10 +76,11 @@ module.exports = (ctx) => {
           'finance/cost-summary',
           req.query.start,
           req.query.end,
-          req.query.period
+          req.query.period,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_COST_SUMMARY,
-        getCostSummary,
+        withLocalizedLog(getCostSummary),
         FINANCE_PERMS
       )
     },
@@ -92,10 +96,11 @@ module.exports = (ctx) => {
           'finance/subsidy-fees',
           req.query.start,
           req.query.end,
-          req.query.period
+          req.query.period,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_SUBSIDY_FEES,
-        getSubsidyFees,
+        withLocalizedLog(getSubsidyFees),
         FINANCE_PERMS
       )
     },
@@ -112,10 +117,11 @@ module.exports = (ctx) => {
           req.query.start,
           req.query.end,
           req.query.period,
-          req.query.pool
+          req.query.pool,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_REVENUE,
-        getRevenue,
+        withLocalizedLog(getRevenue),
         FINANCE_PERMS
       )
     },
@@ -131,10 +137,11 @@ module.exports = (ctx) => {
           'finance/revenue-summary',
           req.query.start,
           req.query.end,
-          req.query.period
+          req.query.period,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_REVENUE_SUMMARY,
-        getRevenueSummary,
+        withLocalizedLog(getRevenueSummary),
         FINANCE_PERMS
       )
     },
@@ -150,10 +157,11 @@ module.exports = (ctx) => {
           'finance/hash-revenue',
           req.query.start,
           req.query.end,
-          req.query.period
+          req.query.period,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_HASH_REVENUE,
-        getHashRevenue,
+        withLocalizedLog(getHashRevenue),
         FINANCE_PERMS
       )
     },
@@ -168,10 +176,11 @@ module.exports = (ctx) => {
         (req) => [
           'finance/power-cost',
           req.query.start,
-          req.query.end
+          req.query.end,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_POWER_COST,
-        getPowerCost,
+        withLocalizedLog(getPowerCost),
         FINANCE_PERMS
       )
     }

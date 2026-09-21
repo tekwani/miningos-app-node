@@ -5,6 +5,7 @@ const {
   HTTP_METHODS
 } = require('../../constants')
 const { getSitePowerConsumption } = require('../handlers/power.consumption.handlers')
+const { withLocalizedLog } = require('../../metrics.utils')
 const { createCachedAuthRoute } = require('../lib/routeHelpers')
 
 module.exports = (ctx) => {
@@ -37,7 +38,7 @@ module.exports = (ctx) => {
           req.query.totalTransformerConsumption, req.query.limit, req.query.timezone
         ],
         ENDPOINTS.SITE_POWER_CONSUMPTION,
-        getSitePowerConsumption
+        withLocalizedLog(getSitePowerConsumption)
       )
     }
   ]

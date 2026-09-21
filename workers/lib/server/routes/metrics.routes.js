@@ -15,6 +15,7 @@ const {
   getInventoryMinerDistribution,
   getPowerMode,
   getPowerModeTimeline,
+  localizePowerModeTimelineLog,
   getTemperature,
   getCooling,
   getDowntime,
@@ -23,6 +24,7 @@ const {
 } = require('../handlers/metrics.handlers')
 const { getSiteLiveStatus } = require('../handlers/site.handlers')
 const { getRevenueHourly } = require('../handlers/finance.handlers')
+const { withLocalizedLog } = require('../../metrics.utils')
 const { createCachedAuthRoute } = require('../lib/routeHelpers')
 
 module.exports = (ctx) => {
@@ -76,7 +78,7 @@ module.exports = (ctx) => {
           req.query.racks
         ],
         ENDPOINTS.METRICS_CONSUMPTION,
-        getConsumption
+        withLocalizedLog(getConsumption)
       )
     },
     {
@@ -97,7 +99,7 @@ module.exports = (ctx) => {
           req.query.racks
         ],
         ENDPOINTS.METRICS_EFFICIENCY,
-        getEfficiency
+        withLocalizedLog(getEfficiency)
       )
     },
     {
@@ -116,7 +118,7 @@ module.exports = (ctx) => {
           req.query.groupBy
         ],
         ENDPOINTS.METRICS_MINER_STATUS,
-        getMinerStatus
+        withLocalizedLog(getMinerStatus)
       )
     },
     {
@@ -194,7 +196,7 @@ module.exports = (ctx) => {
         ctx,
         (req) => ['metrics/revenue/hourly', req.query.start, req.query.end, req.query.timezone, req.query.pool],
         ENDPOINTS.METRICS_REVENUE_HOURLY,
-        getRevenueHourly
+        withLocalizedLog(getRevenueHourly)
       )
     },
     {
@@ -213,7 +215,7 @@ module.exports = (ctx) => {
           req.query.timezone
         ],
         ENDPOINTS.METRICS_POWER_MODE,
-        getPowerMode
+        withLocalizedLog(getPowerMode)
       )
     },
     {
@@ -233,7 +235,7 @@ module.exports = (ctx) => {
           req.query.container
         ],
         ENDPOINTS.METRICS_POWER_MODE_TIMELINE,
-        getPowerModeTimeline
+        withLocalizedLog(getPowerModeTimeline, localizePowerModeTimelineLog)
       )
     },
     {
@@ -253,7 +255,7 @@ module.exports = (ctx) => {
           req.query.container
         ],
         ENDPOINTS.METRICS_TEMPERATURE,
-        getTemperature
+        withLocalizedLog(getTemperature)
       )
     },
     {
@@ -272,7 +274,7 @@ module.exports = (ctx) => {
           req.query.timezone
         ],
         ENDPOINTS.METRICS_COOLING,
-        getCooling
+        withLocalizedLog(getCooling)
       )
     },
     {
@@ -291,7 +293,7 @@ module.exports = (ctx) => {
           req.query.timezone
         ],
         ENDPOINTS.METRICS_DOWNTIME,
-        getDowntime
+        withLocalizedLog(getDowntime)
       )
     },
     {
@@ -312,7 +314,7 @@ module.exports = (ctx) => {
           req.query.limit
         ],
         ENDPOINTS.METRICS_CONTAINER_HISTORY,
-        getContainerHistory
+        withLocalizedLog(getContainerHistory)
       )
     },
     {
