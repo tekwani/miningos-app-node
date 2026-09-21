@@ -3016,7 +3016,7 @@ test('getPowerModeTimeline - fetches a 7d range as bounded 1m windows', async (t
 
   const start = 1700000000000
   const end = start + 7 * 24 * 60 * 60 * 1000
-  const result = await getPowerModeTimeline(mockCtx, { query: { start, end } })
+  const result = await getPowerModeTimeline(mockCtx, { query: { start, end, timezone: 'UTC' } })
 
   t.is(capturedPayloads.length, 14, 'should split 7d of 1m samples into 720-sample windows')
   t.is(capturedPayloads[0].key, 'stat-1m', 'should request the 1m stat log')

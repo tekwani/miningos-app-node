@@ -1,6 +1,7 @@
 'use strict'
 
 const test = require('brittle')
+const { LOCKED_TIMEZONE_DEFAULT } = require('../../../workers/lib/constants')
 const {
   assertTimezone,
   resolveTimezone,
@@ -41,10 +42,10 @@ test('resolveTimezone - falls back to common.json lockedTimezone', (t) => {
   t.pass()
 })
 
-test('resolveTimezone - falls back to UTC when unset anywhere', (t) => {
+test('resolveTimezone - falls back to the constants default when unset anywhere', (t) => {
   const ctx = { conf: {} }
   const req = { query: {} }
-  t.is(resolveTimezone(ctx, req), 'UTC')
+  t.is(resolveTimezone(ctx, req), LOCKED_TIMEZONE_DEFAULT)
   t.pass()
 })
 

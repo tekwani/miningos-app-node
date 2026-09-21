@@ -2,7 +2,7 @@
 
 const test = require('brittle')
 const { getGlobalConfig, setGlobalConfig, getFeatureConfig, getFeatures, setFeatures, getGlobalData, setGlobalData } = require('../../../workers/lib/server/handlers/global.handlers')
-const { GLOBAL_DATA_TYPES } = require('../../../workers/lib/constants')
+const { GLOBAL_DATA_TYPES, LOCKED_TIMEZONE_DEFAULT } = require('../../../workers/lib/constants')
 const { withDataProxy } = require('../helpers/mockHelpers')
 
 test('getGlobalConfig - with fields query param', async (t) => {
@@ -109,7 +109,7 @@ test('getFeatureConfig - defaults lockedTimezone when common.json omits it', asy
   }
 
   const result = await getFeatureConfig(mockCtx)
-  t.is(result.lockedTimezone, 'UTC')
+  t.is(result.lockedTimezone, LOCKED_TIMEZONE_DEFAULT)
   t.is(result.feature1, true, 'other feature flags still pass through')
   t.pass()
 })
@@ -118,7 +118,7 @@ test('getFeatureConfig - defaults lockedTimezone when featureConfig is missing e
   const mockCtx = { conf: {} }
 
   const result = await getFeatureConfig(mockCtx)
-  t.is(result.lockedTimezone, 'UTC')
+  t.is(result.lockedTimezone, LOCKED_TIMEZONE_DEFAULT)
   t.pass()
 })
 
