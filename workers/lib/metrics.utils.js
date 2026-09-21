@@ -109,16 +109,17 @@ function localizeLogTimestamps (log, timeZone) {
 }
 
 // Wraps a routed (ctx, req, rep) handler so a response `log` array has its
-// timestamps localized - but only when the caller explicitly sent `timezone`.
-// A timezone resolved from the site's lockedTimezone or the hardcoded default
-// must not change the response for a caller who never mentioned timezone at all.
+// timestamps localized. Resolves the timezone the same way resolveStartEnd does
+// for the request's start/end - request param, else the site's lockedTimezone,
+// else the hardcoded default - so a caller who never mentions timezone still
+// gets a response localized to whatever zone their start/end were interpreted in.
 // `mapLog` defaults to the `ts`/`timeRange` shape most log entries use; pass a
 // custom one for a response whose entries carry timestamps differently.
 function withLocalizedLog (handler, mapLog = localizeLogTimestamps) {
   return async (ctx, req, rep) => {
     const result = await handler(ctx, req, rep)
-    const timezone = req.query && req.query.timezone
-    if (!timezone || !result || !Array.isArray(result.log)) return result
+    if (!result || !Array.isArray(result.log)) return result
+    const timezone = resolveTimezone(ctx, req)
     return { ...result, log: mapLog(result.log, timezone) }
   }
 }
