@@ -1,7 +1,8 @@
 'use strict'
 
 const { getStartOfDay } = require('./period.utils')
-const { METRICS_TIME, LOG_KEYS, LOCKED_TIMEZONE_DEFAULT } = require('./constants')
+const { METRICS_TIME, LOG_KEYS } = require('./constants')
+const { DEFAULT_TIMEZONE } = require('./server/lib/export/mappers')
 
 /**
  * Parse timestamp from RPC entry.
@@ -52,11 +53,12 @@ function assertTimezone (timezone) {
   }
 }
 
-// A request's `timezone` param wins; otherwise the site's locked timezone from
-// common.json, falling back to the constants default when neither is set.
+// Only an explicit request `timezone` triggers local<->UTC conversion. The site's
+// lockedTimezone and the constants default are display-only values surfaced via
+// getFeatureConfig - they never feed into how start/end or log ts are interpreted,
+// so a caller who omits timezone always gets untouched UTC in both directions.
 function resolveTimezone (ctx, req) {
-  const timezone = req.query.timezone || ctx.conf?.featureConfig?.lockedTimezone || LOCKED_TIMEZONE_DEFAULT
-  return assertTimezone(timezone)
+  return assertTimezone(req.query.timezone || DEFAULT_TIMEZONE)
 }
 
 // `ms` arrives as the wall-clock time in `timeZone` (expressed as if it were UTC ms)
@@ -109,10 +111,8 @@ function localizeLogTimestamps (log, timeZone) {
 }
 
 // Wraps a routed (ctx, req, rep) handler so a response `log` array has its
-// timestamps localized. Resolves the timezone the same way resolveStartEnd does
-// for the request's start/end - request param, else the site's lockedTimezone,
-// else the hardcoded default - so a caller who never mentions timezone still
-// gets a response localized to whatever zone their start/end were interpreted in.
+// timestamps localized - resolved via resolveTimezone, so this is a no-op unless
+// the caller sent an explicit `timezone` (see resolveTimezone).
 // `mapLog` defaults to the `ts`/`timeRange` shape most log entries use; pass a
 // custom one for a response whose entries carry timestamps differently.
 function withLocalizedLog (handler, mapLog = localizeLogTimestamps) {

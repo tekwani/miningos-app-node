@@ -1,7 +1,6 @@
 'use strict'
 
 const test = require('brittle')
-const { LOCKED_TIMEZONE_DEFAULT } = require('../../../workers/lib/constants')
 const {
   validateStartEnd,
   resolveTimezone,
@@ -65,17 +64,17 @@ test('resolveTimezone - request timezone wins', (t) => {
   t.pass()
 })
 
-test('resolveTimezone - falls back to common.json lockedTimezone', (t) => {
+test('resolveTimezone - ignores common.json lockedTimezone, defaults to UTC', (t) => {
   const ctx = { conf: { featureConfig: { lockedTimezone: 'America/Campo_Grande' } } }
   const req = { query: {} }
-  t.is(resolveTimezone(ctx, req), 'America/Campo_Grande')
+  t.is(resolveTimezone(ctx, req), 'UTC')
   t.pass()
 })
 
-test('resolveTimezone - falls back to the constants default when unset anywhere', (t) => {
+test('resolveTimezone - defaults to UTC when unset anywhere', (t) => {
   const ctx = { conf: {} }
   const req = { query: {} }
-  t.is(resolveTimezone(ctx, req), LOCKED_TIMEZONE_DEFAULT)
+  t.is(resolveTimezone(ctx, req), 'UTC')
   t.pass()
 })
 
@@ -123,15 +122,16 @@ test('resolveStartEnd - converts start/end using the request timezone', (t) => {
   t.pass()
 })
 
-test('resolveStartEnd - defaults to common.json lockedTimezone', (t) => {
+test('resolveStartEnd - ignores common.json lockedTimezone without an explicit request timezone', (t) => {
   const ctx = { conf: { featureConfig: { lockedTimezone: 'America/Campo_Grande' } } }
-  const localStart = Date.UTC(2026, 5, 1, 0, 0, 0)
-  const localEnd = Date.UTC(2026, 5, 2, 0, 0, 0)
-  const req = { query: { start: localStart, end: localEnd } }
+  const start = Date.UTC(2026, 5, 1, 0, 0, 0)
+  const end = Date.UTC(2026, 5, 2, 0, 0, 0)
+  const req = { query: { start, end } }
 
-  const { start, end } = resolveStartEnd(ctx, req)
-  t.is(start, localStart + 4 * 3600000)
-  t.is(end, localEnd + 4 * 3600000)
+  const result = resolveStartEnd(ctx, req)
+  t.is(result.timezone, 'UTC')
+  t.is(result.start, start)
+  t.is(result.end, end)
   t.pass()
 })
 

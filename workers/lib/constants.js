@@ -318,8 +318,10 @@ const DEFAULTS = {
   OPERATION_COUNT: 1
 }
 
-// Fallback IANA timezone used to interpret request-supplied start/end when neither the
-// request nor common.json's featureConfig.lockedTimezone specifies one.
+// Display-only fallback for getFeatureConfig's `lockedTimezone` field when
+// common.json's featureConfig.lockedTimezone isn't set. It does not feed into
+// start/end or log ts conversion - those only convert on an explicit request
+// `timezone` (see resolveTimezone in metrics.utils.js).
 const LOCKED_TIMEZONE_DEFAULT = 'America/Campo_Grande'
 
 const STATUS_CODES = {
