@@ -5,7 +5,7 @@ const { AUTH_CACHE_TTL } = require('../../constants')
 
 async function authCheck (ctx, req, rep, tokenFromQuery = null) {
   req._info = req._info || {}
-return
+
   if (ctx.noAuth) return
 
   const token = tokenFromQuery || getAuthTokenFromHeaders(req.headers)

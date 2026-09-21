@@ -886,8 +886,6 @@ async function getRevenueSummary (ctx, req) {
   const { start, end, timezone } = resolveStartEnd(ctx, req)
   const period = req.query.period || PERIOD_TYPES.DAILY
 
-  console.log('in revenue', start, end)
-  
   const [
     transactionResults,
     priceResults,

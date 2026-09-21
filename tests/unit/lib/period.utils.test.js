@@ -3,6 +3,7 @@
 const test = require('brittle')
 const {
   getStartOfDay,
+  localDayStart,
   convertMsToSeconds,
   getPeriodEndDate,
   aggregateByPeriod,
@@ -10,12 +11,35 @@ const {
   isTimestampInPeriod,
   getFilteredPeriodData
 } = require('../../../workers/lib/period.utils')
+const { LOCKED_TIMEZONE_DEFAULT } = require('../../../workers/lib/constants')
 
 test('getStartOfDay - returns start of day timestamp', (t) => {
   const ts = 1700050000000
   const result = getStartOfDay(ts)
   t.ok(result <= ts, 'should be less than or equal to input')
   t.is(result % 86400000, 0, 'should be divisible by 86400000')
+  t.pass()
+})
+
+// ==================== localDayStart ====================
+
+test('localDayStart - explicit UTC matches getStartOfDay', (t) => {
+  const ts = Date.UTC(2026, 8, 1, 2)
+  t.is(localDayStart(ts, 'UTC'), getStartOfDay(ts))
+  t.pass()
+})
+
+test('localDayStart - aligns to local midnight for a non-UTC zone', (t) => {
+  // 02:00 UTC on Sep 1 is still Aug 31 22:00 in America/Campo_Grande (UTC-4).
+  const ts = Date.UTC(2026, 8, 1, 2)
+  t.is(localDayStart(ts, 'America/Campo_Grande'), Date.UTC(2026, 7, 31, 4))
+  t.pass()
+})
+
+test('localDayStart - no timezone arg falls back to LOCKED_TIMEZONE_DEFAULT, not UTC', (t) => {
+  const ts = Date.UTC(2026, 8, 1, 2)
+  t.is(localDayStart(ts), localDayStart(ts, LOCKED_TIMEZONE_DEFAULT))
+  t.not(localDayStart(ts), getStartOfDay(ts), 'the constants default is not UTC, so this differs from the UTC bucket')
   t.pass()
 })
 

@@ -1,6 +1,6 @@
 'use strict'
 
-const { PERIOD_TYPES, NON_METRIC_KEYS } = require('./constants')
+const { PERIOD_TYPES, NON_METRIC_KEYS, LOCKED_TIMEZONE_DEFAULT } = require('./constants')
 
 const getStartOfDay = (ts) => Math.floor(ts / 86400000) * 86400000
 
@@ -25,23 +25,24 @@ function zoneOffsetMs (ts, timeZone) {
 
 // First instant of the local calendar day (in `timeZone`) containing `ts`. DST-safe:
 // resolved twice because the naive guess can land on the wrong side of a shift.
-// Keep using getStartOfDay for callers that must stay on the UTC grid (e.g. a store
-// bucket that is itself UTC-aligned); use this one wherever a "day" bucket has to line
-// up with the site's own calendar instead.
+// A caller that doesn't pass a zone at all gets LOCKED_TIMEZONE_DEFAULT rather than
+// silently landing on the UTC grid - this function has no ctx, so it can't see the
+// site's own featureConfig.lockedTimezone, only the constants fallback. A caller that
+// wants true UTC has to say so explicitly with `'UTC'`.
 const localDayStart = (ts, timeZone) => {
-  console.log('localdaystart', timeZone)
-  if (!timeZone || timeZone === 'UTC') return getStartOfDay(ts)
+  const zone = timeZone || LOCKED_TIMEZONE_DEFAULT
+  if (zone === 'UTC') return getStartOfDay(ts)
 
   const parts = {}
   const formatted = new Intl.DateTimeFormat('en-US', {
-    timeZone, year: 'numeric', month: '2-digit', day: '2-digit'
+    timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit'
   }).formatToParts(new Date(ts))
   for (const { type, value } of formatted) parts[type] = value
 
   const wallClock = Date.UTC(+parts.year, +parts.month - 1, +parts.day)
-  const asTs = wallClock - zoneOffsetMs(wallClock, timeZone)
-  const settled = zoneOffsetMs(asTs, timeZone)
-  return settled === zoneOffsetMs(wallClock, timeZone) ? asTs : wallClock - settled
+  const asTs = wallClock - zoneOffsetMs(wallClock, zone)
+  const settled = zoneOffsetMs(asTs, zone)
+  return settled === zoneOffsetMs(wallClock, zone) ? asTs : wallClock - settled
 }
 
 const convertMsToSeconds = (timestampMs) => {
