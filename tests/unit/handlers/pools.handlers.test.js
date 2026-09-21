@@ -11,6 +11,9 @@ const {
   flattenPoolHashrateHistory,
   resolvePoolHashrateForBuckets,
   groupByBucket,
+  localDayStartTs,
+  localWeekStartTs,
+  localBucketStartTs,
   getPoolThingConfig,
   getPoolStatsContainers
 } = require('../../../workers/lib/server/handlers/pools.handlers')
@@ -306,15 +309,28 @@ test('groupByBucket - groups by daily bucket', (t) => {
     { ts: 1700050000000, revenue: 200 },
     { ts: 1700092800000, revenue: 300 }
   ]
-  const bucketSize = 86400000
-  const buckets = groupByBucket(entries, bucketSize)
+  const buckets = groupByBucket(entries, '1D', 'UTC')
   t.ok(typeof buckets === 'object', 'should return object')
   t.ok(Object.keys(buckets).length >= 1, 'should have at least one bucket')
   t.pass()
 })
 
+test('groupByBucket - groups by local calendar week/month', (t) => {
+  const entries = [
+    { ts: Date.UTC(2026, 0, 5), revenue: 100 }, // Monday
+    { ts: Date.UTC(2026, 0, 6), revenue: 200 }, // Tuesday, same week
+    { ts: Date.UTC(2026, 1, 1), revenue: 300 } // different month
+  ]
+  const weekly = groupByBucket(entries, '1W', 'UTC')
+  t.is(Object.keys(weekly).length, 2, 'first two entries share a week bucket')
+
+  const monthly = groupByBucket(entries, '1M', 'UTC')
+  t.is(Object.keys(monthly).length, 2, 'entries split across two month buckets')
+  t.pass()
+})
+
 test('groupByBucket - handles empty entries', (t) => {
-  const buckets = groupByBucket([], 86400000)
+  const buckets = groupByBucket([], '1D', 'UTC')
   t.is(Object.keys(buckets).length, 0, 'should be empty')
   t.pass()
 })
@@ -324,8 +340,59 @@ test('groupByBucket - handles missing timestamps', (t) => {
     { revenue: 100 },
     { ts: 1700006400000, revenue: 200 }
   ]
-  const buckets = groupByBucket(entries, 86400000)
+  const buckets = groupByBucket(entries, '1D', 'UTC')
   t.ok(Object.keys(buckets).length >= 1, 'should skip items without ts')
+  t.pass()
+})
+
+test('localDayStartTs - aligns to local midnight, not UTC midnight', (t) => {
+  // 2026-01-05 23:30 UTC is still 2026-01-05 in America/New_York (UTC-5), but
+  // already 2026-01-06 in UTC - the local day start must differ from the UTC one.
+  const ts = Date.UTC(2026, 0, 5, 23, 30)
+  const utcDayStart = localDayStartTs(ts, 'UTC')
+  const nyDayStart = localDayStartTs(ts, 'America/New_York')
+  t.is(utcDayStart, Date.UTC(2026, 0, 5), 'UTC day start is UTC midnight')
+  t.is(nyDayStart, Date.UTC(2026, 0, 5, 5), 'NY day start is 05:00 UTC (local midnight)')
+  t.pass()
+})
+
+test('localWeekStartTs - buckets Mon-Sun into the same Monday-start week', (t) => {
+  const monday = Date.UTC(2026, 0, 5)
+  const sunday = Date.UTC(2026, 0, 11, 12)
+  t.is(localWeekStartTs(monday, 'UTC'), monday, 'monday is its own week start')
+  t.is(localWeekStartTs(sunday, 'UTC'), monday, 'sunday rolls back to monday')
+  t.pass()
+})
+
+test('localBucketStartTs - dispatches by range', (t) => {
+  const ts = Date.UTC(2026, 0, 15, 6)
+  t.is(localBucketStartTs(ts, '1D', 'UTC'), localDayStartTs(ts, 'UTC'), '1D uses day start')
+  t.is(localBucketStartTs(ts, '1W', 'UTC'), localWeekStartTs(ts, 'UTC'), '1W uses week start')
+  t.is(localBucketStartTs(ts, '1M', 'UTC'), Date.UTC(2026, 0, 1), '1M uses month start')
+  t.pass()
+})
+
+test('getPoolBalanceHistory - timezone param converts local start/end to UTC', async (t) => {
+  let capturedPayload = null
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        capturedPayload = payload
+        return [{ ts: '1700006400000', transactions: [] }]
+      }
+    }
+  })
+
+  // Wall-clock midnight in America/New_York (UTC-5) should shift 5h forward to UTC.
+  const mockReq = {
+    query: { start: Date.UTC(2026, 0, 5), end: Date.UTC(2026, 0, 6), range: '1D', timezone: 'America/New_York' },
+    params: {}
+  }
+
+  await getPoolBalanceHistory(mockCtx, mockReq, {})
+  t.is(capturedPayload.query.start, Date.UTC(2026, 0, 5, 5), 'start shifted by the zone offset')
+  t.is(capturedPayload.query.end, Date.UTC(2026, 0, 6, 5), 'end shifted by the zone offset')
   t.pass()
 })
 

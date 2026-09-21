@@ -47,7 +47,8 @@ module.exports = (ctx) => {
           req.params.pool,
           req.query.start,
           req.query.end,
-          req.query.range
+          req.query.range,
+          req.query.timezone
         ],
         ENDPOINTS.POOLS_BALANCE_HISTORY,
         getPoolBalanceHistory

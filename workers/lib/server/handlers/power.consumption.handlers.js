@@ -1,7 +1,7 @@
 'use strict'
 
 const { RPC_METHODS, WORKER_TAGS, DCS_POWER_METER_FIELDS } = require('../../constants')
-const { validateStartEnd } = require('../../metrics.utils')
+const { resolveStartEnd } = require('../../metrics.utils')
 const {
   isCentralDCSEnabled,
   getDCSTag,
@@ -152,7 +152,7 @@ async function getDCSSitePowerConsumption (ctx, { start, end, interval, limit })
 // chart: tail-log over a tag/interval/range, tag-appropriate power attribute,
 // returning { summary: min/max/avg + current, log: timeseries } in raw watts.
 async function getSitePowerConsumption (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
 
   const tag = req.query.tag || WORKER_TAGS.MINER
   const interval = req.query.interval || DEFAULT_INTERVAL

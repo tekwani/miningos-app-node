@@ -449,6 +449,7 @@ module.exports = {
   rollupLocalDays,
   rollupLocalMonths,
   localMonthsInRange,
+  localMonthStartTs,
   localMonthKey,
   poolPctOfNominal,
   invoicePeriodPoolPctOfNominal,

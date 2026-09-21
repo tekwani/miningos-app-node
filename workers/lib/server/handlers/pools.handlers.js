@@ -5,14 +5,18 @@ const {
   RPC_METHODS,
   WORKER_TYPES,
   MINERPOOL_EXT_DATA_KEYS,
-  RANGE_BUCKETS,
   MINER_FIELD_MAP
 } = require('../../constants')
 const {
   parseJsonQueryParam,
-  getStartOfDay,
   flattenRpcResults
 } = require('../../utils')
+const {
+  resolveStartEnd,
+  zoneOffsetMs,
+  localMonthStartTs,
+  localMonthKey
+} = require('../../metrics.utils')
 
 async function getPools (ctx, req) {
   const filter = req.query.query ? parseJsonQueryParam(req.query.query, 'ERR_QUERY_INVALID_JSON') : null
@@ -95,29 +99,19 @@ function calculatePoolsSummary (pools) {
 }
 
 async function getPoolBalanceHistory (ctx, req) {
-  const start = Number(req.query.start)
-  const end = Number(req.query.end)
+  const { start, end, timezone } = resolveStartEnd(ctx, req)
   const range = req.query.range || '1D'
   const poolParam = req.params.pool || null
   const poolFilter = poolParam === 'all' ? null : poolParam
-
-  if (!start || !end) {
-    throw new Error('ERR_MISSING_START_END')
-  }
-
-  if (start >= end) {
-    throw new Error('ERR_INVALID_DATE_RANGE')
-  }
 
   const results = await ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
     type: 'minerpool',
     query: { key: MINERPOOL_EXT_DATA_KEYS.TRANSACTIONS, start, end, pool: poolFilter }
   })
 
-  const dailyEntries = flattenTransactionResults(results)
+  const dailyEntries = flattenTransactionResults(results, timezone)
 
-  const bucketSize = RANGE_BUCKETS[range] || RANGE_BUCKETS['1D']
-  const buckets = groupByBucket(dailyEntries, bucketSize)
+  const buckets = groupByBucket(dailyEntries, range, timezone)
 
   const log = Object.entries(buckets)
     .sort(([a], [b]) => Number(a) - Number(b))
@@ -139,7 +133,7 @@ async function getPoolBalanceHistory (ctx, req) {
   return { log }
 }
 
-function flattenTransactionResults (results) {
+function flattenTransactionResults (results, timezone = 'UTC') {
   const daily = []
   for (const res of results) {
     if (res.error || !res) continue
@@ -170,7 +164,7 @@ function flattenTransactionResults (results) {
       if (revenue === 0 && hashCount === 0) continue
 
       daily.push({
-        ts: getStartOfDay(ts),
+        ts: localDayStartTs(ts, timezone),
         revenue,
         hashrate: hashCount > 0 ? hashrate / hashCount : 0
       })
@@ -180,12 +174,46 @@ function flattenTransactionResults (results) {
   return daily
 }
 
-function groupByBucket (entries, bucketSize) {
+// DST-safe: first instant of the local calendar day (in `timezone`) containing `ts`.
+// Mirrors metrics.utils' localMonthStartTs, one calendar level down.
+function localDayStartTs (ts, timezone) {
+  const parts = {}
+  for (const { type, value } of new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(new Date(ts))) parts[type] = value
+
+  const wallClock = Date.UTC(+parts.year, +parts.month - 1, +parts.day)
+  const asTs = wallClock - zoneOffsetMs(wallClock, timezone)
+  const settled = zoneOffsetMs(asTs, timezone)
+  return settled === zoneOffsetMs(wallClock, timezone) ? asTs : wallClock - settled
+}
+
+// Monday-start local week containing `ts`.
+function localWeekStartTs (ts, timezone) {
+  const dayStart = localDayStartTs(ts, timezone)
+  const dow = new Date(dayStart + zoneOffsetMs(dayStart, timezone)).getUTCDay() // 0=Sun..6=Sat
+  const daysSinceMonday = (dow + 6) % 7
+  if (!daysSinceMonday) return dayStart
+  // A rough step back by whole days, corrected by re-deriving the exact local day
+  // start - keeps the result right even if a DST shift falls inside the week.
+  return localDayStartTs(dayStart - daysSinceMonday * 86400000, timezone)
+}
+
+function localBucketStartTs (ts, range, timezone) {
+  if (range === '1W') return localWeekStartTs(ts, timezone)
+  if (range === '1M') {
+    const [year, month] = localMonthKey(ts, timezone).split('-').map(Number)
+    return localMonthStartTs(year, month, timezone)
+  }
+  return localDayStartTs(ts, timezone)
+}
+
+function groupByBucket (entries, range, timezone = 'UTC') {
   const buckets = {}
   for (const entry of entries) {
     const ts = entry.ts
     if (!ts) continue
-    const bucketTs = Math.floor(ts / bucketSize) * bucketSize
+    const bucketTs = localBucketStartTs(ts, range, timezone)
     if (!buckets[bucketTs]) buckets[bucketTs] = []
     buckets[bucketTs].push(entry)
   }
@@ -338,6 +366,9 @@ module.exports = {
   flattenPoolHashrateHistory,
   resolvePoolHashrateForBuckets,
   groupByBucket,
+  localDayStartTs,
+  localWeekStartTs,
+  localBucketStartTs,
   getPoolThingConfig,
   getPoolStatsContainers
 }
