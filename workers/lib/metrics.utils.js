@@ -1,8 +1,7 @@
 'use strict'
 
 const { getStartOfDay } = require('./period.utils')
-const { METRICS_TIME, LOG_KEYS } = require('./constants')
-const { DEFAULT_TIMEZONE } = require('./server/lib/export/mappers')
+const { METRICS_TIME, LOG_KEYS, LOCKED_TIMEZONE_DEFAULT } = require('./constants')
 
 /**
  * Parse timestamp from RPC entry.
@@ -53,12 +52,15 @@ function assertTimezone (timezone) {
   }
 }
 
-// Only an explicit request `timezone` triggers local<->UTC conversion. The site's
-// lockedTimezone and the constants default are display-only values surfaced via
-// getFeatureConfig - they never feed into how start/end or log ts are interpreted,
-// so a caller who omits timezone always gets untouched UTC in both directions.
+// Always resolves to a real zone: the request's own `timezone`, else the site's
+// featureConfig.lockedTimezone, else the constants default. Used unconditionally for
+// output display (withLocalizedLog) and for local day/month bucketing - only whether
+// start/end themselves get reinterpreted as wall-clock time is gated separately (see
+// resolveStartEnd), since a resolved lockedTimezone/default must not silently reshape
+// a caller's own UTC values when they never opted in with an explicit `timezone`.
 function resolveTimezone (ctx, req) {
-  return assertTimezone(req.query.timezone || DEFAULT_TIMEZONE)
+  const timezone = req.query.timezone || ctx.conf?.featureConfig?.lockedTimezone || LOCKED_TIMEZONE_DEFAULT
+  return assertTimezone(timezone)
 }
 
 // `ms` arrives as the wall-clock time in `timeZone` (expressed as if it were UTC ms)
@@ -68,17 +70,31 @@ function convertLocalToUtcMs (ms, timeZone) {
   return ms - zoneOffsetMs(ms, timeZone)
 }
 
-// validateStartEnd plus the timezone conversion described above, for routes where
-// start/end are required and always mean wall-clock time in the resolved zone.
+// validateStartEnd plus the timezone conversion described above - but only when the
+// caller explicitly sent `timezone`. A zone resolved from lockedTimezone/the constants
+// default is still returned (callers use it for bucketing and for withLocalizedLog's
+// output conversion), but it never reinterprets start/end on its own: those only shift
+// when the request itself opted in.
 function resolveStartEnd (ctx, req) {
   const { start, end } = validateStartEnd(req)
   const timezone = resolveTimezone(ctx, req)
+  const hasExplicitTimezone = Boolean(req.query.timezone)
 
   return {
-    start: convertLocalToUtcMs(start, timezone),
-    end: convertLocalToUtcMs(end, timezone),
+    start: hasExplicitTimezone ? convertLocalToUtcMs(start, timezone) : start,
+    end: hasExplicitTimezone ? convertLocalToUtcMs(end, timezone) : end,
     timezone
   }
+}
+
+// For an optional start/end with a computed fallback (already a true UTC instant): an
+// explicitly-supplied value is only reinterpreted as local wall-clock time when the
+// caller also sent `timezone` explicitly - mirrors resolveStartEnd's gating for the
+// required start/end case, for the routes where start/end are optional instead.
+function resolveOptionalTimeMs (req, timezone, rawValue, defaultMs) {
+  if (rawValue === undefined) return defaultMs
+  const ms = Number(rawValue)
+  return req.query.timezone ? convertLocalToUtcMs(ms, timezone) : ms
 }
 
 // Reverse of convertLocalToUtcMs: shifts a true UTC instant to the ms value that
@@ -111,8 +127,10 @@ function localizeLogTimestamps (log, timeZone) {
 }
 
 // Wraps a routed (ctx, req, rep) handler so a response `log` array has its
-// timestamps localized - resolved via resolveTimezone, so this is a no-op unless
-// the caller sent an explicit `timezone` (see resolveTimezone).
+// timestamps localized - unconditionally, using resolveTimezone's resolved zone
+// (request timezone, else lockedTimezone, else the constants default). Unlike
+// resolveStartEnd's start/end conversion, this always runs: a caller who never
+// mentions timezone still gets a response localized to the site's own zone.
 // `mapLog` defaults to the `ts`/`timeRange` shape most log entries use; pass a
 // custom one for a response whose entries carry timestamps differently.
 function withLocalizedLog (handler, mapLog = localizeLogTimestamps) {
@@ -483,6 +501,7 @@ module.exports = {
   resolveTimezone,
   convertLocalToUtcMs,
   resolveStartEnd,
+  resolveOptionalTimeMs,
   convertUtcToLocalMs,
   localizeLogTimestamps,
   withLocalizedLog,
