@@ -53,11 +53,9 @@ function assertTimezone (timezone) {
 }
 
 // Always resolves to a real zone: the request's own `timezone`, else the site's
-// featureConfig.lockedTimezone, else the constants default. Used unconditionally for
-// output display (withLocalizedLog) and for local day/month bucketing - only whether
-// start/end themselves get reinterpreted as wall-clock time is gated separately (see
-// resolveStartEnd), since a resolved lockedTimezone/default must not silently reshape
-// a caller's own UTC values when they never opted in with an explicit `timezone`.
+// featureConfig.lockedTimezone, else the constants default. Used only for local
+// day/month bucketing - never to reinterpret start/end or to shift response timestamps,
+// which are true UTC instants in and out.
 function resolveTimezone (ctx, req) {
   const timezone = req.query.timezone || ctx.conf?.featureConfig?.lockedTimezone || LOCKED_TIMEZONE_DEFAULT
   return assertTimezone(timezone)
@@ -65,7 +63,7 @@ function resolveTimezone (ctx, req) {
 
 // start/end are always true UTC instants, exactly like /auth/export - `timezone` never
 // reinterprets them as wall-clock time. It still resolves (request, else lockedTimezone,
-// else the constants default) for callers that bucket or localize by it.
+// else the constants default) for callers that bucket by it.
 function resolveStartEnd (ctx, req) {
   const { start, end } = validateStartEnd(req)
   const timezone = resolveTimezone(ctx, req)
@@ -78,54 +76,6 @@ function resolveStartEnd (ctx, req) {
 function resolveOptionalTimeMs (req, rawValue, defaultMs) {
   if (rawValue === undefined) return defaultMs
   return Number(rawValue)
-}
-
-// Shifts a true UTC instant to the ms value that carries the same wall-clock digits as
-// `timeZone`'s local time, so a caller that renders the timestamp with no further
-// timezone math sees local time.
-function convertUtcToLocalMs (ms, timeZone) {
-  if (!timeZone || timeZone === 'UTC' || !Number.isFinite(ms)) return ms
-  return ms + zoneOffsetMs(ms, timeZone)
-}
-
-// Output-side mirror of resolveStartEnd's input conversion: shifts every entry's
-// `ts` (and `timeRange.startTs`/`endTs`, when present) from the true UTC instant
-// the store holds to the local-wall-clock-as-ms form described above.
-function localizeLogTimestamps (log, timeZone) {
-  if (!Array.isArray(log) || !timeZone || timeZone === 'UTC') return log
-
-  return log.map((entry) => {
-    if (!entry || typeof entry !== 'object') return entry
-    const out = { ...entry }
-    if (typeof out.ts === 'number') out.ts = convertUtcToLocalMs(out.ts, timeZone)
-    if (out.timeRange && typeof out.timeRange === 'object') {
-      out.timeRange = {
-        ...out.timeRange,
-        startTs: convertUtcToLocalMs(out.timeRange.startTs, timeZone),
-        endTs: convertUtcToLocalMs(out.timeRange.endTs, timeZone)
-      }
-    }
-    return out
-  })
-}
-
-// Wraps a routed (ctx, req, rep) handler so a response `log` array has its
-// timestamps localized - same gating as resolveStartEnd's input conversion: only
-// when the caller explicitly sent `timezone`. A zone resolved from lockedTimezone or
-// the constants default is still used once that gate is open (and always feeds
-// internal day/month bucketing regardless), but it must not silently reshape a
-// response the caller never asked to see in local time.
-// `mapLog` defaults to the `ts`/`timeRange` shape most log entries use; pass a
-// custom one for a response whose entries carry timestamps differently.
-function withLocalizedLog (handler, mapLog = localizeLogTimestamps) {
-  return async (ctx, req, rep) => {
-    const result = await handler(ctx, req, rep)
-    if (!result || !Array.isArray(result.log)) return result
-    const hasExplicitTimezone = Boolean(req.query.timezone)
-    if (!hasExplicitTimezone) return result
-    const timezone = resolveTimezone(ctx, req)
-    return { ...result, log: mapLog(result.log, timezone) }
-  }
 }
 
 function * iterateRpcEntries (results) {
@@ -487,9 +437,6 @@ module.exports = {
   resolveTimezone,
   resolveStartEnd,
   resolveOptionalTimeMs,
-  convertUtcToLocalMs,
-  localizeLogTimestamps,
-  withLocalizedLog,
   iterateRpcEntries,
   forEachRangeAggrItem,
   sumObjectValues,

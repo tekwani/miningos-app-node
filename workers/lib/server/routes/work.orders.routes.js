@@ -24,7 +24,7 @@ const {
   exportWorkOrdersRma,
   exportWorkOrdersBulk
 } = require('../handlers/work.orders.handlers')
-const { createAuthRoute, createCachedAuthRoute } = require('../lib/routeHelpers')
+const { createAuthRoute, createCachedAuthRoute, rejectTimezone } = require('../lib/routeHelpers')
 const { stableJsonString } = require('../../utils')
 
 module.exports = (ctx) => [
@@ -77,6 +77,7 @@ module.exports = (ctx) => [
   {
     method: HTTP_METHODS.GET,
     url: ENDPOINTS.WORK_ORDER_AUDIT,
+    preValidation: rejectTimezone(),
     schema: schemas.audit,
     ...createCachedAuthRoute(
       ctx,

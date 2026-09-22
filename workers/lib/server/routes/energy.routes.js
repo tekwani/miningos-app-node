@@ -2,7 +2,7 @@
 
 const { ENDPOINTS, HTTP_METHODS, AUTH_PERMISSIONS } = require('../../constants')
 const { getEnergyForecast, setAvailableEnergy, getEnergyForecastHistory, setForecastSettings, getForecastSettings, setForecastOverride, setAvailableEnergyHistory, setForecastOverrideHistory } = require('../handlers/energy.handlers')
-const { createCachedAuthRoute, createAuthRoute } = require('../lib/routeHelpers')
+const { createCachedAuthRoute, createAuthRoute, rejectTimezone } = require('../lib/routeHelpers')
 const schemas = require('../schemas/energy.schemas')
 
 module.exports = (ctx) => [
@@ -20,6 +20,7 @@ module.exports = (ctx) => [
   {
     method: HTTP_METHODS.GET,
     url: ENDPOINTS.ENERGY_FORECAST_HISTORY,
+    preValidation: rejectTimezone(),
     schema: {
       querystring: {
         type: 'object',

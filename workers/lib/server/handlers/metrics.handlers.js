@@ -34,7 +34,6 @@ const {
   validateStartEnd,
   resolveStartEnd,
   resolveOptionalTimeMs,
-  convertUtcToLocalMs,
   iterateRpcEntries,
   sumObjectValues,
   extractContainerFromMinerKey,
@@ -1679,21 +1678,6 @@ function processPowerModeTimelineData (results, containerFilter) {
   return aggregator.build()
 }
 
-// getPowerModeTimeline's log entries carry their timestamps as segments[].from/to
-// rather than a top-level `ts`, so they need their own mapper for withLocalizedLog.
-function localizePowerModeTimelineLog (log, timezone) {
-  if (!Array.isArray(log) || !timezone || timezone === 'UTC') return log
-
-  return log.map((entry) => ({
-    ...entry,
-    segments: (entry.segments || []).map((segment) => ({
-      ...segment,
-      from: convertUtcToLocalMs(segment.from, timezone),
-      to: convertUtcToLocalMs(segment.to, timezone)
-    }))
-  }))
-}
-
 async function getTemperature (ctx, req) {
   const { start, end } = resolveStartEnd(ctx, req)
 
@@ -2217,6 +2201,7 @@ async function getDowntime (ctx, req) {
 }
 
 module.exports = {
+  wantsMonthlyRollup,
   ...require('../../metrics.utils'),
   getHashrate,
   getMonthlyHashrate,
@@ -2253,7 +2238,6 @@ module.exports = {
   getPowerModeTimeline,
   processPowerModeTimelineData,
   resolvePowerModeTimelineInterval,
-  localizePowerModeTimelineLog,
   getTemperature,
   processTemperatureData,
   calculateTemperatureSummary,

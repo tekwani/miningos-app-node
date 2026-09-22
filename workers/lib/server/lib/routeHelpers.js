@@ -101,7 +101,24 @@ function createCachedAuthRoute (ctx, keyParts, endpoint, handler, perms = null) 
   }
 }
 
+/**
+ * preValidation hook for routes that do not use `timezone`. Runs before schema
+ * validation (which would otherwise ignore or strip the unknown param), so a caller
+ * that sends it gets a 400 instead of a silent no-op.
+ * @param {Function} [allows] - (req) => true when this request does use the zone
+ * @returns {Function} Fastify preValidation hook
+ */
+function rejectTimezone (allows = () => false) {
+  return (req, rep, done) => {
+    if (req.query?.timezone !== undefined && !allows(req)) {
+      return done(new Error('ERR_TIMEZONE_UNSUPPORTED'))
+    }
+    done()
+  }
+}
+
 module.exports = {
+  rejectTimezone,
   createAuthHandler,
   createAuthOnRequest,
   createReadAuthOnRequest,

@@ -5,6 +5,7 @@ const {
   HTTP_METHODS
 } = require('../../constants')
 const {
+  wantsMonthlyRollup,
   getHashrate,
   getConsumption,
   getEfficiency,
@@ -15,7 +16,6 @@ const {
   getInventoryMinerDistribution,
   getPowerMode,
   getPowerModeTimeline,
-  localizePowerModeTimelineLog,
   getTemperature,
   getCooling,
   getDowntime,
@@ -24,8 +24,7 @@ const {
 } = require('../handlers/metrics.handlers')
 const { getSiteLiveStatus } = require('../handlers/site.handlers')
 const { getRevenueHourly } = require('../handlers/finance.handlers')
-const { withLocalizedLog } = require('../../metrics.utils')
-const { createCachedAuthRoute } = require('../lib/routeHelpers')
+const { createCachedAuthRoute, rejectTimezone } = require('../lib/routeHelpers')
 
 module.exports = (ctx) => {
   const schemas = require('../schemas/metrics.schemas.js')
@@ -37,6 +36,8 @@ module.exports = (ctx) => {
       schema: {
         querystring: schemas.query.hashrate
       },
+      // Only the calendar-month rollup (1M without groupBy/racks) cuts on the zone.
+      preValidation: rejectTimezone(wantsMonthlyRollup),
       ...createCachedAuthRoute(
         ctx,
         (req) => [
@@ -65,6 +66,7 @@ module.exports = (ctx) => {
       schema: {
         querystring: schemas.query.consumption
       },
+      preValidation: rejectTimezone(),
       ...createCachedAuthRoute(
         ctx,
         (req) => [
@@ -72,13 +74,12 @@ module.exports = (ctx) => {
           req.query.start,
           req.query.end,
           req.query.interval,
-          req.query.timezone,
           req.query.groupBy,
           req.query.byMeter,
           req.query.racks
         ],
         ENDPOINTS.METRICS_CONSUMPTION,
-        withLocalizedLog(getConsumption)
+        getConsumption
       )
     },
     {
@@ -87,6 +88,7 @@ module.exports = (ctx) => {
       schema: {
         querystring: schemas.query.efficiency
       },
+      preValidation: rejectTimezone(),
       ...createCachedAuthRoute(
         ctx,
         (req) => [
@@ -94,12 +96,11 @@ module.exports = (ctx) => {
           req.query.start,
           req.query.end,
           req.query.interval,
-          req.query.timezone,
           req.query.groupBy,
           req.query.racks
         ],
         ENDPOINTS.METRICS_EFFICIENCY,
-        withLocalizedLog(getEfficiency)
+        getEfficiency
       )
     },
     {
@@ -108,17 +109,17 @@ module.exports = (ctx) => {
       schema: {
         querystring: schemas.query.minerStatus
       },
+      preValidation: rejectTimezone(),
       ...createCachedAuthRoute(
         ctx,
         (req) => [
           'metrics/miner-status',
           req.query.start,
           req.query.end,
-          req.query.timezone,
           req.query.groupBy
         ],
         ENDPOINTS.METRICS_MINER_STATUS,
-        withLocalizedLog(getMinerStatus)
+        getMinerStatus
       )
     },
     {
@@ -192,11 +193,12 @@ module.exports = (ctx) => {
       schema: {
         querystring: schemas.query.revenueHourly
       },
+      preValidation: rejectTimezone(),
       ...createCachedAuthRoute(
         ctx,
-        (req) => ['metrics/revenue/hourly', req.query.start, req.query.end, req.query.timezone, req.query.pool],
+        (req) => ['metrics/revenue/hourly', req.query.start, req.query.end, req.query.pool],
         ENDPOINTS.METRICS_REVENUE_HOURLY,
-        withLocalizedLog(getRevenueHourly)
+        getRevenueHourly
       )
     },
     {
@@ -205,17 +207,17 @@ module.exports = (ctx) => {
       schema: {
         querystring: schemas.query.powerMode
       },
+      preValidation: rejectTimezone(),
       ...createCachedAuthRoute(
         ctx,
         (req) => [
           'metrics/power-mode',
           req.query.start,
           req.query.end,
-          req.query.interval,
-          req.query.timezone
+          req.query.interval
         ],
         ENDPOINTS.METRICS_POWER_MODE,
-        withLocalizedLog(getPowerMode)
+        getPowerMode
       )
     },
     {
@@ -224,6 +226,7 @@ module.exports = (ctx) => {
       schema: {
         querystring: schemas.query.powerModeTimeline
       },
+      preValidation: rejectTimezone(),
       ...createCachedAuthRoute(
         ctx,
         (req) => [
@@ -231,11 +234,10 @@ module.exports = (ctx) => {
           req.query.start,
           req.query.end,
           req.query.interval,
-          req.query.timezone,
           req.query.container
         ],
         ENDPOINTS.METRICS_POWER_MODE_TIMELINE,
-        withLocalizedLog(getPowerModeTimeline, localizePowerModeTimelineLog)
+        getPowerModeTimeline
       )
     },
     {
@@ -244,6 +246,7 @@ module.exports = (ctx) => {
       schema: {
         querystring: schemas.query.temperature
       },
+      preValidation: rejectTimezone(),
       ...createCachedAuthRoute(
         ctx,
         (req) => [
@@ -251,11 +254,10 @@ module.exports = (ctx) => {
           req.query.start,
           req.query.end,
           req.query.interval,
-          req.query.timezone,
           req.query.container
         ],
         ENDPOINTS.METRICS_TEMPERATURE,
-        withLocalizedLog(getTemperature)
+        getTemperature
       )
     },
     {
@@ -264,17 +266,17 @@ module.exports = (ctx) => {
       schema: {
         querystring: schemas.query.cooling
       },
+      preValidation: rejectTimezone(),
       ...createCachedAuthRoute(
         ctx,
         (req) => [
           'metrics/cooling',
           req.query.start,
           req.query.end,
-          req.query.interval,
-          req.query.timezone
+          req.query.interval
         ],
         ENDPOINTS.METRICS_COOLING,
-        withLocalizedLog(getCooling)
+        getCooling
       )
     },
     {
@@ -293,7 +295,7 @@ module.exports = (ctx) => {
           req.query.timezone
         ],
         ENDPOINTS.METRICS_DOWNTIME,
-        withLocalizedLog(getDowntime)
+        getDowntime
       )
     },
     {
@@ -302,6 +304,7 @@ module.exports = (ctx) => {
       schema: {
         querystring: schemas.query.containerHistory
       },
+      preValidation: rejectTimezone(),
       ...createCachedAuthRoute(
         ctx,
         (req) => [
@@ -310,11 +313,10 @@ module.exports = (ctx) => {
           req.query.start,
           req.query.end,
           req.query.interval,
-          req.query.timezone,
           req.query.limit
         ],
         ENDPOINTS.METRICS_CONTAINER_HISTORY,
-        withLocalizedLog(getContainerHistory)
+        getContainerHistory
       )
     },
     {

@@ -32,7 +32,6 @@ const {
   getPowerModeTimeline,
   processPowerModeTimelineData,
   resolvePowerModeTimelineInterval,
-  localizePowerModeTimelineLog,
   getTemperature,
   processTemperatureData,
   calculateTemperatureSummary,
@@ -2750,25 +2749,6 @@ test('getPowerModeTimeline - happy path', async (t) => {
   t.ok(result.log.length > 0, 'log should have entries')
   t.is(result.log[0].minerId, 'cont1-miner1', 'should have miner ID')
   t.ok(result.log[0].segments.length > 0, 'should have segments')
-  t.pass()
-})
-
-test('localizePowerModeTimelineLog - shifts segments[].from/to to local wall-clock', (t) => {
-  const utcFrom = Date.UTC(2026, 5, 1, 4, 0, 0)
-  const utcTo = Date.UTC(2026, 5, 1, 8, 0, 0)
-  const log = [{ minerId: 'm1', container: 'c1', segments: [{ from: utcFrom, to: utcTo, powerMode: 'normal', status: 'mining' }] }]
-
-  const localized = localizePowerModeTimelineLog(log, 'America/Campo_Grande')
-  t.is(localized[0].segments[0].from, Date.UTC(2026, 5, 1, 0, 0, 0), 'from shifted -4h')
-  t.is(localized[0].segments[0].to, Date.UTC(2026, 5, 1, 4, 0, 0), 'to shifted -4h')
-  t.is(localized[0].segments[0].powerMode, 'normal', 'other segment fields preserved')
-  t.is(log[0].segments[0].from, utcFrom, 'input log left untouched')
-  t.pass()
-})
-
-test('localizePowerModeTimelineLog - UTC is a no-op', (t) => {
-  const log = [{ minerId: 'm1', segments: [{ from: 1, to: 2 }] }]
-  t.is(localizePowerModeTimelineLog(log, 'UTC'), log)
   t.pass()
 })
 

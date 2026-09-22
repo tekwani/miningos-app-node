@@ -15,7 +15,6 @@ const {
   getHashRevenue,
   getPowerCost
 } = require('../handlers/finance.handlers')
-const { withLocalizedLog } = require('../../metrics.utils')
 const { createCachedAuthRoute } = require('../lib/routeHelpers')
 
 const FINANCE_PERMS = [AUTH_PERMISSIONS.REVENUE]
@@ -40,7 +39,7 @@ module.exports = (ctx) => {
           req.query.timezone
         ],
         ENDPOINTS.FINANCE_ENERGY_BALANCE,
-        withLocalizedLog(getEnergyBalance),
+        getEnergyBalance,
         FINANCE_PERMS
       )
     },
@@ -60,7 +59,7 @@ module.exports = (ctx) => {
           req.query.timezone
         ],
         ENDPOINTS.FINANCE_EBITDA,
-        withLocalizedLog(getEbitda),
+        getEbitda,
         FINANCE_PERMS
       )
     },
@@ -80,7 +79,7 @@ module.exports = (ctx) => {
           req.query.timezone
         ],
         ENDPOINTS.FINANCE_COST_SUMMARY,
-        withLocalizedLog(getCostSummary),
+        getCostSummary,
         FINANCE_PERMS
       )
     },
@@ -100,7 +99,7 @@ module.exports = (ctx) => {
           req.query.timezone
         ],
         ENDPOINTS.FINANCE_SUBSIDY_FEES,
-        withLocalizedLog(getSubsidyFees),
+        getSubsidyFees,
         FINANCE_PERMS
       )
     },
@@ -121,7 +120,7 @@ module.exports = (ctx) => {
           req.query.timezone
         ],
         ENDPOINTS.FINANCE_REVENUE,
-        withLocalizedLog(getRevenue),
+        getRevenue,
         FINANCE_PERMS
       )
     },
@@ -141,7 +140,7 @@ module.exports = (ctx) => {
           req.query.timezone
         ],
         ENDPOINTS.FINANCE_REVENUE_SUMMARY,
-        withLocalizedLog(getRevenueSummary),
+        getRevenueSummary,
         FINANCE_PERMS
       )
     },
@@ -161,7 +160,7 @@ module.exports = (ctx) => {
           req.query.timezone
         ],
         ENDPOINTS.FINANCE_HASH_REVENUE,
-        withLocalizedLog(getHashRevenue),
+        getHashRevenue,
         FINANCE_PERMS
       )
     },
@@ -180,7 +179,7 @@ module.exports = (ctx) => {
           req.query.timezone
         ],
         ENDPOINTS.FINANCE_POWER_COST,
-        withLocalizedLog(getPowerCost),
+        getPowerCost,
         FINANCE_PERMS
       )
     }

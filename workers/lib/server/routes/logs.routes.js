@@ -11,13 +11,14 @@ const {
   tailLogRangeAggrRoute,
   getHistoryLogRoute
 } = require('../handlers/logs.handlers')
-const { createCachedAuthRoute } = require('../lib/routeHelpers')
+const { createCachedAuthRoute, rejectTimezone } = require('../lib/routeHelpers')
 
 module.exports = (ctx) => {
   return [
     {
       method: HTTP_METHODS.GET,
       url: ENDPOINTS.TAIL_LOG,
+      preValidation: rejectTimezone(),
       schema: {
         querystring: {
           type: 'object',
@@ -54,6 +55,7 @@ module.exports = (ctx) => {
     {
       method: HTTP_METHODS.GET,
       url: ENDPOINTS.TAIL_LOG_MULTI,
+      preValidation: rejectTimezone(),
       schema: {
         querystring: {
           type: 'object',
@@ -124,6 +126,7 @@ module.exports = (ctx) => {
     {
       method: HTTP_METHODS.GET,
       url: ENDPOINTS.HISTORY_LOG,
+      preValidation: rejectTimezone(),
       schema: {
         querystring: {
           type: 'object',

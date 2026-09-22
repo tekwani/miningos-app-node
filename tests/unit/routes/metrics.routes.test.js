@@ -55,12 +55,17 @@ test('metrics routes - schema integration', (t) => {
   t.pass()
 })
 
-test('metrics routes - timezone query param on every start/end route', (t) => {
-  const routes = createRoutesForTest(ROUTES_PATH)
+// Honour it or reject it: only downtime buckets on the zone, so it is the only one of
+// these that still declares `timezone`; the rest refuse it before schema validation.
+const runPreValidation = (route, query) => {
+  let result
+  route.preValidation({ query }, {}, (err) => { result = err || null })
+  return result
+}
 
-  // hashrate is deliberately excluded: its timezone param picks the 1M rollup's
-  // calendar-month boundary, not a start/end conversion, so it keeps its own schema.
-  const startEndUrls = new Set([
+test('metrics routes - timezone is declared only where it is used', (t) => {
+  const routes = createRoutesForTest(ROUTES_PATH)
+  const rejecting = [
     '/auth/metrics/consumption',
     '/auth/metrics/efficiency',
     '/auth/metrics/miner-status',
@@ -69,17 +74,29 @@ test('metrics routes - timezone query param on every start/end route', (t) => {
     '/auth/metrics/power-mode/timeline',
     '/auth/metrics/temperature',
     '/auth/metrics/cooling',
-    '/auth/metrics/downtime',
     '/auth/metrics/containers/:id/history'
-  ])
+  ]
 
-  routes.forEach(route => {
-    if (!startEndUrls.has(route.url)) return
-    const props = route.schema?.querystring?.properties
-    t.ok(props?.timezone, `route ${route.url} should accept a timezone param`)
-    t.alike(props.timezone, { type: 'string', maxLength: 100 }, `route ${route.url} timezone param should be a bounded string`)
-  })
+  for (const url of rejecting) {
+    const route = routes.find(r => r.url === url)
+    t.absent(route.schema.querystring.properties.timezone, `${url} does not declare timezone`)
+    t.is(runPreValidation(route, { timezone: 'UTC' })?.message, 'ERR_TIMEZONE_UNSUPPORTED', `${url} rejects timezone`)
+    t.is(runPreValidation(route, {}), null, `${url} passes without timezone`)
+  }
 
+  const downtime = routes.find(r => r.url === '/auth/metrics/downtime')
+  t.alike(downtime.schema.querystring.properties.timezone, { type: 'string', maxLength: 100 }, 'downtime buckets on it')
+  t.absent(downtime.preValidation, 'downtime does not reject it')
+  t.pass()
+})
+
+test('metrics routes - hashrate accepts timezone only for the 1M rollup', (t) => {
+  const hashrate = createRoutesForTest(ROUTES_PATH).find(route => route.url === '/auth/metrics/hashrate')
+
+  t.is(runPreValidation(hashrate, { interval: '1M', timezone: 'UTC' }), null, '1M rollup uses it')
+  t.is(runPreValidation(hashrate, { interval: '1d', timezone: 'UTC' })?.message, 'ERR_TIMEZONE_UNSUPPORTED', 'other intervals reject it')
+  t.is(runPreValidation(hashrate, { interval: '1M', groupBy: 'container', timezone: 'UTC' })?.message, 'ERR_TIMEZONE_UNSUPPORTED', 'grouped 1M does not roll up, so rejects it')
+  t.is(runPreValidation(hashrate, { interval: '1M', racks: 'r1', timezone: 'UTC' })?.message, 'ERR_TIMEZONE_UNSUPPORTED', 'rack-scoped 1M rejects it')
   t.pass()
 })
 
