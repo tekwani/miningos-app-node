@@ -4833,6 +4833,19 @@ test('buildHourlyDowntime + aggregateDowntimeDaily - numeric ts entries fall bac
   t.pass()
 })
 
+test('aggregateDowntimeDaily - buckets on local days in the given zone', (t) => {
+  // America/Campo_Grande is UTC-04:00 year-round, so local midnight is 04:00Z.
+  const sep1 = Date.UTC(2026, 8, 1, 4)
+  const hours = [sep1, sep1 + 19 * DOWNTIME_HOUR_MS, sep1 + 20 * DOWNTIME_HOUR_MS, sep1 + 24 * DOWNTIME_HOUR_MS]
+  const hourly = buildHourlyDowntime(hours.map(ts => ({ ts, site_power_w: 5000000 })), 10000000, new Map())
+
+  const daily = aggregateDowntimeDaily(hourly, 'America/Campo_Grande')
+  t.alike(daily.map(d => d.ts), [sep1, sep1 + 24 * DOWNTIME_HOUR_MS],
+    'hours either side of 00:00Z stay in the same local day; 04:00Z starts the next')
+  t.alike(daily[0].timeRange, { startTs: sep1, endTs: sep1 + 24 * DOWNTIME_HOUR_MS - 1 }, 'local day range')
+  t.pass()
+})
+
 // --- interval=1M: calendar-month rollup -------------------------------------
 
 // A fixed -03:00 zone (Etc/GMT+3 is UTC-03:00 - POSIX inverts the sign): whole-hour

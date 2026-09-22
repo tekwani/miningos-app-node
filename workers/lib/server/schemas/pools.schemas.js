@@ -21,17 +21,6 @@ const schemas = {
         overwriteCache: { type: 'boolean' }
       },
       required: ['start', 'end']
-    },
-    poolStatsAggregate: {
-      type: 'object',
-      properties: {
-        start: { type: 'integer', minimum: 0 },
-        end: { type: 'integer', minimum: 0 },
-        range: { type: 'string', enum: ['daily', 'weekly', 'monthly'] },
-        pool: { type: 'string' },
-        overwriteCache: { type: 'boolean' }
-      },
-      required: ['start', 'end']
     }
   }
 }

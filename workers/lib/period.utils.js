@@ -87,24 +87,6 @@ const localWeekStart = (ts, timeZone) => {
   return localDayStart(dayStart - daysSinceMonday * 86400000, zone)
 }
 
-const PERIOD_CALCULATORS = {
-  daily: (timestamp) => getStartOfDay(timestamp),
-  weekly: (timestamp) => {
-    const date = new Date(timestamp)
-    const day = date.getUTCDay()
-    const diff = date.getUTCDate() - day
-    return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), diff)).getTime()
-  },
-  monthly: (timestamp) => {
-    const date = new Date(timestamp)
-    return new Date(date.getFullYear(), date.getMonth(), 1).getTime()
-  },
-  yearly: (timestamp) => {
-    const date = new Date(timestamp)
-    return new Date(date.getFullYear(), 0, 1).getTime()
-  }
-}
-
 const aggregateByPeriod = (log, period, nonMetricKeys = [], options = {}) => {
   if (period === PERIOD_TYPES.DAILY) {
     return log
@@ -213,61 +195,9 @@ const aggregateByPeriod = (log, period, nonMetricKeys = [], options = {}) => {
   return aggregatedResults.sort((a, b) => Number(b.ts) - Number(a.ts))
 }
 
-const getPeriodKey = (timestamp, period) => {
-  const calculator = PERIOD_CALCULATORS[period] || PERIOD_CALCULATORS.daily
-  return calculator(timestamp)
-}
-
-const getPeriodEndDate = (periodTs, period) => {
-  const periodEnd = new Date(periodTs)
-
-  switch (period) {
-    case PERIOD_TYPES.WEEKLY:
-      periodEnd.setDate(periodEnd.getDate() + 7)
-      break
-    case PERIOD_TYPES.MONTHLY:
-      periodEnd.setMonth(periodEnd.getMonth() + 1)
-      break
-    case PERIOD_TYPES.YEARLY:
-      periodEnd.setFullYear(periodEnd.getFullYear() + 1)
-      break
-  }
-
-  return periodEnd
-}
-
-const isTimestampInPeriod = (timestamp, periodTs, period) => {
-  if (period === PERIOD_TYPES.DAILY) return timestamp === periodTs
-
-  const periodEnd = getPeriodEndDate(periodTs, period)
-  return timestamp >= periodTs && timestamp < periodEnd.getTime()
-}
-
-const getFilteredPeriodData = (
-  sourceData,
-  periodTs,
-  period,
-  filterFn = (entries) => entries
-) => {
-  if (period === PERIOD_TYPES.DAILY) {
-    return sourceData[periodTs] || (typeof filterFn === 'function' ? {} : 0)
-  }
-
-  const entriesInPeriod = Object.entries(sourceData).filter(([tsStr]) => {
-    const timestamp = Number(tsStr)
-    return isTimestampInPeriod(timestamp, periodTs, period)
-  })
-
-  return filterFn(entriesInPeriod, sourceData)
-}
-
 module.exports = {
   getStartOfDay,
   localDayStart,
   convertMsToSeconds,
-  getPeriodEndDate,
-  aggregateByPeriod,
-  getPeriodKey,
-  isTimestampInPeriod,
-  getFilteredPeriodData
+  aggregateByPeriod
 }

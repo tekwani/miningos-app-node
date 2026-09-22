@@ -318,10 +318,11 @@ const DEFAULTS = {
   OPERATION_COUNT: 1
 }
 
-// Display-only fallback for getFeatureConfig's `lockedTimezone` field when
-// common.json's featureConfig.lockedTimezone isn't set. It does not feed into
-// start/end or log ts conversion - those only convert on an explicit request
-// `timezone` (see resolveTimezone in metrics.utils.js).
+// Fallback site zone when common.json's featureConfig.lockedTimezone isn't set: shown by
+// getFeatureConfig, and resolved by resolveTimezone (metrics.utils.js) for every request
+// that omits `timezone`. That resolved zone cuts all finance/* day and month buckets and
+// metrics/downtime's daily ones. It never reinterprets start/end (always true UTC), and
+// log[].ts is only localized when the request sends `timezone` explicitly.
 const LOCKED_TIMEZONE_DEFAULT = 'America/Campo_Grande'
 
 const STATUS_CODES = {

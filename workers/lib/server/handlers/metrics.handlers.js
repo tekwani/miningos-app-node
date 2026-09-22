@@ -20,6 +20,7 @@ const {
 } = require('../../constants')
 const {
   getStartOfDay,
+  localDayStart,
   safeDiv,
   flattenRpcResults
 } = require('../../utils')
@@ -2114,11 +2115,12 @@ function buildHourlyDowntime (entries, nominalPowerW, decisionByHour) {
 }
 
 // Daily rates are the mean of the hourly rates over hours that have data, so
-// gaps in the stat log don't read as 100% downtime.
-function aggregateDowntimeDaily (hourlyLog) {
+// gaps in the stat log don't read as 100% downtime. Days are local calendar days in
+// `timezone`, the same grid finance/* buckets on, so pages that render both line up.
+function aggregateDowntimeDaily (hourlyLog, timezone = 'UTC') {
   const byDay = new Map()
   for (const entry of hourlyLog) {
-    const dayTs = getStartOfDay(entry.ts)
+    const dayTs = localDayStart(entry.ts, timezone)
     if (!byDay.has(dayTs)) byDay.set(dayTs, [])
     byDay.get(dayTs).push(entry)
   }
@@ -2127,7 +2129,8 @@ function aggregateDowntimeDaily (hourlyLog) {
     .sort(([a], [b]) => a - b)
     .map(([dayTs, hours]) => ({
       ts: dayTs,
-      timeRange: { startTs: dayTs, endTs: dayTs + METRICS_TIME.ONE_DAY_MS - 1 },
+      // A local day is 23-25h across a DST shift, so its end is the next day's start.
+      timeRange: { startTs: dayTs, endTs: localDayStart(dayTs + 1.5 * METRICS_TIME.ONE_DAY_MS, timezone) - 1 },
       powerW: hours.reduce((sum, h) => sum + h.powerW, 0) / hours.length,
       nominalPowerW: hours[0].nominalPowerW,
       downtimeRate: meanOfField(hours, 'downtimeRate'),
@@ -2162,7 +2165,7 @@ function calculateDowntimeSummary (log, nominalPowerW, hasForecastData) {
 }
 
 async function getDowntime (ctx, req) {
-  const { start, end } = resolveStartEnd(ctx, req)
+  const { start, end, timezone } = resolveStartEnd(ctx, req)
   const interval = req.query.interval ||
     ((end - start) <= METRICS_TIME.TWO_DAYS_MS ? '1h' : '1d')
 
@@ -2207,7 +2210,7 @@ async function getDowntime (ctx, req) {
 
   const decisionByHour = indexForecastDecisionsByHour(forecastRes)
   const hourly = buildHourlyDowntime(firstOrkEntries(powerRes), nominalPowerW, decisionByHour)
-  const log = interval === '1d' ? aggregateDowntimeDaily(hourly) : hourly
+  const log = interval === '1d' ? aggregateDowntimeDaily(hourly, timezone) : hourly
   const summary = calculateDowntimeSummary(log, nominalPowerW, decisionByHour.size > 0)
 
   return { log, summary }
