@@ -5,7 +5,6 @@ const { localDayStart } = require('../../utils')
 const {
   assertTimezone,
   resolveTimezone,
-  convertLocalToUtcMs,
   resolveStartEnd
 } = require('../../metrics.utils')
 
@@ -171,7 +170,6 @@ module.exports = {
   validateStartEnd,
   assertTimezone,
   resolveTimezone,
-  convertLocalToUtcMs,
   resolveStartEnd,
   normalizeTimestampMs,
   processTransactions,

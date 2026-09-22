@@ -31,7 +31,6 @@ const {
   parseEntryTs,
   parseEntryTimeRange,
   validateStartEnd,
-  resolveTimezone,
   resolveStartEnd,
   resolveOptionalTimeMs,
   convertUtcToLocalMs,
@@ -1558,12 +1557,9 @@ function resolvePowerModeTimelineInterval (start, end, requested) {
 
 async function getPowerModeTimeline (ctx, req) {
   const now = Date.now()
-  const timezone = resolveTimezone(ctx, req)
-  // Only an explicit start/end is wall-clock time to convert, and only when the
-  // request itself sent `timezone` explicitly - the computed defaults below are
-  // already real UTC instants relative to "now".
-  const start = resolveOptionalTimeMs(req, timezone, req.query.start, now - METRICS_TIME.ONE_MONTH_MS)
-  const end = resolveOptionalTimeMs(req, timezone, req.query.end, now)
+  // An explicit start/end is a true UTC instant, same as the computed defaults below.
+  const start = resolveOptionalTimeMs(req, req.query.start, now - METRICS_TIME.ONE_MONTH_MS)
+  const end = resolveOptionalTimeMs(req, req.query.end, now)
   const container = req.query.container || null
 
   if (start >= end) {
@@ -1891,12 +1887,9 @@ async function getContainerHistory (ctx, req) {
   }
 
   const now = Date.now()
-  const timezone = resolveTimezone(ctx, req)
-  // Only an explicit start/end is wall-clock time to convert, and only when the
-  // request itself sent `timezone` explicitly - the computed defaults below are
-  // already real UTC instants relative to "now".
-  const start = resolveOptionalTimeMs(req, timezone, req.query.start, now - METRICS_TIME.ONE_DAY_MS)
-  const end = resolveOptionalTimeMs(req, timezone, req.query.end, now)
+  // An explicit start/end is a true UTC instant, same as the computed defaults below.
+  const start = resolveOptionalTimeMs(req, req.query.start, now - METRICS_TIME.ONE_DAY_MS)
+  const end = resolveOptionalTimeMs(req, req.query.end, now)
   const limit = Number(req.query.limit) || METRICS_DEFAULTS.CONTAINER_HISTORY_LIMIT
 
   if (start >= end) {

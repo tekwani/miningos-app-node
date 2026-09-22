@@ -372,7 +372,7 @@ test('localBucketStartTs - dispatches by range', (t) => {
   t.pass()
 })
 
-test('getPoolBalanceHistory - timezone param converts local start/end to UTC', async (t) => {
+test('getPoolBalanceHistory - timezone param never reinterprets start/end', async (t) => {
   let capturedPayload = null
   const mockCtx = withDataProxy({
     conf: { orks: [{ rpcPublicKey: 'key1' }] },
@@ -384,15 +384,14 @@ test('getPoolBalanceHistory - timezone param converts local start/end to UTC', a
     }
   })
 
-  // Wall-clock midnight in America/New_York (UTC-5) should shift 5h forward to UTC.
   const mockReq = {
     query: { start: Date.UTC(2026, 0, 5), end: Date.UTC(2026, 0, 6), range: '1D', timezone: 'America/New_York' },
     params: {}
   }
 
   await getPoolBalanceHistory(mockCtx, mockReq, {})
-  t.is(capturedPayload.query.start, Date.UTC(2026, 0, 5, 5), 'start shifted by the zone offset')
-  t.is(capturedPayload.query.end, Date.UTC(2026, 0, 6, 5), 'end shifted by the zone offset')
+  t.is(capturedPayload.query.start, Date.UTC(2026, 0, 5), 'start is a true UTC instant, same as export')
+  t.is(capturedPayload.query.end, Date.UTC(2026, 0, 6), 'end is a true UTC instant, same as export')
   t.pass()
 })
 

@@ -253,7 +253,8 @@ async function getEnergyBalance (ctx, req) {
     meanKeys: [
       'sitePowerMW', 'powerW', 'btcPrice', 'energyRevenuePerMWh', 'allInCostPerMWh',
       'curtailmentRate', 'operationalIssuesRate', 'powerUtilization'
-    ]
+    ],
+    timezone
   })
 
   for (const entry of aggregated) {
@@ -543,7 +544,8 @@ async function getEbitda (ctx, req) {
   }
 
   const aggregated = aggregateByPeriod(log, period, [], {
-    meanKeys: ['btcPrice', 'powerW', 'hashrateMhs']
+    meanKeys: ['btcPrice', 'powerW', 'hashrateMhs'],
+    timezone
   })
   for (const entry of aggregated) entry.btcProductionCost = safeDiv(entry.totalCostsUSD, entry.revenueBTC)
   const summary = calculateEbitdaSummary(aggregated, currentBtcPrice)
@@ -672,7 +674,8 @@ async function getCostSummary (ctx, req) {
   }
 
   const aggregated = aggregateByPeriod(log, period, [], {
-    meanKeys: ['btcPrice', 'allInCostPerMWh', 'energyCostPerMWh']
+    meanKeys: ['btcPrice', 'allInCostPerMWh', 'energyCostPerMWh'],
+    timezone
   })
   const summary = calculateCostSummary(aggregated)
 
@@ -738,7 +741,7 @@ async function getSubsidyFees (ctx, req) {
     })
   }
 
-  const aggregated = aggregateByPeriod(log, period)
+  const aggregated = aggregateByPeriod(log, period, [], { timezone })
   const summary = calculateSubsidyFeesSummary(aggregated)
 
   return { log: aggregated, summary }
@@ -804,7 +807,7 @@ async function getRevenue (ctx, req) {
     })
   }
 
-  const aggregated = aggregateByPeriod(log, period)
+  const aggregated = aggregateByPeriod(log, period, [], { timezone })
   const summary = calculateRevenueSummary(aggregated)
 
   return { log: aggregated, summary }
@@ -1064,7 +1067,8 @@ async function getRevenueSummary (ctx, req) {
       'btcPrice', 'powerW', 'hashrateMhs', 'energyRevenuePerMWh', 'netEnergyRevenuePerMWh', 'allInCostPerMWh',
       'hashRevenueBTCPerPHsPerDay', 'hashRevenueUSDPerPHsPerDay', 'netHashRevenueUSDPerPHsPerDay',
       'curtailmentRate', 'operationalIssuesRate', 'powerUtilization', 'lcoeUsdPerMwh'
-    ]
+    ],
+    timezone
   })
   for (const entry of aggregated) entry.btcProductionCost = safeDiv(entry.totalCostsUSD, entry.revenueBTC)
   const summary = calculateDetailedRevenueSummary(aggregated, currentBtcPrice)
@@ -1294,7 +1298,8 @@ async function getHashRevenue (ctx, req) {
       'btcPrice', 'hashrateMhs', 'networkHashrateMhs',
       'hashRevenueBTCPerPHsPerDay', 'hashRevenueUSDPerPHsPerDay', 'hashCostBTCPerPHsPerDay', 'hashCostUSDPerPHsPerDay',
       'networkHashPriceBTCPerPHsPerDay', 'networkHashPriceUSDPerPHsPerDay'
-    ]
+    ],
+    timezone
   })
   const summary = calculateHashRevenueSummary(aggregated)
 

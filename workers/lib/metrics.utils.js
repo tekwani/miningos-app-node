@@ -63,43 +63,26 @@ function resolveTimezone (ctx, req) {
   return assertTimezone(timezone)
 }
 
-// `ms` arrives as the wall-clock time in `timeZone` (expressed as if it were UTC ms)
-// and is shifted here to the real UTC instant it represents.
-function convertLocalToUtcMs (ms, timeZone) {
-  if (!timeZone || timeZone === 'UTC') return ms
-  return ms - zoneOffsetMs(ms, timeZone)
-}
-
-// validateStartEnd plus the timezone conversion described above - but only when the
-// caller explicitly sent `timezone`. A zone resolved from lockedTimezone/the constants
-// default is still returned (callers use it for bucketing and for withLocalizedLog's
-// output conversion), but it never reinterprets start/end on its own: those only shift
-// when the request itself opted in.
+// start/end are always true UTC instants, exactly like /auth/export - `timezone` never
+// reinterprets them as wall-clock time. It still resolves (request, else lockedTimezone,
+// else the constants default) for callers that bucket or localize by it.
 function resolveStartEnd (ctx, req) {
   const { start, end } = validateStartEnd(req)
   const timezone = resolveTimezone(ctx, req)
-  const hasExplicitTimezone = Boolean(req.query.timezone)
 
-  return {
-    start: hasExplicitTimezone ? convertLocalToUtcMs(start, timezone) : start,
-    end: hasExplicitTimezone ? convertLocalToUtcMs(end, timezone) : end,
-    timezone
-  }
+  return { start, end, timezone }
 }
 
-// For an optional start/end with a computed fallback (already a true UTC instant): an
-// explicitly-supplied value is only reinterpreted as local wall-clock time when the
-// caller also sent `timezone` explicitly - mirrors resolveStartEnd's gating for the
-// required start/end case, for the routes where start/end are optional instead.
-function resolveOptionalTimeMs (req, timezone, rawValue, defaultMs) {
+// An optional start/end with a computed fallback: an explicitly-supplied value is a true
+// UTC instant, same as resolveStartEnd - the computed default already is one too.
+function resolveOptionalTimeMs (req, rawValue, defaultMs) {
   if (rawValue === undefined) return defaultMs
-  const ms = Number(rawValue)
-  return req.query.timezone ? convertLocalToUtcMs(ms, timezone) : ms
+  return Number(rawValue)
 }
 
-// Reverse of convertLocalToUtcMs: shifts a true UTC instant to the ms value that
-// carries the same wall-clock digits as `timeZone`'s local time, so a caller that
-// renders the timestamp with no further timezone math sees local time.
+// Shifts a true UTC instant to the ms value that carries the same wall-clock digits as
+// `timeZone`'s local time, so a caller that renders the timestamp with no further
+// timezone math sees local time.
 function convertUtcToLocalMs (ms, timeZone) {
   if (!timeZone || timeZone === 'UTC' || !Number.isFinite(ms)) return ms
   return ms + zoneOffsetMs(ms, timeZone)
@@ -502,7 +485,6 @@ module.exports = {
   validateStartEnd,
   assertTimezone,
   resolveTimezone,
-  convertLocalToUtcMs,
   resolveStartEnd,
   resolveOptionalTimeMs,
   convertUtcToLocalMs,

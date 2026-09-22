@@ -236,13 +236,13 @@ test('getPeriodEndDate - yearly returns next year', (t) => {
   t.pass()
 })
 
-test('aggregateByPeriod - monthly buckets are grouped and stamped in UTC', (t) => {
+test('aggregateByPeriod - monthly buckets are grouped and stamped in the given zone', (t) => {
   const log = [
     { ts: Date.UTC(2026, 7, 1), revenueBTC: 1 },
     { ts: Date.UTC(2026, 7, 2), revenueBTC: 2 }
   ]
 
-  const [month] = aggregateByPeriod(log, 'monthly')
+  const [month] = aggregateByPeriod(log, 'monthly', [], { timezone: 'UTC' })
 
   t.is(month.ts, Date.UTC(2026, 7, 1), 'stamped on the UTC first of the month')
   t.is(month.month, 8)
@@ -251,16 +251,54 @@ test('aggregateByPeriod - monthly buckets are grouped and stamped in UTC', (t) =
   t.pass()
 })
 
-test('aggregateByPeriod - yearly buckets are grouped and stamped in UTC', (t) => {
+test('aggregateByPeriod - yearly buckets are grouped and stamped in the given zone', (t) => {
   const log = [
     { ts: Date.UTC(2026, 0, 1), revenueBTC: 1 },
     { ts: Date.UTC(2026, 11, 31), revenueBTC: 2 }
   ]
 
-  const [year] = aggregateByPeriod(log, 'yearly')
+  const [year] = aggregateByPeriod(log, 'yearly', [], { timezone: 'UTC' })
 
   t.is(year.ts, Date.UTC(2026, 0, 1), 'stamped on the UTC first of the year')
   t.is(year.year, 2026)
   t.is(year.revenueBTC, 3, 'both UTC days land in the same bucket')
+  t.pass()
+})
+
+test('aggregateByPeriod - monthly cuts in the resolved zone, not UTC', (t) => {
+  // 02:00 UTC on Sep 1 is still Aug 31 in America/Campo_Grande (UTC-4).
+  const log = [
+    { ts: Date.UTC(2026, 7, 31, 20), revenueBTC: 1 },
+    { ts: Date.UTC(2026, 8, 1, 2), revenueBTC: 2 }
+  ]
+
+  const [month] = aggregateByPeriod(log, 'monthly', [], { timezone: 'America/Campo_Grande' })
+
+  t.is(month.month, 8, 'both entries fall in the local August, not a UTC-split August/September')
+  t.is(month.revenueBTC, 3, 'both entries land in the same local-month bucket')
+  t.pass()
+})
+
+test('aggregateByPeriod - weekly buckets are Monday-start in the resolved zone, matching pools', (t) => {
+  // Sep 2 2026 is a Wednesday, and Aug 31 2026 is the Monday of its local week in
+  // America/Campo_Grande (UTC-4).
+  const log = [
+    { ts: Date.UTC(2026, 8, 2, 12), revenueBTC: 1 },
+    { ts: Date.UTC(2026, 8, 3, 12), revenueBTC: 2 }
+  ]
+
+  const [week] = aggregateByPeriod(log, 'weekly', [], { timezone: 'America/Campo_Grande' })
+
+  t.is(week.ts, Date.UTC(2026, 7, 31, 4), 'stamped on the Monday-start local week, not the UTC Sunday-start week')
+  t.is(week.revenueBTC, 3, 'both entries land in the same local week')
+  t.pass()
+})
+
+test('aggregateByPeriod - weekly falls back to LOCKED_TIMEZONE_DEFAULT when no timezone option is given', (t) => {
+  const ts = Date.UTC(2026, 8, 2, 12)
+  const [withDefault] = aggregateByPeriod([{ ts, revenueBTC: 1 }], 'weekly')
+  const [withExplicit] = aggregateByPeriod([{ ts, revenueBTC: 1 }], 'weekly', [], { timezone: LOCKED_TIMEZONE_DEFAULT })
+
+  t.is(withDefault.ts, withExplicit.ts, 'omitting timezone resolves the same as passing the constants default explicitly')
   t.pass()
 })

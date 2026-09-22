@@ -5,7 +5,6 @@ const { LOCKED_TIMEZONE_DEFAULT } = require('../../../workers/lib/constants')
 const {
   validateStartEnd,
   resolveTimezone,
-  convertLocalToUtcMs,
   resolveStartEnd,
   normalizeTimestampMs,
   processTransactions,
@@ -91,39 +90,22 @@ test('resolveTimezone - rejects an invalid IANA timezone', (t) => {
   t.pass()
 })
 
-// ==================== convertLocalToUtcMs ====================
-
-test('convertLocalToUtcMs - UTC is a no-op', (t) => {
-  const ms = Date.UTC(2026, 5, 1, 0, 0, 0)
-  t.is(convertLocalToUtcMs(ms, 'UTC'), ms)
-  t.pass()
-})
-
-test('convertLocalToUtcMs - shifts wall-clock local time to the real UTC instant', (t) => {
-  const localMidnight = Date.UTC(2026, 5, 1, 0, 0, 0)
-  // America/Campo_Grande is UTC-4 with no DST, so local midnight is 04:00 UTC.
-  t.is(convertLocalToUtcMs(localMidnight, 'America/Campo_Grande'), localMidnight + 4 * 3600000)
-  // Asia/Kolkata is UTC+5:30, so local midnight is the previous day 18:30 UTC.
-  t.is(convertLocalToUtcMs(localMidnight, 'Asia/Kolkata'), localMidnight - 5.5 * 3600000)
-  t.pass()
-})
-
 // ==================== resolveStartEnd ====================
 
-test('resolveStartEnd - converts start/end using the request timezone', (t) => {
+test('resolveStartEnd - never reinterprets start/end, even with an explicit request timezone', (t) => {
   const ctx = { conf: {} }
-  const localStart = Date.UTC(2026, 5, 1, 0, 0, 0)
-  const localEnd = Date.UTC(2026, 5, 2, 0, 0, 0)
-  const req = { query: { start: localStart, end: localEnd, timezone: 'America/Campo_Grande' } }
+  const start = Date.UTC(2026, 5, 1, 0, 0, 0)
+  const end = Date.UTC(2026, 5, 2, 0, 0, 0)
+  const req = { query: { start, end, timezone: 'America/Campo_Grande' } }
 
-  const { start, end, timezone } = resolveStartEnd(ctx, req)
-  t.is(timezone, 'America/Campo_Grande')
-  t.is(start, localStart + 4 * 3600000)
-  t.is(end, localEnd + 4 * 3600000)
+  const result = resolveStartEnd(ctx, req)
+  t.is(result.timezone, 'America/Campo_Grande')
+  t.is(result.start, start, 'start is a true UTC instant, same as export')
+  t.is(result.end, end, 'end is a true UTC instant, same as export')
   t.pass()
 })
 
-test('resolveStartEnd - resolves lockedTimezone but never shifts start/end without an explicit request timezone', (t) => {
+test('resolveStartEnd - resolves lockedTimezone but never shifts start/end', (t) => {
   const ctx = { conf: { featureConfig: { lockedTimezone: 'America/Campo_Grande' } } }
   const start = Date.UTC(2026, 5, 1, 0, 0, 0)
   const end = Date.UTC(2026, 5, 2, 0, 0, 0)

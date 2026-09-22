@@ -312,11 +312,10 @@ test('getSitePowerConsumption - invalid range throws', async (t) => {
   t.pass()
 })
 
-test('getSitePowerConsumption - timezone param converts local start/end to UTC', async (t) => {
+test('getSitePowerConsumption - timezone param never reinterprets start/end', async (t) => {
   let captured = null
   const ctx = buildCtx({ onTailLog: (payload) => { captured = payload } })
 
-  // Wall-clock midnight in America/New_York (UTC-5) should shift 5h forward to UTC.
   await getSitePowerConsumption(ctx, {
     query: {
       start: Date.UTC(2026, 0, 5),
@@ -326,8 +325,8 @@ test('getSitePowerConsumption - timezone param converts local start/end to UTC',
     }
   })
 
-  t.is(captured.start, Date.UTC(2026, 0, 5, 5), 'start shifted by the zone offset')
-  t.is(captured.end, Date.UTC(2026, 0, 6, 5), 'end shifted by the zone offset')
+  t.is(captured.start, Date.UTC(2026, 0, 5), 'start is a true UTC instant, same as export')
+  t.is(captured.end, Date.UTC(2026, 0, 6), 'end is a true UTC instant, same as export')
   t.pass()
 })
 
