@@ -179,7 +179,7 @@ test('localizeLogTimestamps - UTC/missing timezone is a no-op', (t) => {
 
 // ==================== withLocalizedLog ====================
 
-test('withLocalizedLog - always localizes using the resolved zone, request or lockedTimezone or default', async (t) => {
+test('withLocalizedLog - localizes only when the caller sent an explicit timezone', async (t) => {
   const utcTs = Date.UTC(2026, 5, 1, 4, 0, 0)
   const handler = async () => ({ log: [{ ts: utcTs }], summary: {} })
   const wrapped = withLocalizedLog(handler)
@@ -188,14 +188,14 @@ test('withLocalizedLog - always localizes using the resolved zone, request or lo
   const withExplicitTz = await wrapped({ conf: {} }, { query: { timezone: 'America/Campo_Grande' } })
   t.is(withExplicitTz.log[0].ts, localized, 'explicit request timezone localizes ts')
 
-  const withLockedTz = await wrapped(
+  const withLockedTzButNoRequestTz = await wrapped(
     { conf: { featureConfig: { lockedTimezone: 'America/Campo_Grande' } } },
     { query: {} }
   )
-  t.is(withLockedTz.log[0].ts, localized, 'falls back to lockedTimezone and still localizes')
+  t.is(withLockedTzButNoRequestTz.log[0].ts, utcTs, 'lockedTimezone resolves but does not trigger localization on its own')
 
-  const withDefaultTz = await wrapped({ conf: {} }, { query: {} })
-  t.is(withDefaultTz.log[0].ts, localized, 'falls back to the constants default (also Campo_Grande) and still localizes')
+  const withoutAnyTz = await wrapped({ conf: {} }, { query: {} })
+  t.is(withoutAnyTz.log[0].ts, utcTs, 'no request timezone at all leaves ts as true UTC')
   t.pass()
 })
 
