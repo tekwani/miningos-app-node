@@ -81,13 +81,17 @@ async function getDailySeries (ctx, start, end, handler, field, timezone = 'UTC'
   const cache = getDailySeriesCache(ctx)
   const now = Date.now()
   const months = localMonthsInRange(start, end, timezone)
-  const cacheable = (month) => month.end < now
+  // A month that has ended can be answered from cache, but only a month the request
+  // covers end to end may be stored: a partial edge month is a slice, and caching it
+  // as the whole would drop the days outside that slice from every later request.
+  const ended = (month) => month.end < now
+  const cacheable = (month) => ended(month) && month.start >= start && month.end <= end
 
   const byDay = {}
   const missing = []
 
   for (const month of months) {
-    const cached = cacheable(month)
+    const cached = ended(month)
       ? cache.get(dailySeriesCacheKey(month.key, timezone, field), now)
       : undefined
     if (cached) Object.assign(byDay, cached)
@@ -101,7 +105,11 @@ async function getDailySeries (ctx, start, end, handler, field, timezone = 'UTC'
       start: Math.max(start, missing[0].start),
       end: Math.min(end, missing[missing.length - 1].end)
     }
-    const { log } = await handler(ctx, { query: { start: span.start, end: span.end, interval: '1h' } })
+    // A window ending exactly on a month boundary leaves a zero-width edge month; the
+    // handlers reject start >= end, and there is nothing in it to fetch anyway.
+    const { log } = span.end > span.start
+      ? await handler(ctx, { query: { start: span.start, end: span.end, interval: '1h' } })
+      : { log: [] }
 
     const byMonthLog = new Map()
     for (const entry of log) {
@@ -119,6 +127,12 @@ async function getDailySeries (ctx, start, end, handler, field, timezone = 'UTC'
         cache.set(dailySeriesCacheKey(month.key, timezone, field), monthDays, now)
       }
     }
+  }
+
+  // A cached month is whole, so clamp to the local days [start, end] touches.
+  const firstDay = localDayStart(start, timezone)
+  for (const dayTs of Object.keys(byDay)) {
+    if (Number(dayTs) < firstDay || Number(dayTs) > end) delete byDay[dayTs]
   }
 
   return byDay
@@ -177,7 +191,7 @@ async function getEnergyBalance (ctx, req) {
       .then(r => cb(null, r)).catch(cb)
   ])
 
-  const dailyTransactions = addRebates(processTransactions(transactionResults, null, timezone), poolRebates, timezone)
+  const dailyTransactions = addRebates(processTransactions(transactionResults, { start, end }, timezone), poolRebates, timezone)
   const dailyPrices = processPriceData(priceResults, timezone)
   const currentBtcPrice = extractCurrentPrice(currentPriceResults)
   const costsByMonth = processCostsData(productionCosts)
@@ -491,7 +505,7 @@ async function getEbitda (ctx, req) {
       .then(r => cb(null, r)).catch(cb)
   ])
 
-  const dailyTransactions = addRebates(processTransactions(transactionResults, null, timezone), poolRebates, timezone)
+  const dailyTransactions = addRebates(processTransactions(transactionResults, { start, end }, timezone), poolRebates, timezone)
   const dailyPrices = processEbitdaPrices(priceResults, timezone)
   const currentBtcPrice = extractCurrentPrice(currentPriceResults)
   const costsByMonth = processCostsData(productionCosts)
@@ -791,7 +805,7 @@ async function getRevenue (ctx, req) {
     query
   })
 
-  const dailyRevenue = processTransactions(transactionResults, { trackFees: true }, timezone)
+  const dailyRevenue = processTransactions(transactionResults, { trackFees: true, start, end }, timezone)
 
   const log = []
   for (const dayTs of Object.keys(dailyRevenue).sort()) {
@@ -956,7 +970,7 @@ async function getRevenueSummary (ctx, req) {
     }).then(r => cb(null, r)).catch(cb)
   ])
 
-  const dailyRevenue = addRebates(processTransactions(transactionResults, { trackFees: true }, timezone), poolRebates, timezone)
+  const dailyRevenue = addRebates(processTransactions(transactionResults, { trackFees: true, start, end }, timezone), poolRebates, timezone)
   const dailyPrices = processEbitdaPrices(priceResults, timezone)
   const currentBtcPrice = extractCurrentPrice(currentPriceResults)
   const costsByMonth = processCostsData(productionCosts)
@@ -976,6 +990,7 @@ async function getRevenueSummary (ctx, req) {
   const log = []
   for (const dayTs of [...allDays].sort()) {
     const ts = Number(dayTs)
+    // Forecast and price days are not clamped at their source, unlike transactions.
     if (ts < start || ts > end) continue
 
     const revenue = dailyRevenue[dayTs] || {}
@@ -1250,7 +1265,7 @@ async function getHashRevenue (ctx, req) {
     }).then(r => cb(null, r)).catch(cb)
   ])
 
-  const dailyTransactions = processTransactions(transactionResults, { trackFees: true }, timezone)
+  const dailyTransactions = processTransactions(transactionResults, { trackFees: true, start, end }, timezone)
   const dailyPrices = processEbitdaPrices(priceResults, timezone)
   const currentBtcPrice = extractCurrentPrice(currentPriceResults)
   const dailyNetworkHashrate = processNetworkHashrateData(networkHashrateResults, timezone)

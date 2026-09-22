@@ -50,8 +50,13 @@ function normalizeTimestampMs (ts) {
   return ts < 1e12 ? ts * 1000 : ts
 }
 
+// `opts.start`/`opts.end` drop transactions whose own (mining) date falls outside the
+// window: the store selects records by their settle time, so a payout inside the window
+// can still carry a mining_date before or after it.
 function processTransactions (results, opts, timezone = 'UTC') {
   const trackFees = opts && opts.trackFees
+  const start = Number.isFinite(opts?.start) ? opts.start : -Infinity
+  const end = Number.isFinite(opts?.end) ? opts.end : Infinity
   const daily = {}
   for (const res of results) {
     if (!res || res.error) continue
@@ -65,7 +70,7 @@ function processTransactions (results, opts, timezone = 'UTC') {
         if (!t) continue
         const rawTs = t.mining_extra?.mining_date || t.ts || t.created_at || t.timestamp || t.time
         const rawMs = normalizeTimestampMs(rawTs)
-        if (!rawMs) continue
+        if (!rawMs || rawMs < start || rawMs > end) continue
         const ts = localDayStart(rawMs, timezone)
         const day = daily[ts] ??= trackFees
           ? { revenueBTC: 0, feesBTC: 0 }

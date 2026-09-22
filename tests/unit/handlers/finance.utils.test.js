@@ -409,6 +409,14 @@ test('processTransactions buckets f2pool payouts by mining_extra.mining_date whe
   t.alike(Object.keys(daily), [String(miningDay)])
 })
 
+test('processTransactions drops transactions whose mining date is outside start/end', (t) => {
+  const day = 1700006400000
+  const DAY = 86400000
+  const tx = (miningMs) => ({ created_at: (day + DAY) / 1000, changed_balance: 1, mining_extra: { mining_date: miningMs / 1000 } })
+  const daily = processTransactions([[{ transactions: [tx(day - DAY), tx(day), tx(day + DAY)] }]], { start: day, end: day + DAY - 1 })
+  t.alike(Object.keys(daily), [String(day)], 'the day before start and the day after end are dropped')
+})
+
 test('addRebates folds rebates into revenueBTC and keeps the payout/rebate split', (t) => {
   const { addRebates } = require('../../../workers/lib/server/handlers/finance.utils')
   const d1 = 1700006400000
