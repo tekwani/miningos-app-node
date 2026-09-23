@@ -228,7 +228,7 @@ test('processPriceData - processes mempool price data', (t) => {
     [{ ts: 1700006400000, priceUSD: 40000 }]
   ]
 
-  const daily = processPriceData(results)
+  const daily = processPriceData(results, 'UTC')
   t.ok(typeof daily === 'object', 'should return object')
   t.ok(Object.keys(daily).length > 0, 'should have entries')
   const key = Object.keys(daily)[0]
@@ -669,7 +669,7 @@ test('processEbitdaPrices - processes valid data', (t) => {
   const results = [
     [{ prices: [{ ts: 1700006400000, price: 40000 }] }]
   ]
-  const daily = processEbitdaPrices(results)
+  const daily = processEbitdaPrices(results, 'UTC')
   t.ok(typeof daily === 'object', 'should return object')
   t.pass()
 })
@@ -681,7 +681,7 @@ test('processEbitdaPrices - flat per-ork items with priceUSD (production shape)'
       { ts: 1700092800000, priceUSD: 41500 }
     ]
   ]
-  const daily = processEbitdaPrices(results)
+  const daily = processEbitdaPrices(results, 'UTC')
   t.is(daily[1700006400000], 40000, 'should extract priceUSD for first day')
   t.is(daily[1700092800000], 41500, 'should extract priceUSD for second day')
   t.pass()
@@ -1294,7 +1294,7 @@ test('processNetworkHashrateData - processes array data', (t) => {
     [{ data: [{ ts: 1700006400000, avgHashrateMHs: 500000000000000 }] }]
   ]
 
-  const daily = processNetworkHashrateData(results)
+  const daily = processNetworkHashrateData(results, 'UTC')
   t.ok(typeof daily === 'object', 'should return object')
   t.ok(Object.keys(daily).length > 0, 'should have entries')
   const key = Object.keys(daily)[0]
@@ -1309,7 +1309,7 @@ test('processNetworkHashrateData - flat per-ork items (production shape)', (t) =
       { ts: 1700092800000, avgHashrateMHs: 1029591824888537 }
     ]
   ]
-  const daily = processNetworkHashrateData(results)
+  const daily = processNetworkHashrateData(results, 'UTC')
   t.is(daily[1700006400000], 1019725948656278, 'extracts avgHashrateMHs day 1')
   t.is(daily[1700092800000], 1029591824888537, 'extracts avgHashrateMHs day 2')
   t.pass()
@@ -1320,7 +1320,7 @@ test('processNetworkHashrateData - processes object-keyed data', (t) => {
     [{ data: { 1700006400000: { avgHashrateMHs: 500000000000000 } } }]
   ]
 
-  const daily = processNetworkHashrateData(results)
+  const daily = processNetworkHashrateData(results, 'UTC')
   t.ok(typeof daily === 'object', 'should return object')
   t.ok(Object.keys(daily).length > 0, 'should have entries')
   t.pass()
@@ -1328,7 +1328,7 @@ test('processNetworkHashrateData - processes object-keyed data', (t) => {
 
 test('processNetworkHashrateData - handles error results', (t) => {
   const results = [{ error: 'timeout' }]
-  const daily = processNetworkHashrateData(results)
+  const daily = processNetworkHashrateData(results, 'UTC')
   t.is(Object.keys(daily).length, 0, 'should be empty for errors')
   t.pass()
 })
@@ -1788,7 +1788,7 @@ test('processDailyRevenueBtc - prefers changed_balance and falls back to satoshi
         ]
       }
     ]
-  ], JAN_1, JAN_31)
+  ], JAN_1, JAN_31, 'UTC')
   t.is(daily[JAN_10], 1, 'should sum 0.5 BTC + 0.5 BTC')
   t.pass()
 })
@@ -1800,7 +1800,7 @@ test('processDailyAvgPrices - averages price points within a day', (t) => {
       { ts: JAN_10 + 3600000, priceUSD: 110000 },
       { ts: JAN_31 + DAY_MS, priceUSD: 500 }
     ]
-  ], JAN_1, JAN_31)
+  ], JAN_1, JAN_31, 'UTC')
   t.is(daily[JAN_10], 100000, 'should average intra-day prices')
   t.absent(daily[JAN_31 + DAY_MS], 'should drop out-of-range days')
   t.pass()

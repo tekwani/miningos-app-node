@@ -210,5 +210,6 @@ module.exports = {
   localWeekStart,
   localMonthStartTs,
   convertMsToSeconds,
-  aggregateByPeriod
+  aggregateByPeriod,
+  requireZone
 }

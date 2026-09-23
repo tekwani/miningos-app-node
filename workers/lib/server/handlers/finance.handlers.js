@@ -77,7 +77,7 @@ function rollupLocalDaysMean (log, timezone, field) {
   return days
 }
 
-async function getDailySeries (ctx, start, end, handler, field, timezone = 'UTC') {
+async function getDailySeries (ctx, start, end, handler, field, timezone) {
   const cache = getDailySeriesCache(ctx)
   const now = Date.now()
   const months = localMonthsInRange(start, end, timezone)
@@ -282,7 +282,7 @@ async function getEnergyBalance (ctx, req) {
   return { log: aggregated, summary }
 }
 
-function processPriceData (results, timezone = 'UTC') {
+function processPriceData (results, timezone) {
   const daily = {}
   for (const res of results) {
     if (res.error || !res) continue
@@ -304,7 +304,7 @@ function processPriceData (results, timezone = 'UTC') {
 // Both callers request stats-history with groupRange, so ts arrives as a "<start>-<end>"
 // range string rather than a number; parseEntryTs reads its start, and an entry it can't
 // parse is skipped.
-function processEnergyData (results, aggrField, timezone = 'UTC') {
+function processEnergyData (results, aggrField, timezone) {
   const daily = {}
   for (const res of results) {
     if (!res || res.error) continue
@@ -339,7 +339,7 @@ async function getPoolRebates (ctx, start, end) {
   return Array.isArray(rebates) ? rebates : []
 }
 
-function processForecastHistory (results, timezone = 'UTC') {
+function processForecastHistory (results, timezone) {
   const daily = {}
   for (const res of results) {
     if (!res || res.error) continue
@@ -566,7 +566,7 @@ async function getEbitda (ctx, req) {
   return { log: aggregated, summary }
 }
 
-function processEbitdaPrices (results, timezone = 'UTC') {
+function processEbitdaPrices (results, timezone) {
   const daily = {}
   for (const res of results) {
     if (res.error || !res) continue
@@ -1320,7 +1320,7 @@ async function getHashRevenue (ctx, req) {
   return { log: aggregated, summary }
 }
 
-function processNetworkHashrateData (results, timezone = 'UTC') {
+function processNetworkHashrateData (results, timezone) {
   const daily = {}
   for (const res of results) {
     if (!res || res.error) continue
@@ -1517,7 +1517,7 @@ async function getPowerCost (ctx, req) {
   return { log }
 }
 
-function processDailyRevenueBtc (results, start, end, timezone = 'UTC') {
+function processDailyRevenueBtc (results, start, end, timezone) {
   const startDay = localDayStart(start, timezone)
   const endDay = localDayStart(end, timezone)
   const daily = {}
@@ -1546,7 +1546,7 @@ function processDailyRevenueBtc (results, start, end, timezone = 'UTC') {
   return daily
 }
 
-function processDailyAvgPrices (results, start, end, timezone = 'UTC') {
+function processDailyAvgPrices (results, start, end, timezone) {
   const startDay = localDayStart(start, timezone)
   const endDay = localDayStart(end, timezone)
   const sums = {}
@@ -1573,7 +1573,7 @@ function processDailyAvgPrices (results, start, end, timezone = 'UTC') {
   return daily
 }
 
-function sumCostsByMonth (costs, startMonthTs, endMonthTs, timezone = 'UTC') {
+function sumCostsByMonth (costs, startMonthTs, endMonthTs, timezone) {
   const byMonth = {}
   if (!Array.isArray(costs)) return byMonth
   for (const entry of costs) {

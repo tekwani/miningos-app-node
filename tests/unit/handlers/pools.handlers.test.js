@@ -287,7 +287,7 @@ test('flattenTransactionResults - extracts daily entries from ext-data', (t) => 
       ]
     }]
   ]
-  const entries = flattenTransactionResults(results)
+  const entries = flattenTransactionResults(results, 'UTC')
   t.is(entries.length, 1, 'should have 1 daily entry')
   t.ok(entries[0].revenue > 0, 'should have revenue')
   t.ok(entries[0].hashrate > 0, 'should have hashrate')
@@ -296,7 +296,7 @@ test('flattenTransactionResults - extracts daily entries from ext-data', (t) => 
 
 test('flattenTransactionResults - handles error results', (t) => {
   const results = [{ error: 'timeout' }]
-  const entries = flattenTransactionResults(results)
+  const entries = flattenTransactionResults(results, 'UTC')
   t.is(entries.length, 0, 'should be empty for errors')
   t.pass()
 })

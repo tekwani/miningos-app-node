@@ -134,7 +134,7 @@ async function getPoolBalanceHistory (ctx, req) {
   return { log }
 }
 
-function flattenTransactionResults (results, timezone = 'UTC') {
+function flattenTransactionResults (results, timezone) {
   const daily = []
   for (const res of results) {
     if (res.error || !res) continue
@@ -184,7 +184,7 @@ function localBucketStartTs (ts, range, timezone) {
   return localDayStart(ts, timezone)
 }
 
-function groupByBucket (entries, range, timezone = 'UTC') {
+function groupByBucket (entries, range, timezone) {
   const buckets = {}
   for (const entry of entries) {
     const ts = entry.ts

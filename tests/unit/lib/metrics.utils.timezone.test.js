@@ -6,7 +6,8 @@ const {
   assertTimezone,
   resolveTimezone,
   resolveStartEnd,
-  resolveOptionalTimeMs
+  resolveOptionalTimeMs,
+  localMonthKey
 } = require('../../../workers/lib/metrics.utils')
 
 // ==================== assertTimezone ====================
@@ -118,4 +119,9 @@ test('resolveOptionalTimeMs - an explicit value is a true UTC instant, timezone 
   const withoutTz = { query: { start: ts } }
   t.is(resolveOptionalTimeMs(withoutTz, ts, 0), ts)
   t.pass()
+})
+
+test('localMonthKey - a missing timezone throws instead of using the host zone', async (t) => {
+  await t.exception(() => localMonthKey(Date.UTC(2026, 0, 1)), /localMonthKey: timezone is required/)
+  t.is(localMonthKey(Date.UTC(2026, 0, 1, 2), 'America/Campo_Grande'), '2025-12', 'explicit zone still works')
 })

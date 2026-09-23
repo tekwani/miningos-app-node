@@ -1,6 +1,6 @@
 'use strict'
 
-const { getStartOfDay, zoneOffsetMs, localMonthStartTs } = require('./period.utils')
+const { getStartOfDay, zoneOffsetMs, localMonthStartTs, requireZone } = require('./period.utils')
 const { METRICS_TIME, LOG_KEYS, LOCKED_TIMEZONE_DEFAULT } = require('./constants')
 
 /**
@@ -358,7 +358,8 @@ function rollupLocalPeriods (log, periodOf) {
 }
 
 function localMonthKey (ts, timeZone) {
-  const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit' })
+  const zone = requireZone(timeZone, 'localMonthKey')
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit' })
     .format(new Date(ts))
   return parts.slice(0, 7)
 }

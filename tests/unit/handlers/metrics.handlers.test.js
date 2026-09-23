@@ -4995,7 +4995,7 @@ test('buildHourlyDowntime + aggregateDowntimeDaily - numeric ts entries fall bac
   t.absent('timeRange' in hourly[0], 'no timeRange for a numeric source ts')
   t.is(hourly[0].downtimeRate, 0.5, 'rate still computed')
 
-  const daily = aggregateDowntimeDaily(hourly)
+  const daily = aggregateDowntimeDaily(hourly, 'UTC')
   t.is(daily.length, 1, 'single day')
   t.alike(daily[0].timeRange,
     { startTs: DOWNTIME_DAY_TS, endTs: DOWNTIME_DAY_TS + 24 * DOWNTIME_HOUR_MS - 1 },

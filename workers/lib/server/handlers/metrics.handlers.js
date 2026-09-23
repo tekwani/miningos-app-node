@@ -2229,7 +2229,7 @@ function buildHourlyDowntime (entries, nominalPowerW, decisionByHour) {
 // Daily rates are the mean of the hourly rates over hours that have data, so
 // gaps in the stat log don't read as 100% downtime. Days are local calendar days in
 // `timezone`, the same grid finance/* buckets on, so pages that render both line up.
-function aggregateDowntimeDaily (hourlyLog, timezone = 'UTC') {
+function aggregateDowntimeDaily (hourlyLog, timezone) {
   const byDay = new Map()
   for (const entry of hourlyLog) {
     const dayTs = localDayStart(entry.ts, timezone)
