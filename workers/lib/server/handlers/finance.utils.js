@@ -29,8 +29,9 @@ function historyLimit (start, end) {
 
 // Worker timestamps arrive in whatever shape the upstream pool API uses: unix seconds
 // (f2pool `created_at`), unix ms, or an ISO-8601 string (ocean `ts`, e.g. "2026-05-28T16:46:30").
-// Anything this returns unparsed becomes NaN in localDayStart and the record is dropped without
-// a trace, so every shape has to be handled here rather than at the call sites.
+// Anything it can't parse comes back as 0, and every caller skips a 0 before bucketing, so
+// the record is dropped without a trace - every shape has to be handled here rather than
+// at the call sites.
 function normalizeTimestampMs (ts) {
   if (!ts) return 0
 

@@ -1,6 +1,15 @@
 'use strict'
 
-const { PERIOD_TYPES, NON_METRIC_KEYS, LOCKED_TIMEZONE_DEFAULT } = require('./constants')
+const { PERIOD_TYPES, NON_METRIC_KEYS } = require('./constants')
+
+// These helpers have no ctx, so they can't see the site's featureConfig.lockedTimezone.
+// Rather than guess a zone (and bucket every other site on the wrong grid without a
+// sound), a missing one throws - callers resolve it via resolveTimezone and pass it,
+// or pass 'UTC' explicitly when they want the UTC grid.
+function requireZone (timeZone, fn) {
+  if (!timeZone) throw new Error(`${fn}: timezone is required`)
+  return timeZone
+}
 
 const getStartOfDay = (ts) => Math.floor(ts / 86400000) * 86400000
 
@@ -25,12 +34,8 @@ function zoneOffsetMs (ts, timeZone) {
 
 // First instant of the local calendar day (in `timeZone`) containing `ts`. DST-safe:
 // resolved twice because the naive guess can land on the wrong side of a shift.
-// A caller that doesn't pass a zone at all gets LOCKED_TIMEZONE_DEFAULT rather than
-// silently landing on the UTC grid - this function has no ctx, so it can't see the
-// site's own featureConfig.lockedTimezone, only the constants fallback. A caller that
-// wants true UTC has to say so explicitly with `'UTC'`.
 const localDayStart = (ts, timeZone) => {
-  const zone = timeZone || LOCKED_TIMEZONE_DEFAULT
+  const zone = requireZone(timeZone, 'localDayStart')
   if (zone === 'UTC') return getStartOfDay(ts)
 
   const parts = {}
@@ -52,7 +57,7 @@ const convertMsToSeconds = (timestampMs) => {
 // Y/M/D fields of `ts`, read in `timeZone`. 1-based month, matching Date's calendar
 // fields elsewhere in this file.
 const localDateParts = (ts, timeZone) => {
-  const zone = timeZone || LOCKED_TIMEZONE_DEFAULT
+  const zone = requireZone(timeZone, 'localDateParts')
   const parts = {}
   for (const { type, value } of new Intl.DateTimeFormat('en-US', {
     timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit'
@@ -60,24 +65,25 @@ const localDateParts = (ts, timeZone) => {
   return { year: +parts.year, month: +parts.month, day: +parts.day }
 }
 
-// First instant of the local calendar month (`month` 0-based, matching `Date`) in
-// `timeZone`. DST-safe via the same two-pass resolution as localDayStart.
-const localMonthStart = (year, month, timeZone) => {
-  const zone = timeZone || LOCKED_TIMEZONE_DEFAULT
-  if (zone === 'UTC') return Date.UTC(year, month, 1)
+// First instant of the local calendar month in `timeZone`. `month` is 1-based, matching
+// localDateParts and localMonthKey. DST-safe via the same two-pass resolution as
+// localDayStart.
+const localMonthStartTs = (year, month, timeZone) => {
+  const zone = requireZone(timeZone, 'localMonthStartTs')
+  if (zone === 'UTC') return Date.UTC(year, month - 1, 1)
 
-  const wallClock = Date.UTC(year, month, 1)
+  const wallClock = Date.UTC(year, month - 1, 1)
   const asTs = wallClock - zoneOffsetMs(wallClock, zone)
   const settled = zoneOffsetMs(asTs, zone)
   return settled === zoneOffsetMs(wallClock, zone) ? asTs : wallClock - settled
 }
 
-const localYearStart = (year, timeZone) => localMonthStart(year, 0, timeZone)
+const localYearStart = (year, timeZone) => localMonthStartTs(year, 1, timeZone)
 
-// Monday-start local week (in `timeZone`) containing `ts`. Mirrors pools.handlers'
-// localWeekStartTs, so finance and pools cut weeks the same way.
+// Monday-start local week (in `timeZone`) containing `ts`. Finance and pools both
+// bucket weeks through this one function, so they can't drift apart.
 const localWeekStart = (ts, timeZone) => {
-  const zone = timeZone || LOCKED_TIMEZONE_DEFAULT
+  const zone = requireZone(timeZone, 'localWeekStart')
   const dayStart = localDayStart(ts, zone)
   const dow = new Date(dayStart + zoneOffsetMs(dayStart, zone)).getUTCDay() // 0=Sun..6=Sat
   const daysSinceMonday = (dow + 6) % 7
@@ -88,11 +94,13 @@ const localWeekStart = (ts, timeZone) => {
 }
 
 const aggregateByPeriod = (log, period, nonMetricKeys = [], options = {}) => {
+  // Checked before the daily early return so a call site that forgets the zone fails
+  // in its daily tests too, not only once someone requests weekly/monthly.
+  const timeZone = requireZone(options.timezone, 'aggregateByPeriod')
   if (period === PERIOD_TYPES.DAILY) {
     return log
   }
 
-  const timeZone = options.timezone || LOCKED_TIMEZONE_DEFAULT
   const allNonMetricKeys = new Set([...NON_METRIC_KEYS, ...nonMetricKeys])
   const meanKeys = new Set(options.meanKeys || [])
 
@@ -148,7 +156,7 @@ const aggregateByPeriod = (log, period, nonMetricKeys = [], options = {}) => {
     try {
       if (period === PERIOD_TYPES.MONTHLY) {
         const [year, month] = groupKey.split('-').map(Number)
-        const ts = localMonthStart(year, month - 1, timeZone)
+        const ts = localMonthStartTs(year, month, timeZone)
         if (!Number.isFinite(ts)) {
           throw new Error(`Invalid date for monthly grouping: ${groupKey}`)
         }
@@ -197,7 +205,10 @@ const aggregateByPeriod = (log, period, nonMetricKeys = [], options = {}) => {
 
 module.exports = {
   getStartOfDay,
+  zoneOffsetMs,
   localDayStart,
+  localWeekStart,
+  localMonthStartTs,
   convertMsToSeconds,
   aggregateByPeriod
 }

@@ -26,7 +26,6 @@ const {
   getHashRevenue,
   getPowerCost,
   getProductionCosts,
-  getStartOfMonthUtc,
   processDailyRevenueBtc,
   processDailyAvgPrices,
   processNetworkHashrateData,
@@ -1804,12 +1803,6 @@ test('processDailyAvgPrices - averages price points within a day', (t) => {
   ], JAN_1, JAN_31)
   t.is(daily[JAN_10], 100000, 'should average intra-day prices')
   t.absent(daily[JAN_31 + DAY_MS], 'should drop out-of-range days')
-  t.pass()
-})
-
-test('getStartOfMonthUtc - buckets to UTC month start', (t) => {
-  t.is(getStartOfMonthUtc(JAN_10), JAN_1)
-  t.is(getStartOfMonthUtc(JAN_1), JAN_1)
   t.pass()
 })
 

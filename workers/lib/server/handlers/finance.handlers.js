@@ -301,10 +301,9 @@ function processPriceData (results, timezone = 'UTC') {
   return daily
 }
 
-// Both callers request stats-history with groupRange, so ts arrives as a range string rather
-// than a number -- see parseEntryTs. localDayStart would turn that NaN into a bogus bucket and
-// every reading would land there instead of being dropped by the guard below, leaving
-// curtailment and operational issues with a wrong value rather than no data at all.
+// Both callers request stats-history with groupRange, so ts arrives as a "<start>-<end>"
+// range string rather than a number; parseEntryTs reads its start, and an entry it can't
+// parse is skipped.
 function processEnergyData (results, aggrField, timezone = 'UTC') {
   const daily = {}
   for (const res of results) {
@@ -1445,11 +1444,6 @@ function calculateHashRevenueSummary (log) {
 const WATTS_PER_MW = 1e6
 const HOURS_PER_DAY = 24
 
-function getStartOfMonthUtc (ts) {
-  const date = new Date(ts)
-  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1)
-}
-
 async function getPowerCost (ctx, req) {
   const { start, end, timezone } = resolveStartEnd(ctx, req)
   const startMonthTs = localMonthStart(start, timezone)
@@ -1668,7 +1662,6 @@ module.exports = {
   getRevenueSummary,
   getHashRevenue,
   getPowerCost,
-  getStartOfMonthUtc,
   processDailyRevenueBtc,
   processDailyAvgPrices,
   sumCostsByMonth,

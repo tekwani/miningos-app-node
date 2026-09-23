@@ -9,11 +9,12 @@ const {
 } = require('../../constants')
 const {
   parseJsonQueryParam,
-  flattenRpcResults
+  flattenRpcResults,
+  localDayStart,
+  localWeekStart
 } = require('../../utils')
 const {
   resolveStartEnd,
-  zoneOffsetMs,
   localMonthStartTs,
   localMonthKey
 } = require('../../metrics.utils')
@@ -164,7 +165,7 @@ function flattenTransactionResults (results, timezone = 'UTC') {
       if (revenue === 0 && hashCount === 0) continue
 
       daily.push({
-        ts: localDayStartTs(ts, timezone),
+        ts: localDayStart(ts, timezone),
         revenue,
         hashrate: hashCount > 0 ? hashrate / hashCount : 0
       })
@@ -174,38 +175,13 @@ function flattenTransactionResults (results, timezone = 'UTC') {
   return daily
 }
 
-// DST-safe: first instant of the local calendar day (in `timezone`) containing `ts`.
-// Mirrors metrics.utils' localMonthStartTs, one calendar level down.
-function localDayStartTs (ts, timezone) {
-  const parts = {}
-  for (const { type, value } of new Intl.DateTimeFormat('en-US', {
-    timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit'
-  }).formatToParts(new Date(ts))) parts[type] = value
-
-  const wallClock = Date.UTC(+parts.year, +parts.month - 1, +parts.day)
-  const asTs = wallClock - zoneOffsetMs(wallClock, timezone)
-  const settled = zoneOffsetMs(asTs, timezone)
-  return settled === zoneOffsetMs(wallClock, timezone) ? asTs : wallClock - settled
-}
-
-// Monday-start local week containing `ts`.
-function localWeekStartTs (ts, timezone) {
-  const dayStart = localDayStartTs(ts, timezone)
-  const dow = new Date(dayStart + zoneOffsetMs(dayStart, timezone)).getUTCDay() // 0=Sun..6=Sat
-  const daysSinceMonday = (dow + 6) % 7
-  if (!daysSinceMonday) return dayStart
-  // A rough step back by whole days, corrected by re-deriving the exact local day
-  // start - keeps the result right even if a DST shift falls inside the week.
-  return localDayStartTs(dayStart - daysSinceMonday * 86400000, timezone)
-}
-
 function localBucketStartTs (ts, range, timezone) {
-  if (range === '1W') return localWeekStartTs(ts, timezone)
+  if (range === '1W') return localWeekStart(ts, timezone)
   if (range === '1M') {
     const [year, month] = localMonthKey(ts, timezone).split('-').map(Number)
     return localMonthStartTs(year, month, timezone)
   }
-  return localDayStartTs(ts, timezone)
+  return localDayStart(ts, timezone)
 }
 
 function groupByBucket (entries, range, timezone = 'UTC') {
@@ -366,8 +342,6 @@ module.exports = {
   flattenPoolHashrateHistory,
   resolvePoolHashrateForBuckets,
   groupByBucket,
-  localDayStartTs,
-  localWeekStartTs,
   localBucketStartTs,
   getPoolThingConfig,
   getPoolStatsContainers

@@ -4,10 +4,13 @@ const test = require('brittle')
 const {
   getStartOfDay,
   localDayStart,
+  localWeekStart,
+  localMonthStartTs,
+  zoneOffsetMs,
   convertMsToSeconds,
   aggregateByPeriod
 } = require('../../../workers/lib/period.utils')
-const { LOCKED_TIMEZONE_DEFAULT } = require('../../../workers/lib/constants')
+const metricsUtils = require('../../../workers/lib/metrics.utils')
 
 test('getStartOfDay - returns start of day timestamp', (t) => {
   const ts = 1700050000000
@@ -32,10 +35,49 @@ test('localDayStart - aligns to local midnight for a non-UTC zone', (t) => {
   t.pass()
 })
 
-test('localDayStart - no timezone arg falls back to LOCKED_TIMEZONE_DEFAULT, not UTC', (t) => {
+test('localDayStart - throws without a timezone instead of guessing one', async (t) => {
   const ts = Date.UTC(2026, 8, 1, 2)
-  t.is(localDayStart(ts), localDayStart(ts, LOCKED_TIMEZONE_DEFAULT))
-  t.not(localDayStart(ts), getStartOfDay(ts), 'the constants default is not UTC, so this differs from the UTC bucket')
+  await t.exception(() => localDayStart(ts), /localDayStart: timezone is required/)
+  await t.exception(() => localDayStart(ts, ''), /localDayStart: timezone is required/)
+  t.is(localDayStart(ts, 'UTC'), getStartOfDay(ts), 'UTC has to be asked for explicitly')
+  t.pass()
+})
+
+test('localDayStart - aligns to local midnight, not UTC midnight', (t) => {
+  // 2026-01-05 23:30 UTC is still 2026-01-05 in America/New_York (UTC-5), but
+  // already 2026-01-06 in UTC - the local day start must differ from the UTC one.
+  const ts = Date.UTC(2026, 0, 5, 23, 30)
+  const utcDayStart = localDayStart(ts, 'UTC')
+  const nyDayStart = localDayStart(ts, 'America/New_York')
+  t.is(utcDayStart, Date.UTC(2026, 0, 5), 'UTC day start is UTC midnight')
+  t.is(nyDayStart, Date.UTC(2026, 0, 5, 5), 'NY day start is 05:00 UTC (local midnight)')
+  t.pass()
+})
+
+test('localWeekStart - buckets Mon-Sun into the same Monday-start week', (t) => {
+  const monday = Date.UTC(2026, 0, 5)
+  const sunday = Date.UTC(2026, 0, 11, 12)
+  t.is(localWeekStart(monday, 'UTC'), monday, 'monday is its own week start')
+  t.is(localWeekStart(sunday, 'UTC'), monday, 'sunday rolls back to monday')
+  t.pass()
+})
+
+test('localMonthStartTs - month is 1-based', (t) => {
+  t.is(localMonthStartTs(2026, 1, 'UTC'), Date.UTC(2026, 0, 1), 'January is 1')
+  t.is(localMonthStartTs(2026, 12, 'UTC'), Date.UTC(2026, 11, 1), 'December is 12')
+  // Campo_Grande is UTC-4 year-round, so local midnight on Sep 1 is 04:00 UTC.
+  t.is(localMonthStartTs(2026, 9, 'America/Campo_Grande'), Date.UTC(2026, 8, 1, 4))
+  t.pass()
+})
+
+test('localMonthStartTs - throws without a timezone', async (t) => {
+  await t.exception(() => localMonthStartTs(2026, 1), /localMonthStartTs: timezone is required/)
+  t.pass()
+})
+
+test('metrics.utils re-exports the period.utils zone helpers rather than its own copies', (t) => {
+  t.is(metricsUtils.zoneOffsetMs, zoneOffsetMs)
+  t.is(metricsUtils.localMonthStartTs, localMonthStartTs)
   t.pass()
 })
 
@@ -51,7 +93,7 @@ test('aggregateByPeriod - returns log unchanged for daily period', (t) => {
     { ts: 1700006400000, value: 10 },
     { ts: 1700092800000, value: 20 }
   ]
-  const result = aggregateByPeriod(log, 'daily')
+  const result = aggregateByPeriod(log, 'daily', [], { timezone: 'UTC' })
   t.is(result.length, 2, 'should return same length')
   t.alike(result, log, 'should return same entries')
   t.pass()
@@ -62,7 +104,7 @@ test('aggregateByPeriod - aggregates monthly', (t) => {
     { ts: 1700006400000, value: 10, region: 'us' },
     { ts: 1700092800000, value: 20, region: 'us' }
   ]
-  const result = aggregateByPeriod(log, 'monthly')
+  const result = aggregateByPeriod(log, 'monthly', [], { timezone: 'UTC' })
   t.ok(result.length >= 1, 'should have at least one aggregated entry')
   t.ok(result[0].month, 'should have month field')
   t.ok(result[0].year, 'should have year field')
@@ -74,14 +116,14 @@ test('aggregateByPeriod - aggregates yearly', (t) => {
     { ts: 1700006400000, value: 10, region: 'us' },
     { ts: 1700092800000, value: 20, region: 'us' }
   ]
-  const result = aggregateByPeriod(log, 'yearly')
+  const result = aggregateByPeriod(log, 'yearly', [], { timezone: 'UTC' })
   t.ok(result.length >= 1, 'should have at least one aggregated entry')
   t.ok(result[0].year, 'should have year field')
   t.pass()
 })
 
 test('aggregateByPeriod - handles empty log', (t) => {
-  const result = aggregateByPeriod([], 'monthly')
+  const result = aggregateByPeriod([], 'monthly', [], { timezone: 'UTC' })
   t.is(result.length, 0, 'should return empty array')
   t.pass()
 })
@@ -91,7 +133,7 @@ test('aggregateByPeriod - handles invalid timestamps', (t) => {
     { ts: 'invalid', value: 10 },
     { ts: 1700006400000, value: 20 }
   ]
-  const result = aggregateByPeriod(log, 'monthly')
+  const result = aggregateByPeriod(log, 'monthly', [], { timezone: 'UTC' })
   t.ok(result.length >= 1, 'should skip invalid entries')
   t.pass()
 })
@@ -102,7 +144,7 @@ test('aggregateByPeriod - meanKeys option averages instead of summing', (t) => {
     { ts, total: 10, rate: 0.1 },
     { ts: ts + 86400000, total: 20, rate: 0.3 }
   ]
-  const result = aggregateByPeriod(log, 'monthly', [], { meanKeys: ['rate'] })
+  const result = aggregateByPeriod(log, 'monthly', [], { timezone: 'UTC', meanKeys: ['rate'] })
   t.is(result.length, 1, 'one monthly bucket')
   t.is(result[0].total, 30, 'sum keys still summed')
   t.is(result[0].rate, 0.2, 'mean key averaged: (0.1+0.3)/2')
@@ -115,7 +157,7 @@ test('aggregateByPeriod - meanKeys skip null/undefined values when averaging', (
     { ts: ts + 86400000, rate: null },
     { ts: ts + 2 * 86400000, rate: 0.3 }
   ]
-  const result = aggregateByPeriod(log, 'monthly', [], { meanKeys: ['rate'] })
+  const result = aggregateByPeriod(log, 'monthly', [], { timezone: 'UTC', meanKeys: ['rate'] })
   t.is(result[0].rate, 0.2, 'null skipped: (0.1+0.3)/2')
 })
 
@@ -125,7 +167,7 @@ test('aggregateByPeriod - meanKeys returns null when no entries have the value',
     { ts, rate: null },
     { ts: ts + 86400000, rate: undefined }
   ]
-  const result = aggregateByPeriod(log, 'monthly', [], { meanKeys: ['rate'] })
+  const result = aggregateByPeriod(log, 'monthly', [], { timezone: 'UTC', meanKeys: ['rate'] })
   t.is(result[0].rate, null, 'all-null group yields null')
 })
 
@@ -135,7 +177,7 @@ test('aggregateByPeriod - omitting options preserves legacy sum-everything behav
     { ts, rate: 0.1 },
     { ts: ts + 86400000, rate: 0.3 }
   ]
-  const result = aggregateByPeriod(log, 'monthly')
+  const result = aggregateByPeriod(log, 'monthly', [], { timezone: 'UTC' })
   t.is(result[0].rate, 0.4, 'rate is summed when meanKeys not provided')
 })
 
@@ -203,11 +245,10 @@ test('aggregateByPeriod - weekly buckets are Monday-start in the resolved zone, 
   t.pass()
 })
 
-test('aggregateByPeriod - weekly falls back to LOCKED_TIMEZONE_DEFAULT when no timezone option is given', (t) => {
-  const ts = Date.UTC(2026, 8, 2, 12)
-  const [withDefault] = aggregateByPeriod([{ ts, revenueBTC: 1 }], 'weekly')
-  const [withExplicit] = aggregateByPeriod([{ ts, revenueBTC: 1 }], 'weekly', [], { timezone: LOCKED_TIMEZONE_DEFAULT })
-
-  t.is(withDefault.ts, withExplicit.ts, 'omitting timezone resolves the same as passing the constants default explicitly')
+test('aggregateByPeriod - throws without a timezone option, daily included', async (t) => {
+  const log = [{ ts: Date.UTC(2026, 8, 2, 12), revenueBTC: 1 }]
+  await t.exception(() => aggregateByPeriod(log, 'weekly'), /aggregateByPeriod: timezone is required/)
+  await t.exception(() => aggregateByPeriod(log, 'daily'), /aggregateByPeriod: timezone is required/,
+    'daily never uses the zone, but still rejects a call site that forgot it')
   t.pass()
 })

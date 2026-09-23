@@ -1,6 +1,6 @@
 'use strict'
 
-const { getStartOfDay } = require('./period.utils')
+const { getStartOfDay, zoneOffsetMs, localMonthStartTs } = require('./period.utils')
 const { METRICS_TIME, LOG_KEYS, LOCKED_TIMEZONE_DEFAULT } = require('./constants')
 
 /**
@@ -355,35 +355,6 @@ function rollupLocalPeriods (log, periodOf) {
       reportedHours: entries.length
     }
   })
-}
-
-// Milliseconds to add to an instant to read it as wall clock in `timeZone`.
-function zoneOffsetMs (ts, timeZone) {
-  const parts = {}
-  const formatted = new Intl.DateTimeFormat('en-US', {
-    timeZone,
-    hourCycle: 'h23',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit'
-  }).formatToParts(new Date(ts))
-  for (const { type, value } of formatted) parts[type] = value
-
-  const asUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second)
-  return asUtc - ts
-}
-
-// First instant of a calendar month in `timeZone`. `month` is 1-based. The offset is
-// resolved twice because the naive guess can land on the wrong side of a DST shift.
-function localMonthStartTs (year, month, timeZone) {
-  const wallClock = Date.UTC(year, month - 1, 1)
-  const ts = wallClock - zoneOffsetMs(wallClock, timeZone)
-  const settled = zoneOffsetMs(ts, timeZone)
-
-  return settled === zoneOffsetMs(wallClock, timeZone) ? ts : wallClock - settled
 }
 
 function localMonthKey (ts, timeZone) {

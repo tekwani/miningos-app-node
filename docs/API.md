@@ -12,6 +12,34 @@ All authenticated endpoints require the `Authorization` header:
 curl -H "Authorization:Bearer YOUR_TOKEN_HERE" http://localhost:3000/auth/userinfo
 ```
 
+### `timezone` Query Parameter
+
+`timezone` (an IANA zone, e.g. `America/Sao_Paulo`) only sets how day/month buckets are cut. It never changes how `start`/`end` are read: those are always UTC ms timestamps. When omitted, the site zone (`featureConfig.lockedTimezone`, default `America/Campo_Grande`) is used.
+
+It is honored on:
+
+- `/auth/finance/*`
+- `/auth/metrics/downtime`
+- `/auth/pools/:pool/balance-history`
+- `/auth/metrics/hashrate`, only for the calendar-month rollup (`interval=1M` with no `groupBy` and no rack filter)
+- `/auth/export`, for date labels and invoicing buckets (defaults to `UTC` here, not the site zone)
+
+These routes reject it with `400 ERR_TIMEZONE_UNSUPPORTED`:
+
+- `/auth/metrics/hashrate` (any request other than the 1M rollup above)
+- `/auth/metrics/consumption`, `/auth/metrics/efficiency`, `/auth/metrics/miner-status`
+- `/auth/metrics/revenue/hourly`, `/auth/metrics/power-mode`, `/auth/metrics/power-mode/timeline`
+- `/auth/metrics/temperature`, `/auth/metrics/cooling`, `/auth/metrics/containers/:id/history`
+- `/auth/tail-log`, `/auth/tail-log/multi`, `/auth/history-log`
+- `/auth/site/power-consumption`, `/auth/energy/forecast/history`
+- `/auth/alerts/history`, `/auth/work-orders/:id/audit`
+
+```json
+{ "statusCode": 400, "error": "Bad Request", "message": "ERR_TIMEZONE_UNSUPPORTED" }
+```
+
+Other routes don't use it and ignore it.
+
 ### Authentication Endpoints
 
 #### `GET /oauth/google/callback`
