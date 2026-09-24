@@ -50,4 +50,22 @@ async function cachedRoute (ctx, ckeyParts, apiPath, func, overwriteCache = fals
   return data
 }
 
-module.exports = { cachedRoute }
+/**
+ * The lru package only expires an entry when that exact key is read again, so
+ * entries whose key is never repeated (e.g. tail-log keyed on a moving start/end)
+ * stay resident until the bucket fills up to `max`. Peeking every key evicts the
+ * expired ones so a bucket only holds what is still within its maxAge.
+ *
+ * @param {Object} lruFac - a bfx-facs-lru facility
+ * @returns {number} number of entries evicted
+ */
+function sweepExpired (lruFac) {
+  const cache = lruFac?.cache
+  if (!cache) return 0
+
+  const before = cache.length
+  for (const key of cache.keys) cache.peek(key)
+  return before - cache.length
+}
+
+module.exports = { cachedRoute, sweepExpired }

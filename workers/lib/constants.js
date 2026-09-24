@@ -1408,6 +1408,8 @@ const CUSTOM_ALERT_CONFIG = {
 }
 
 const POOL_PROTOCOL = 'stratum+tcp'
+const LRU_BUCKETS = ['8s', '10s', '15s', '30s', '1m', '15m']
+const LRU_SWEEP_INTERVAL_MS = 30000
 
 module.exports = {
   SUPER_ADMIN_ROLE,
@@ -1519,5 +1521,7 @@ module.exports = {
   MINER_MODEL_DISPLAY_NAMES,
   MICROSOFT_AUTH_SCOPE,
   CUSTOM_ALERT_CONFIG,
-  POOL_PROTOCOL
+  POOL_PROTOCOL,
+  LRU_BUCKETS,
+  LRU_SWEEP_INTERVAL_MS
 }

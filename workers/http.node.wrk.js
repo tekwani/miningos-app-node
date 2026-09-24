@@ -4,7 +4,7 @@ const async = require('async')
 const WebsocketPlugin = require('@fastify/websocket')
 const MultipartPlugin = require('@fastify/multipart')
 const fastifyPlugin = require('fastify-plugin')
-const { WORK_ORDER_FILE_MAX_BYTES_DEFAULT, MICROSOFT_AUTH_SCOPE } = require('./lib/constants')
+const { WORK_ORDER_FILE_MAX_BYTES_DEFAULT, MICROSOFT_AUTH_SCOPE, LRU_BUCKETS, LRU_SWEEP_INTERVAL_MS } = require('./lib/constants')
 const TetherWrkBase = require('@tetherto/tether-wrk-base/workers/base.wrk.tether')
 const AuthLib = require('./lib/auth')
 const debug = require('debug')('store:aggr')
@@ -13,6 +13,7 @@ const GlobalDataLib = require('./lib/globalData')
 const { UserService } = require('./lib/users')
 const { AlertsService } = require('./lib/alerts')
 const { auditLogger } = require('./lib/server/lib/auditLogger')
+const { sweepExpired } = require('./lib/server/lib/cachedRoute')
 const { createDataProxy } = require('./lib/data.proxy')
 const { AUTH_CACHE_TTL } = require('./lib/constants')
 const LogDownloader = require('./lib/log-downloader')
@@ -185,6 +186,17 @@ class WrkServerHttp extends TetherWrkBase {
             }
           }, 15 * 60 * 1000)
         }
+
+        this.interval_0.add('sweepLruCaches', () => {
+          for (const bucket of LRU_BUCKETS) {
+            try {
+              const evicted = sweepExpired(this[`lru_${bucket}`])
+              debug(`lru_${bucket} entries evicted: ${evicted}`)
+            } catch (err) {
+              console.error(new Date().toISOString(), err)
+            }
+          }
+        }, LRU_SWEEP_INTERVAL_MS)
 
         this.alertsService = new AlertsService({ dataProxy: this.dataProxy })
         this.interval_0.add('broadcastAlerts', async () => {
