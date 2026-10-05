@@ -113,12 +113,13 @@ module.exports = (ctx) => {
           required: ['keys']
         }
       },
-      preValidation: (req, rep, done) => {
+      preValidation: (req, rep, done) => rejectTimezone()(req, rep, (err) => {
+        if (err) return done(err)
         if (req.query.keys) {
           req.query.keys = parseJsonQueryParam(req.query.keys, 'ERR_KEYS_INVALID_JSON')
         }
         done()
-      },
+      }),
       ...createCachedAuthRoute(
         ctx,
         (req) => ['tail-log/range-aggr', JSON.stringify(req.query.keys)],

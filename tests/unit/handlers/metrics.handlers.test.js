@@ -5103,6 +5103,19 @@ test('getHashrate 1M - months are cut in the requested zone, not UTC', async (t)
   t.pass()
 })
 
+test('getHashrate 1M - without timezone, months are cut in the site lockedTimezone', async (t) => {
+  const ctx = monthlyCtx()
+  ctx.conf.featureConfig.lockedTimezone = MONTHLY_TZ
+  const result = await getHashrate(ctx, {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M' }
+  })
+
+  t.is(result.log.length, 1, 'no stray UTC-month bucket at the edge')
+  t.is(result.log[0].ts, AUG_1_LOCAL, 'stamped at the start of the local month')
+  t.is(result.log[0].reportedHours, 744, 'every hour of local August in the one row')
+  t.pass()
+})
+
 test('getHashrate 1M - a completed month is served from cache on the next request', async (t) => {
   const spans = []
   const ctx = monthlyCtx((payload) => { if (payload.start) spans.push([payload.start, payload.end]) })
@@ -5116,6 +5129,23 @@ test('getHashrate 1M - a completed month is served from cache on the next reques
   t.ok(firstSpans > 0, 'the first request queries the store')
   t.is(spans.length, firstSpans, 'the second asks the store for nothing at all')
   t.alike(second.log, first.log, 'and returns the same rows')
+  t.pass()
+})
+
+test('getHashrate 1M - overwriteCache skips the cached month and stores the fresh rollup', async (t) => {
+  const spans = []
+  const ctx = monthlyCtx((payload) => { if (payload.start) spans.push([payload.start, payload.end]) })
+  const query = { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ }
+
+  monthlyHashesCache.clear()
+  await getHashrate(ctx, { query })
+  const afterFirst = spans.length
+  await getHashrate(ctx, { query: { ...query, overwriteCache: true } })
+  const afterRefresh = spans.length
+  await getHashrate(ctx, { query })
+
+  t.ok(afterRefresh > afterFirst, 'overwriteCache queries the store again')
+  t.is(spans.length, afterRefresh, 'the request after it is served from the refreshed cache')
   t.pass()
 })
 

@@ -35,6 +35,7 @@ const {
   parseEntryTimeRange,
   validateStartEnd,
   resolveStartEnd,
+  resolveTimezone,
   resolveOptionalTimeMs,
   iterateRpcEntries,
   sumObjectValues,
@@ -50,7 +51,7 @@ const {
   rackFilterFor
 } = require('../../metrics.utils')
 const { parseRacks } = require('../lib/queryUtils')
-const { assertTimezone, DEFAULT_TIMEZONE } = require('../lib/export/mappers')
+const { assertTimezone } = require('../lib/export/mappers')
 const { createMonthlyHashesCache } = require('../lib/monthlyHashesCache')
 const { resolvePoolHashrateForBuckets } = require('./pools.handlers')
 const { extractGlobalConfig } = require('./site.utils')
@@ -132,8 +133,8 @@ async function getHashrate (ctx, req) {
 }
 
 /**
- * Calendar months instead of raw buckets, in `timezone` when one is given (the
- * consumption endpoint's '1M' is UTC-aligned; invoicing bills the site's own month).
+ * Calendar months instead of raw buckets, cut in the resolved zone: the request's
+ * `timezone`, else the site's lockedTimezone (invoicing bills the site's own month).
  *
  * The store cannot bucket by calendar month (groupRange '1M' is a rolling 30 days)
  * and its daily buckets are UTC-aligned, so a month is still built from hourly ones -
@@ -147,8 +148,9 @@ async function getHashrate (ctx, req) {
 async function getMonthlyHashrate (ctx, req) {
   const { start, end } = validateStartEnd(req)
   // A zone the runtime does not know throws a raw RangeError out of Intl; the exports
-  // already turn that into a named 400, so the endpoint answers the same way.
-  const timezone = assertTimezone(req.query.timezone || DEFAULT_TIMEZONE)
+  // already turn that into a named 400, so the endpoint answers the same way. Without
+  // one, months are cut in the site's zone, as every other local bucketing is.
+  const timezone = req.query.timezone ? assertTimezone(req.query.timezone) : resolveTimezone(ctx, req)
   const now = Date.now()
   const flags = {
     nominal: req.query.nominal === true || req.query.nominal === 'true',
@@ -161,11 +163,14 @@ async function getMonthlyHashrate (ctx, req) {
   // month is a slice of one, and must neither be stored as the whole nor answered
   // with it. The running month still gains hours, so it is never cached either.
   const cacheable = (month) => month.end < now && month.start >= start && month.end <= end
+  // overwriteCache skips cached months but still stores the fresh rollup, so a backfilled
+  // month is not served stale for the rest of the TTL.
+  const refresh = !!req.query.overwriteCache
   const rows = new Map()
   const missing = []
 
   for (const month of months) {
-    const cached = cacheable(month)
+    const cached = cacheable(month) && !refresh
       ? monthlyHashesCache.get(monthlyHashesCache.key(month.key, timezone, flags), now)
       : undefined
 
@@ -2285,10 +2290,20 @@ function calculateDowntimeSummary (log, nominalPowerW, hasForecastData) {
   }
 }
 
+function resolveDowntimeInterval (start, end, interval) {
+  return interval || ((end - start) <= METRICS_TIME.TWO_DAYS_MS ? '1h' : '1d')
+}
+
+// Only the daily rollup cuts on the zone; hourly buckets are the same UTC instants in any
+// whole-hour zone. Runs before validation, so start/end may still be raw query strings.
+function downtimeUsesTimezone (req) {
+  const { start, end, interval } = req.query
+  return resolveDowntimeInterval(Number(start), Number(end), interval) === '1d'
+}
+
 async function getDowntime (ctx, req) {
   const { start, end, timezone } = resolveStartEnd(ctx, req)
-  const interval = req.query.interval ||
-    ((end - start) <= METRICS_TIME.TWO_DAYS_MS ? '1h' : '1d')
+  const interval = resolveDowntimeInterval(start, end, req.query.interval)
 
   // Attribution is decided per forecast hour, so power is always fetched at
   // hourly resolution and rolled up to days afterwards when interval=1d.
@@ -2420,6 +2435,7 @@ async function getPoolHashrate (ctx, req) {
 
 module.exports = {
   wantsMonthlyRollup,
+  downtimeUsesTimezone,
   ...require('../../metrics.utils'),
   getHashrate,
   getMonthlyHashrate,

@@ -88,7 +88,18 @@ test('metrics routes - timezone is declared only where it is used', (t) => {
 
   const downtime = routes.find(r => r.url === '/auth/metrics/downtime')
   t.alike(downtime.schema.querystring.properties.timezone, { type: 'string', maxLength: 100 }, 'downtime buckets on it')
-  t.absent(downtime.preValidation, 'downtime does not reject it')
+  t.pass()
+})
+
+test('metrics routes - downtime accepts timezone only for the daily rollup', (t) => {
+  const downtime = createRoutesForTest(ROUTES_PATH).find(route => route.url === '/auth/metrics/downtime')
+  const DAY = 86400000
+
+  t.is(runPreValidation(downtime, { start: '0', end: String(DAY), interval: '1d', timezone: 'UTC' }), null, 'explicit 1d uses it')
+  t.is(runPreValidation(downtime, { start: '0', end: String(3 * DAY), timezone: 'UTC' }), null, 'automatic 1d (over 2 days) uses it')
+  t.is(runPreValidation(downtime, { start: '0', end: String(3 * DAY), interval: '1h', timezone: 'UTC' })?.message, 'ERR_TIMEZONE_UNSUPPORTED', 'explicit 1h rejects it')
+  t.is(runPreValidation(downtime, { start: '0', end: String(2 * DAY), timezone: 'UTC' })?.message, 'ERR_TIMEZONE_UNSUPPORTED', 'automatic 1h (2 days or less) rejects it')
+  t.is(runPreValidation(downtime, { start: '0', end: String(DAY) }), null, 'passes without it')
   t.pass()
 })
 

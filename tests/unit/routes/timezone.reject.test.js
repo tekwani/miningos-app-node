@@ -29,6 +29,8 @@ const ROUTES = [
   ['../../../workers/lib/server/routes/logs.routes.js', '/auth/tail-log'],
   ['../../../workers/lib/server/routes/logs.routes.js', '/auth/tail-log/multi'],
   ['../../../workers/lib/server/routes/logs.routes.js', '/auth/history-log'],
+  ['../../../workers/lib/server/routes/logs.routes.js', '/auth/tail-log/range-aggr'],
+  ['../../../workers/lib/server/routes/work.orders.routes.js', '/auth/work-orders'],
   ['../../../workers/lib/server/routes/work.orders.routes.js', '/auth/work-orders/:id/audit'],
   ['../../../workers/lib/server/routes/power.consumption.routes.js', '/auth/site/power-consumption']
 ]

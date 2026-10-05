@@ -7,6 +7,7 @@ const {
 } = require('../../constants')
 const {
   wantsMonthlyRollup,
+  downtimeUsesTimezone,
   getHashrate,
   getPoolHashrate,
   getConsumption,
@@ -316,6 +317,9 @@ module.exports = (ctx) => {
       schema: {
         querystring: schemas.query.downtime
       },
+      // Only the daily rollup (interval=1d, or the automatic one for ranges over 2 days)
+      // cuts on the zone.
+      preValidation: rejectTimezone(downtimeUsesTimezone),
       ...createCachedAuthRoute(
         ctx,
         (req) => [

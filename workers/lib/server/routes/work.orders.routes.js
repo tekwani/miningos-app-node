@@ -44,6 +44,7 @@ module.exports = (ctx) => [
     method: HTTP_METHODS.GET,
     url: ENDPOINTS.WORK_ORDERS,
     schema: schemas.list,
+    preValidation: rejectTimezone(),
     ...createCachedAuthRoute(
       ctx,
       (req) => [

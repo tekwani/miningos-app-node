@@ -77,7 +77,9 @@ function rollupLocalDaysMean (log, timezone, field) {
   return days
 }
 
-async function getDailySeries (ctx, start, end, handler, field, timezone) {
+// `refresh` (the route's overwriteCache) skips cached months but still stores the fresh
+// rollup, so a backfilled month is not served stale for the rest of the TTL.
+async function getDailySeries (ctx, start, end, handler, field, timezone, refresh = false) {
   const cache = getDailySeriesCache(ctx)
   const now = Date.now()
   const months = localMonthsInRange(start, end, timezone)
@@ -91,7 +93,7 @@ async function getDailySeries (ctx, start, end, handler, field, timezone) {
   const missing = []
 
   for (const month of months) {
-    const cached = ended(month)
+    const cached = ended(month) && !refresh
       ? cache.get(dailySeriesCacheKey(month.key, timezone, field), now)
       : undefined
     if (cached) Object.assign(byDay, cached)
@@ -150,12 +152,11 @@ async function getEnergyBalance (ctx, req) {
     priceResults,
     currentPriceResults,
     productionCosts,
-    activeEnergyInResults,
     globalConfigResults,
     costParameters,
     poolRebates
   ] = await runParallel([
-    (cb) => getDailySeries(ctx, start, end, getConsumption, 'powerW', timezone)
+    (cb) => getDailySeries(ctx, start, end, getConsumption, 'powerW', timezone, !!req.query.overwriteCache)
       .then(r => cb(null, r)).catch(cb),
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
@@ -174,12 +175,7 @@ async function getEnergyBalance (ctx, req) {
     }).then(r => cb(null, r)).catch(cb),
 
     (cb) => getProductionCosts(ctx, start, end)
-      .then(r => cb(null, r)).catch(cb),
-
-    (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
-      type: WORKER_TYPES.ELECTRICITY,
-      query: { key: 'stats-history', start, end, groupRange: '1D' }
-    }).then(r => cb(null, r)).catch(cb),
+      .then(r => cb(null, r)).catch(cb),   
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GLOBAL_CONFIG, {})
       .then(r => cb(null, r)).catch(cb),
@@ -195,8 +191,6 @@ async function getEnergyBalance (ctx, req) {
   const dailyPrices = processPriceData(priceResults, timezone)
   const currentBtcPrice = extractCurrentPrice(currentPriceResults)
   const costsByMonth = processCostsData(productionCosts)
-  const dailyActiveEnergyIn = processEnergyData(activeEnergyInResults, AGGR_FIELDS.ACTIVE_ENERGY_IN, timezone)
-  const dailyUteEnergy = processEnergyData(activeEnergyInResults, AGGR_FIELDS.UTE_ENERGY, timezone)
   const nominalPowerMW = extractNominalPower(globalConfigResults)
 
   const allDays = new Set([
@@ -221,20 +215,7 @@ async function getEnergyBalance (ctx, req) {
     const energyCostUSD = resolveEnergyCostsUSD(costs, powerMWh, resolveLcoeUsdPerMwh(costParameters, monthKey))
     const totalCostUSD = energyCostUSD + (costs.operationalCostPerDay || 0)
 
-    const activeEnergyIn = dailyActiveEnergyIn[dayTs] || 0
-    const uteEnergy = dailyUteEnergy[dayTs] || 0
     const consumptionMWh = powerMWh
-
-    const curtailmentMWh = activeEnergyIn > 0
-      ? activeEnergyIn - consumptionMWh
-      : null
-    const curtailmentRate = curtailmentMWh !== null
-      ? safeDiv(curtailmentMWh, consumptionMWh)
-      : null
-
-    const operationalIssuesRate = uteEnergy > 0
-      ? safeDiv(uteEnergy - consumptionMWh, uteEnergy)
-      : null
 
     const actualPowerMW = powerW / 1000000
     const powerUtilization = nominalPowerMW > 0
@@ -256,9 +237,9 @@ async function getEnergyBalance (ctx, req) {
       energyRevenuePerMWh: safeDiv(revenueUSD, powerMWh),
       allInCostPerMWh: safeDiv(totalCostUSD, powerMWh),
       profitUSD: revenueUSD - totalCostUSD,
-      curtailmentMWh,
-      curtailmentRate,
-      operationalIssuesRate,
+      curtailmentMWh : null,
+      curtailmentRate : null,
+      operationalIssuesRate : null,
       powerUtilization
     })
   }
@@ -295,35 +276,6 @@ function processPriceData (results, timezone) {
       const price = entry.priceUSD || entry.price
       if (rawMs && price) {
         daily[localDayStart(rawMs, timezone)] = price
-      }
-    }
-  }
-  return daily
-}
-
-// Both callers request stats-history with groupRange, so ts arrives as a "<start>-<end>"
-// range string rather than a number; parseEntryTs reads its start, and an entry it can't
-// parse is skipped.
-function processEnergyData (results, aggrField, timezone) {
-  const daily = {}
-  for (const res of results) {
-    if (!res || res.error) continue
-    const data = Array.isArray(res) ? res : (res.data || res.result || [])
-    if (!Array.isArray(data)) continue
-    for (const entry of data) {
-      if (!entry) continue
-      const items = Array.isArray(entry) ? entry : (entry.data || entry)
-      if (Array.isArray(items)) {
-        for (const item of items) {
-          if (!item) continue
-          const itemMs = parseEntryTs(item.ts || item.timestamp)
-          if (!itemMs) continue
-          const ts = localDayStart(itemMs, timezone)
-          const energyAggr = item[AGGR_FIELDS.ENERGY_AGGR]
-          if (energyAggr && energyAggr[aggrField]) {
-            daily[ts] = (daily[ts] || 0) + Number(energyAggr[aggrField])
-          }
-        }
       }
     }
   }
@@ -478,10 +430,10 @@ async function getEbitda (ctx, req) {
       query: { key: MINERPOOL_EXT_DATA_KEYS.TRANSACTIONS, start, end }
     }).then(r => cb(null, r)).catch(cb),
 
-    (cb) => getDailySeries(ctx, start, end, getConsumption, 'powerW', timezone)
+    (cb) => getDailySeries(ctx, start, end, getConsumption, 'powerW', timezone, !!req.query.overwriteCache)
       .then(r => cb(null, r)).catch(cb),
 
-    (cb) => getDailySeries(ctx, start, end, getHashrate, 'hashrateMhs', timezone)
+    (cb) => getDailySeries(ctx, start, end, getHashrate, 'hashrateMhs', timezone, !!req.query.overwriteCache)
       .then(r => cb(null, r)).catch(cb),
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
@@ -645,7 +597,7 @@ async function getCostSummary (ctx, req) {
       query: { key: 'HISTORICAL_PRICES', start, end, limit: historyLimit(start, end) }
     }).then(r => cb(null, r)).catch(cb),
 
-    (cb) => getDailySeries(ctx, start, end, getConsumption, 'powerW', timezone)
+    (cb) => getDailySeries(ctx, start, end, getConsumption, 'powerW', timezone, !!req.query.overwriteCache)
       .then(r => cb(null, r)).catch(cb),
 
     (cb) => getCostParameters(ctx)
@@ -931,10 +883,10 @@ async function getRevenueSummary (ctx, req) {
       query: { key: 'current_price' }
     }).then(r => cb(null, r)).catch(cb),
 
-    (cb) => getDailySeries(ctx, start, end, getConsumption, 'powerW', timezone)
+    (cb) => getDailySeries(ctx, start, end, getConsumption, 'powerW', timezone, !!req.query.overwriteCache)
       .then(r => cb(null, r)).catch(cb),
 
-    (cb) => getDailySeries(ctx, start, end, getHashrate, 'hashrateMhs', timezone)
+    (cb) => getDailySeries(ctx, start, end, getHashrate, 'hashrateMhs', timezone, !!req.query.overwriteCache)
       .then(r => cb(null, r)).catch(cb),
 
     (cb) => getProductionCosts(ctx, start, end)
@@ -1246,7 +1198,7 @@ async function getHashRevenue (ctx, req) {
       query: { key: MINERPOOL_EXT_DATA_KEYS.TRANSACTIONS, start, end }
     }).then(r => cb(null, r)).catch(cb),
 
-    (cb) => getDailySeries(ctx, start, end, getHashrate, 'hashrateMhs', timezone)
+    (cb) => getDailySeries(ctx, start, end, getHashrate, 'hashrateMhs', timezone, !!req.query.overwriteCache)
       .then(r => cb(null, r)).catch(cb),
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
@@ -1456,7 +1408,7 @@ async function getPowerCost (ctx, req) {
     priceResults,
     productionCosts
   ] = await runParallel([
-    (cb) => getDailySeries(ctx, start, end, getConsumption, 'powerW', timezone)
+    (cb) => getDailySeries(ctx, start, end, getConsumption, 'powerW', timezone, !!req.query.overwriteCache)
       .then(r => cb(null, r)).catch(cb),
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
@@ -1672,7 +1624,6 @@ module.exports = {
   resolveLcoeUsdPerMwh,
   resolveEnergyCostsUSD,
   processPriceData,
-  processEnergyData,
   extractNominalPower,
   extractForecastSettings,
   processCostsData,
