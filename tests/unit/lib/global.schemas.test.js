@@ -45,16 +45,6 @@ test('global schemas - query globalData schema', (t) => {
   t.pass()
 })
 
-test('global schemas - query features schema', (t) => {
-  const featuresSchema = schemas.query.features
-
-  t.ok(featuresSchema.type === 'object', 'should be object type')
-  t.ok(featuresSchema.properties.overwriteCache, 'should have overwriteCache property')
-  t.ok(featuresSchema.properties.overwriteCache.type === 'boolean', 'overwriteCache should be boolean')
-
-  t.pass()
-})
-
 test('global schemas - query globalConfig schema', (t) => {
   const globalConfigSchema = schemas.query.globalConfig
 
@@ -114,7 +104,6 @@ test('global schemas - schema structure validation', (t) => {
   // Test query schemas
   t.ok(schemas.query.type, 'should have type query schema')
   t.ok(schemas.query.globalData, 'should have globalData query schema')
-  t.ok(schemas.query.features, 'should have features query schema')
   t.ok(schemas.query.globalConfig, 'should have globalConfig query schema')
 
   // Test body schemas
@@ -176,13 +165,11 @@ test('global schemas - data type consistency', (t) => {
 test('global schemas - boolean properties validation', (t) => {
   // Test that boolean properties are properly typed
   const globalDataQuerySchema = schemas.query.globalData
-  const featuresQuerySchema = schemas.query.features
   const globalConfigQuerySchema = schemas.query.globalConfig
   const globalConfigBodySchema = schemas.body.globalConfig
 
   t.ok(globalDataQuerySchema.properties.reverse.type === 'boolean', 'reverse should be boolean')
   t.ok(globalDataQuerySchema.properties.overwriteCache.type === 'boolean', 'overwriteCache should be boolean')
-  t.ok(featuresQuerySchema.properties.overwriteCache.type === 'boolean', 'features overwriteCache should be boolean')
   t.ok(globalConfigQuerySchema.properties.overwriteCache.type === 'boolean', 'globalConfig overwriteCache should be boolean')
   t.ok(globalConfigBodySchema.properties.data.properties.isAutoSleepAllowed.type === 'boolean', 'isAutoSleepAllowed should be boolean')
 

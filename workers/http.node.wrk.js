@@ -166,7 +166,8 @@ class WrkServerHttp extends TetherWrkBase {
             httpc: this.http_c0,
             httpd,
             auth: this.auth_a0,
-            userService: this.userService
+            userService: this.userService,
+            microsoftTenant: httpdAuthMicrosoft.conf.credentials.tenant
           })
         }
 

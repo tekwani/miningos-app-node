@@ -11,7 +11,6 @@ const {
   getGlobalData,
   setGlobalData,
   getFeatureConfig,
-  getFeatures,
   setFeatures,
   getGlobalConfig,
   setGlobalConfig
@@ -47,8 +46,11 @@ module.exports = (ctx) => {
           req.query.lte,
           req.query.lt,
           req.query.limit,
+          req.query.offset,
           req.query.reverse,
           req.query.query,
+          req.query.sort,
+          req.query.fields,
           req.query.groupBy,
           req.query.model
         ],
@@ -69,28 +71,14 @@ module.exports = (ctx) => {
         querystring: schemas.query.type
       }
     },
-    {
-      method: HTTP_METHODS.GET,
-      url: ENDPOINTS.FEATURE_CONFIG,
-      ...createAuthRoute(ctx, getFeatureConfig, AUTH_ONLY)
-    },
-    {
-      method: HTTP_METHODS.GET,
-      url: ENDPOINTS.FEATURES,
-      schema: {
-        querystring: schemas.query.features
-      },
-      ...createCachedAuthRoute(
-        ctx,
-        ['features'],
-        '/auth/features',
-        getFeatures,
-        AUTH_ONLY
-      )
-    },
     ...[ENDPOINTS.FEATURE_CONFIG, ENDPOINTS.FEATURES].map((url) => ({
-      method: HTTP_METHODS.POST,
+      method: HTTP_METHODS.GET,
       url,
+      ...createAuthRoute(ctx, getFeatureConfig, AUTH_ONLY)
+    })),
+    {
+      method: HTTP_METHODS.POST,
+      url: ENDPOINTS.FEATURES,
       ...createAuthRoute(ctx, async (ctx, req) => {
         const success = await setFeatures(ctx, req)
         return { success }
@@ -98,7 +86,7 @@ module.exports = (ctx) => {
       schema: {
         body: schemas.body.features
       }
-    })),
+    },
     {
       method: HTTP_METHODS.GET,
       url: ENDPOINTS.GLOBAL_CONFIG,

@@ -26,6 +26,23 @@ test('global routes - route definitions', (t) => {
   t.pass()
 })
 
+test('global routes - featureConfig is read-only and features returns the same response', async (t) => {
+  const routes = require('../../../workers/lib/server/routes/global.routes.js')({
+    globalDataLib: { getGlobalData: async () => ({ inventory: true, flagOnly: true }) },
+    conf: { featureConfig: { inventory: false } }
+  })
+  const find = (method, url) => routes.find(r => r.method === method && r.url === url)
+  const get = async (url) => {
+    let body
+    await find('GET', url).handler({}, { status: () => ({ send: (data) => { body = data } }) })
+    return body
+  }
+
+  t.absent(find('POST', '/auth/featureConfig'), 'featureConfig has no POST route')
+  t.ok(find('POST', '/auth/features'), 'features keeps its POST route')
+  t.alike(await get('/auth/features'), await get('/auth/featureConfig'))
+})
+
 test('global routes - schema integration', (t) => {
   const routes = createRoutesForTest('../../../workers/lib/server/routes/global.routes.js')
 

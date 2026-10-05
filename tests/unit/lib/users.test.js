@@ -268,3 +268,30 @@ test('UserService - getUser', async (t) => {
 
   t.pass()
 })
+
+test('UserService - bindOAuthSubject binds the first subject and rejects any other', async (t) => {
+  const { promisify } = require('util')
+  const sqlite3 = require('sqlite3')
+  const db = new sqlite3.Database(':memory:')
+  const sqlite = {
+    execAsync: promisify(db.exec.bind(db)),
+    runAsync: promisify(db.run.bind(db)),
+    getAsync: promisify(db.get.bind(db))
+  }
+  const users = { 'bob@acme.com': { id: 7 } }
+  const userService = new UserService({ sqlite, auth: { getUserByEmail: async (email) => users[email] } })
+  await userService.init()
+  await userService.init()
+
+  await userService.bindOAuthSubject('bob@acme.com', 'google', 'sub-1')
+  await userService.bindOAuthSubject('bob@acme.com', 'google', 'sub-1')
+  await userService.bindOAuthSubject('bob@acme.com', 'microsoft', 'oid-1')
+  await t.exception(userService.bindOAuthSubject('bob@acme.com', 'google', 'sub-2'), /ERR_USER_INVALID/)
+
+  await userService.bindOAuthSubject('nobody@acme.com', 'google', 'sub-3')
+  t.is(await sqlite.getAsync('SELECT * FROM oauth_subjects WHERE email = ?', ['nobody@acme.com']), undefined, 'unknown email binds nothing')
+
+  users['bob@acme.com'] = { id: 8 }
+  await userService.bindOAuthSubject('bob@acme.com', 'google', 'sub-2')
+  t.pass('recreated user row rebinds')
+})

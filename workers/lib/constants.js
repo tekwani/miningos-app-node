@@ -10,6 +10,11 @@ const GLOBAL_DATA_TYPES = {
   POOL_REBATES: 'poolRebates'
 }
 
+const POOL_REBATE_SOURCES = {
+  AUTO: 'auto',
+  MANUAL: 'manual'
+}
+
 const LCOE_SOURCES = ['current', 'custom']
 
 const USER_SETTINGS_TYPE = 'userSettings'
@@ -18,7 +23,6 @@ const SUPER_ADMIN_ID = '1'
 const SUPER_ADMIN_ROLE = '*'
 
 const MIGRATED_USER_ROLES = {
-  DEFAULT: 'site_operator',
   READ_ONLY: 'read_only_user'
 }
 
@@ -788,6 +792,17 @@ const MINERPOOL_EXT_DATA_KEYS = {
   HASHRATE_HISTORY: 'hashrate-history'
 }
 
+const MEMPOOL_EXT_DATA_KEYS = {
+  POOL_REBATES: 'POOL_REBATES',
+  POOL_REBATES_UPDATE: 'POOL_REBATES_UPDATE',
+  POOL_REBATES_DELETE: 'POOL_REBATES_DELETE',
+  PRICE_AT_TIMESTAMPS: 'PRICE_AT_TIMESTAMPS'
+}
+
+// Payouts are valued at the BTC price recorded for the 5-minute bucket they
+// landed in. Must match the mempool worker's own bucket size.
+const PRICE_BUCKET_MS = 5 * 60 * 1000
+
 // Bucket sizes /auth/metrics/pool-hashrate serves; keys are the wire values of
 // its interval param. stats-history rows arrive every 5 min, so 5m is the floor.
 const POOL_HASHRATE_INTERVALS_MS = {
@@ -1463,6 +1478,9 @@ module.exports = {
   AGGR_FIELDS,
   PERIOD_TYPES,
   MINERPOOL_EXT_DATA_KEYS,
+  MEMPOOL_EXT_DATA_KEYS,
+  PRICE_BUCKET_MS,
+  POOL_REBATE_SOURCES,
   POOL_HASHRATE_INTERVALS_MS,
   NON_METRIC_KEYS,
   BTC_SATS,

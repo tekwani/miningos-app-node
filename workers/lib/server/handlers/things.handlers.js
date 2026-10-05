@@ -4,7 +4,7 @@ const {
   AUTH_LEVELS,
   COMMENT_ACTION
 } = require('../../constants')
-const { parseJsonQueryParam, flattenRpcResults } = require('../../utils')
+const { parseJsonQueryParam, flattenRpcResults, sanitizeIncludeFields } = require('../../utils')
 const { assertSafeMongoQuery } = require('../lib/queryUtils')
 
 async function listThingsRoute (ctx, req, rep) {
@@ -18,7 +18,7 @@ async function listThingsRoute (ctx, req, rep) {
   }
 
   if (req.query.fields) {
-    req.query.fields = parseJsonQueryParam(req.query.fields, 'ERR_FIELDS_INVALID_JSON')
+    req.query.fields = sanitizeIncludeFields(parseJsonQueryParam(req.query.fields, 'ERR_FIELDS_INVALID_JSON'))
   }
 
   return await ctx.dataProxy.requestDataMap('listThings', req.query)
@@ -100,7 +100,7 @@ async function processThingComment (ctx, req, operation = COMMENT_ACTION.ADD) {
 
 async function getWorkerConfig (ctx, req, rep) {
   if (req.query.fields) {
-    req.query.fields = parseJsonQueryParam(req.query.fields, 'ERR_FIELDS_INVALID_JSON')
+    req.query.fields = sanitizeIncludeFields(parseJsonQueryParam(req.query.fields, 'ERR_FIELDS_INVALID_JSON'))
   }
 
   return await ctx.dataProxy.requestDataMap('getWrkConf', req.query)

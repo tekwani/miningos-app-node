@@ -2,7 +2,7 @@
 
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const mingo = require('mingo')
-const { GLOBAL_DATA_TYPES, LCOE_SOURCES, USER_SETTINGS_TYPE } = require('./constants')
+const { GLOBAL_DATA_TYPES, LCOE_SOURCES, USER_SETTINGS_TYPE, POOL_REBATE_SOURCES } = require('./constants')
 const gLibUtilBase = require('@bitfinex/lib-js-util-base')
 const { isValidJsonObject } = require('./utils')
 
@@ -216,17 +216,60 @@ class GlobalDataLib {
     return true
   }
 
+  // Only user-entered rebates live here; synced (auto) rows belong to the
+  // mempool worker and are merged in at read time by the handlers.
   async setPoolRebatesData (data) {
     if (!Number.isInteger(data.ts) || data.ts <= 0) throw new Error('ERR_INVALID_TS')
+
     const db = this._globalDataBee.sub(GLOBAL_DATA_TYPES.POOL_REBATES)
-    const key = utilsStore.convIntToBin(data.ts)
+
     if (data.remove) {
-      await db.del(key)
+      await db.del(utilsStore.convIntToBin(data.ts))
       return true
     }
+
     if (!Number.isFinite(data.amountBTC) || data.amountBTC <= 0) throw new Error('ERR_INVALID_AMOUNT')
-    const { ts, amountBTC, txid, sender, receiver } = data
-    await db.put(key, JSON.stringify({ site: this.site, ts, amountBTC, txid, sender, receiver }))
+
+    const txid = data.txid ? String(data.txid).toLowerCase() : undefined
+    if (txid && !/^[0-9a-f]{64}$/.test(txid)) throw new Error('ERR_INVALID_TXID')
+
+    const { prevTs } = data
+    if (prevTs !== undefined && (!Number.isInteger(prevTs) || prevTs <= 0)) throw new Error('ERR_INVALID_TS')
+
+    const rows = await this.queryGlobalData(db)
+
+    if (txid && rows.some((row) => row.txid === txid && row.ts !== prevTs)) {
+      throw new Error('ERR_DUPLICATE_TXID')
+    }
+
+    let prevRow
+    if (prevTs !== undefined) {
+      prevRow = rows.find((row) => row.ts === prevTs)
+      if (!prevRow) throw new Error('ERR_REBATE_NOT_FOUND')
+      await db.del(utilsStore.convIntToBin(prevTs))
+    }
+
+    const { amountBTC, sender, receiver } = data
+
+    // priceUSD is the BTC price when the rebate was received, derived by the
+    // handler at write time. When an edit could not re-derive it (bucket not
+    // recorded, worker unreachable), the previous value is only safe to keep
+    // if the timestamp did not move - a shifted rebate with the old moment's
+    // price would be silently wrong.
+    let priceUSD = Number.isFinite(data.priceUSD) ? data.priceUSD : undefined
+    if (priceUSD === undefined && prevRow && prevRow.ts === data.ts) priceUSD = prevRow.priceUSD
+
+    // Keys are timestamps, so two manual rows at the same instant would
+    // otherwise overwrite each other.
+    let ts = data.ts
+    while (await db.get(utilsStore.convIntToBin(ts))) ts++
+
+    await db.put(
+      utilsStore.convIntToBin(ts),
+      JSON.stringify({
+        site: this.site, ts, amountBTC, txid, sender, receiver, priceUSD, source: POOL_REBATE_SOURCES.MANUAL
+      })
+    )
     return true
   }
 

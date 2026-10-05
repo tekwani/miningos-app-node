@@ -6,6 +6,9 @@ const test = require('brittle')
 const AuthLib = require('../../../workers/lib/auth')
 const { MIGRATED_USER_ROLES } = require('../../../workers/lib/constants')
 
+const TENANT = '11111111-1111-1111-1111-111111111111'
+const msIdToken = (tid) => `h.${Buffer.from(JSON.stringify({ tid, oid: 'oid-1' })).toString('base64url')}.`
+
 const AUTH_CONFIG = JSON.parse(
   fs.readFileSync(path.join(__dirname, '../../../config/facs/auth.config.json.example'), 'utf8')
 )
@@ -31,24 +34,24 @@ test('AuthLib - constructor', (t) => {
   t.pass()
 })
 
-test('AuthLib - migrateUsers skips when users exist', async (t) => {
-  const mockUsers = [
-    { id: 1, email: 'admin@example.com' },
-    { id: 2, email: 'user@example.com' }
-  ]
+test('AuthLib - migrateUsers skips once users were created, even if all were deleted since', async (t) => {
+  const createUserCalls = []
   const mockAuth = {
-    listUsers: async () => mockUsers
+    listUsers: async () => [{ id: 1, email: 'admin@example.com' }]
   }
   const authLib = new AuthLib({
     httpc: {},
     httpd: {},
-    userService: {},
+    userService: {
+      hasCreatedUsers: async () => true,
+      createUser: async (data) => createUserCalls.push(data)
+    },
     auth: mockAuth
   })
 
-  await authLib.migrateUsers({ conf: { users: [] } })
+  await authLib.migrateUsers({ conf: { users: [{ email: 'demoted@example.com', write: true }] } })
 
-  t.pass()
+  t.is(createUserCalls.length, 0, 'should not recreate legacy users')
 })
 
 test('AuthLib - migrateUsers migrates old users', async (t) => {
@@ -61,6 +64,7 @@ test('AuthLib - migrateUsers migrates old users', async (t) => {
   ]
   const createUserCalls = []
   const mockUserService = {
+    hasCreatedUsers: async () => false,
     createUser: async (data) => {
       createUserCalls.push(data)
     }
@@ -79,7 +83,7 @@ test('AuthLib - migrateUsers migrates old users', async (t) => {
 
   t.is(createUserCalls.length, 2, 'should create users for old users')
   t.is(createUserCalls[0].email, 'olduser1@example.com', 'should migrate first user')
-  t.is(createUserCalls[0].role, MIGRATED_USER_ROLES.DEFAULT, 'should assign default role for write user')
+  t.is(createUserCalls[0].role, MIGRATED_USER_ROLES.READ_ONLY, 'should assign read-only role for write user')
   t.is(createUserCalls[1].email, 'olduser2@example.com', 'should migrate second user')
   t.is(createUserCalls[1].role, MIGRATED_USER_ROLES.READ_ONLY, 'should assign read-only role for non-write user')
 
@@ -96,6 +100,7 @@ test('AuthLib - migrateUsers skips super admin', async (t) => {
   ]
   const createUserCalls = []
   const mockUserService = {
+    hasCreatedUsers: async () => false,
     createUser: async (data) => {
       createUserCalls.push(data)
     }
@@ -128,7 +133,7 @@ test('AuthLib - start adds OAuth handlers', async (t) => {
   const authLib = new AuthLib({
     httpc: {},
     httpd: {},
-    userService: {},
+    userService: { init: async () => {} },
     auth: mockAuth
   })
 
@@ -489,7 +494,9 @@ test('AuthLib - _resolveOAuthGoogle with valid response', async (t) => {
     }
   }
   const mockUserInfo = {
+    id: 'google-sub-1',
     email: 'user@example.com',
+    verified_email: true,
     name: 'Test User'
   }
   const mockHttpd = {
@@ -506,10 +513,11 @@ test('AuthLib - _resolveOAuthGoogle with valid response', async (t) => {
       return { body: mockUserInfo }
     }
   }
+  let bound = null
   const authLib = new AuthLib({
     httpc: mockHttpc,
     httpd: mockHttpd,
-    userService: {},
+    userService: { bindOAuthSubject: async (...args) => { bound = args } },
     auth: {}
   })
 
@@ -517,6 +525,10 @@ test('AuthLib - _resolveOAuthGoogle with valid response', async (t) => {
 
   t.ok(result, 'should return result')
   t.is(result.email, 'user@example.com', 'should return email')
+  t.alike(bound, ['user@example.com', 'google', 'google-sub-1'], 'should bind the google subject')
+
+  mockUserInfo.verified_email = false
+  t.is(await authLib._resolveOAuthGoogle({}, {}), null, 'should reject an unverified email')
 
   t.pass()
 })
@@ -569,12 +581,13 @@ test('AuthLib - _resolveOAuthMicrosoft with valid profile mail', async (t) => {
     httpd: {
       server: {
         microsoftOAuth2: {
-          getAccessTokenFromAuthorizationCodeFlow: async () => ({ token: { access_token: 'ms-token-123' } })
+          getAccessTokenFromAuthorizationCodeFlow: async () => ({ token: { access_token: 'ms-token-123', id_token: msIdToken(TENANT) } })
         }
       }
     },
-    userService: {},
-    auth: {}
+    userService: { bindOAuthSubject: async () => {} },
+    auth: {},
+    microsoftTenant: TENANT
   })
 
   try {
@@ -603,12 +616,13 @@ test('AuthLib - _resolveOAuthMicrosoft prefers otherMails for guest mail', async
     httpd: {
       server: {
         microsoftOAuth2: {
-          getAccessTokenFromAuthorizationCodeFlow: async () => ({ token: { access_token: 'ms-token-123' } })
+          getAccessTokenFromAuthorizationCodeFlow: async () => ({ token: { access_token: 'ms-token-123', id_token: msIdToken(TENANT) } })
         }
       }
     },
-    userService: {},
-    auth: {}
+    userService: { bindOAuthSubject: async () => {} },
+    auth: {},
+    microsoftTenant: TENANT
   })
 
   try {
@@ -619,6 +633,24 @@ test('AuthLib - _resolveOAuthMicrosoft prefers otherMails for guest mail', async
   }
 
   t.pass()
+})
+
+test('AuthLib - _resolveOAuthMicrosoft rejects an id_token from another tenant', async (t) => {
+  const authLib = new AuthLib({
+    httpc: {},
+    httpd: {
+      server: {
+        microsoftOAuth2: {
+          getAccessTokenFromAuthorizationCodeFlow: async () => ({ token: { access_token: 'ms-token-123', id_token: msIdToken('22222222-2222-2222-2222-222222222222') } })
+        }
+      }
+    },
+    userService: {},
+    auth: {},
+    microsoftTenant: TENANT
+  })
+
+  await t.exception(authLib._resolveOAuthMicrosoft({}, {}), /ERR_MICROSOFT_TENANT_INVALID/)
 })
 
 test('AuthLib - _resolveOAuthMicrosoft throws when token exchange fails', async (t) => {
@@ -660,12 +692,13 @@ test('AuthLib - _resolveOAuthMicrosoft throws when graph request fails', async (
     httpd: {
       server: {
         microsoftOAuth2: {
-          getAccessTokenFromAuthorizationCodeFlow: async () => ({ token: { access_token: 'ms-token-123' } })
+          getAccessTokenFromAuthorizationCodeFlow: async () => ({ token: { access_token: 'ms-token-123', id_token: msIdToken(TENANT) } })
         }
       }
     },
-    userService: {},
-    auth: {}
+    userService: { bindOAuthSubject: async () => {} },
+    auth: {},
+    microsoftTenant: TENANT
   })
 
   try {

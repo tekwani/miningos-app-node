@@ -195,9 +195,8 @@ test('constants - POOL_PROTOCOL', (t) => {
 
 test('constants - MIGRATED_USER_ROLES', (t) => {
   t.ok(typeof MIGRATED_USER_ROLES === 'object', 'should be object')
-  t.is(MIGRATED_USER_ROLES.DEFAULT, 'site_operator', 'should have DEFAULT role')
   t.is(MIGRATED_USER_ROLES.READ_ONLY, 'read_only_user', 'should have READ_ONLY role')
-  t.is(Object.keys(MIGRATED_USER_ROLES).length, 2, 'should have 2 roles')
+  t.is(Object.keys(MIGRATED_USER_ROLES).length, 1, 'should have 1 role')
   t.pass()
 })
 

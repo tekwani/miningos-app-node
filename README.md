@@ -138,13 +138,14 @@ Edit `config/facs/httpd-oauth2.config.json`:
       }
     },
     "users": [
-      { "email": "admin@yourcompany.com", "write": true },
-      { "email": "operator@yourcompany.com", "write": true },
-      { "email": "viewer@yourcompany.com", "write": false }
+      { "email": "operator@yourcompany.com" },
+      { "email": "viewer@yourcompany.com" }
     ]
   }
 }
 ```
+
+`users` is a one-time seed: on the first start of an empty database each entry is created as `read_only_user`; assign roles afterwards in User Management.
 
 #### 3. Authentication & Roles Configuration
 
