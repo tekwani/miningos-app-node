@@ -306,6 +306,12 @@ test('Api', { timeout: 90000 }, async (main) => {
   await sleep(2000)
   await createUser(admin1, 'admin')
   await createUser(admin2, 'admin')
+  // Startup migrates every oauth-config user as read_only_user; routes now require explicit
+  // permissions, so the operator needs its real role. Not via /auth/users: its schema
+  // rejects the TLD-less test address.
+  const operator = await worker.worker.auth_a0.getUserByEmail(siteOperatorUser)
+  await worker.worker.auth_a0.deleteUser(operator.id)
+  await worker.worker.auth_a0.createUser({ email: siteOperatorUser, roles: ['site_operator'] })
 
   const minersApi = `${appNodeBaseUrl}${ENDPOINTS.MINERS}`
 

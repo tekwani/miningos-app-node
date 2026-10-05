@@ -2096,7 +2096,7 @@ test('getRevenueSummary - folds forecast energy sales, pool rebates and net-of-t
           case 'forecastSettings': return [{ miningRevenueTaxFees: { percent: 4, fixed: 2 } }]
           case 'forecastHistory': return [{
             hourlyForecast: [
-              { start: dayTs, isEnergySelected: true, energySalesRevenue: 100, energySalesRevenueSelected: 100, energySalesRevenuePerMwh: 10, energySalesTaxesAndFees: 2, miningRevenue: 50, taxesAndFees: 1 },
+              { start: dayTs, isEnergySelected: true, energySellPrice: 100, energySalesRevenue: 100, energySalesRevenueSelected: 100, energySalesRevenuePerMwh: 10, energySalesTaxesAndFees: 2, miningRevenue: 50, taxesAndFees: 1 },
               { start: dayTs + hour, isEnergySelected: false, energySalesRevenue: 100, energySalesRevenueSelected: 100, energySalesRevenuePerMwh: 10, energySalesTaxesAndFees: 2, miningRevenue: 500, taxesAndFees: 20 }
             ]
           }]
@@ -2117,9 +2117,9 @@ test('getRevenueSummary - folds forecast energy sales, pool rebates and net-of-t
   t.is(row.soldMWh, 10)
   t.is(row.availableMWh, 20)
   t.is(row.energySalesNetUSD, 98)
-  t.is(row.allMineNetUSD, 529)
-  t.is(row.allSellNetUSD, 196)
-  t.is(row.optimalNetUSD, 578)
+  t.is(row.allMineNetUSD, 550, 'forecast miningRevenue is already net')
+  t.is(row.allSellNetUSD, 200, 'forecast energySalesRevenue is already net')
+  t.is(row.optimalNetUSD, 600)
   t.is(row.curtailmentMWh, 0)
   t.is(row.availableEnergyMWh, 0)
   t.is(row.miningNetUSD, 57360)
@@ -2132,4 +2132,33 @@ test('getRevenueSummary - folds forecast energy sales, pool rebates and net-of-t
   t.is(summary.totalNetCashUSD, 57458)
   t.is(summary.avgRevenuePerMWh, 500, 'gross avg revenue per MWh')
   t.is(summary.avgNetRevenuePerMWh, 478, 'net avg revenue per MWh')
+})
+
+test('getRevenueSummary - an energy-selected hour the forecast decided to mine is not sold', async (t) => {
+  const dayTs = 1700006400000
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'tailLog') return [{ ts: dayTs, site_power_w: 5000000 }]
+        if (method !== 'getWrkExtData') return []
+        if (payload.query.key === 'forecastHistory') {
+          return [{
+            hourlyForecast: [
+              { start: dayTs, decision: 'mine', isEnergySelected: true, energySellPrice: 100, energySalesRevenue: 100, energySalesRevenuePerMwh: 10, energySalesTaxesAndFees: 2, miningRevenue: 500 }
+            ]
+          }]
+        }
+        return []
+      }
+    },
+    globalDataLib: { getGlobalData: async () => [] }
+  })
+
+  const { log: [row] } = await getRevenueSummary(mockCtx, { query: { start: dayTs, end: dayTs + 86400000, period: 'daily' } }, {})
+
+  t.is(row.soldMWh, 0)
+  t.is(row.energySalesNetUSD, 0)
+  t.is(row.availableMWh, 10, 'the hour still counts as available energy')
+  t.is(row.optimalNetUSD, 500)
 })
