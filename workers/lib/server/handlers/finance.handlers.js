@@ -2,7 +2,6 @@
 
 const {
   WORKER_TYPES,
-  AGGR_FIELDS,
   PERIOD_TYPES,
   MINERPOOL_EXT_DATA_KEYS,
   ELECTRICITY_EXT_DATA_KEYS,
@@ -11,7 +10,7 @@ const {
   BTC_SATS
 } = require('../../constants')
 const { localDayStart, safeDiv, runParallel } = require('../../utils')
-const { parseEntryTs, localMonthsInRange, localMonthKey, localMonthStartTs } = require('../../metrics.utils')
+const { localMonthsInRange, localMonthKey, localMonthStartTs } = require('../../metrics.utils')
 const { aggregateByPeriod } = require('../../period.utils')
 const { createMonthlyHashesCache } = require('../lib/monthlyHashesCache')
 const { getConsumption, getHashrate } = require('./metrics.handlers')
@@ -177,7 +176,7 @@ async function getEnergyBalance (ctx, req) {
     }).then(r => cb(null, r)).catch(cb),
 
     (cb) => getProductionCosts(ctx, start, end)
-      .then(r => cb(null, r)).catch(cb),   
+      .then(r => cb(null, r)).catch(cb),
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GLOBAL_CONFIG, {})
       .then(r => cb(null, r)).catch(cb),
@@ -246,9 +245,9 @@ async function getEnergyBalance (ctx, req) {
       energyRevenuePerMWh: safeDiv(revenueUSD, powerMWh),
       allInCostPerMWh: safeDiv(totalCostUSD, powerMWh),
       profitUSD: revenueUSD - totalCostUSD,
-      curtailmentMWh,
-      curtailmentRate,
-      operationalIssuesRate,
+      curtailmentMWh: null,
+      curtailmentRate: null,
+      operationalIssuesRate: null,
       powerUtilization,
       unpricedPayouts: transactions.unpricedPayouts || 0
     })
