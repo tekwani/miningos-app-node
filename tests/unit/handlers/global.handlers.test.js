@@ -125,7 +125,7 @@ test('getFeatureConfig - defaults lockedTimezone when featureConfig is missing e
   t.pass()
 })
 
-test('getFeatureConfig - merges feature flags under site config', async (t) => {
+test('getFeatureConfig - stored features override site config', async (t) => {
   const mockCtx = {
     globalDataLib: {
       getGlobalData: async (req) => {
@@ -133,12 +133,13 @@ test('getFeatureConfig - merges feature flags under site config', async (t) => {
         return { inventory: true, flagOnly: true }
       }
     },
-    conf: { featureConfig: { inventory: false } }
+    conf: { featureConfig: { inventory: false, siteOnly: true } }
   }
 
   const result = await getFeatureConfig(mockCtx)
   t.is(result.flagOnly, true, 'flag-only keys are included')
-  t.is(result.inventory, false, 'site config wins on conflicts')
+  t.is(result.inventory, true, 'stored features win on conflicts')
+  t.is(result.siteOnly, true, 'site-only keys still pass through')
 })
 
 test('getFeatures - returns features from globalDataLib', async (t) => {
