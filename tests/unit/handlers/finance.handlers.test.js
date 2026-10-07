@@ -611,6 +611,59 @@ test('getRevenueSummary monthly - a missing hashrate day does not drag the mean 
   t.is(result.log[0].hashrateMhs, 200, 'mean over the two days that reported: (100+300)/2')
 })
 
+test('getRevenueSummary - miningConsumptionMWh sums only the DCS rack meters, null where unmetered', async (t) => {
+  const day1 = Date.UTC(2024, 0, 15)
+  const day2 = Date.UTC(2024, 0, 16)
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }], featureConfig: { centralDCSSetup: { enabled: true } } },
+    net_r0: {
+      jRequest: async (_key, method, payload) => {
+        if (method === 'listThings') {
+          return [{
+            type: payload.fields.type && 'dcs-siemens',
+            last: {
+              snap: {
+                stats: {
+                  dcs_specific: {
+                    equipment: {
+                      power_meters: [
+                        { equipment: 'Site-PM', role: 'site_main' },
+                        { equipment: 'QGBT-01', role: 'rack' },
+                        { equipment: 'QDFL-1P', role: 'rack' },
+                        { equipment: 'CCM', role: 'ccm_principal' }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }]
+        }
+        if (method === 'tailLog' && payload.aggrFields.by_meter_power_w) {
+          return [
+            { ts: day1, by_meter_power_w: { 'site-pm': 9_000_000, 'qgbt-01': 2_000_000, 'qdfl-1_p': 1_000_000, ccm: 5_000_000 } },
+            { ts: day2, by_meter_power_w: {} }
+          ]
+        }
+        if (method === 'tailLog') return [{ ts: day1, site_power_w: 9_000_000 }, { ts: day2, site_power_w: 9_000_000 }]
+        return []
+      }
+    },
+    globalDataLib: { getGlobalData: async () => [] }
+  })
+  const query = { start: day1, end: day2 + 86400000 - 1 }
+
+  const daily = await getRevenueSummary(ctx, { query: { ...query, period: 'daily' } }, {})
+  t.is(daily.log[0].consumptionMWh, 216, 'site consumption is unchanged')
+  t.is(daily.log[0].miningConsumptionMWh, 72, 'rack meters only: (2 + 1) MW x 24h')
+  t.is(daily.log[1].miningConsumptionMWh, null, 'a day without rack readings is unknown, not 0')
+  t.is(daily.summary.totalMiningConsumptionMWh, 72)
+
+  const unmetered = await getRevenueSummary(ctx, { query: { start: day2, end: query.end, period: 'monthly' } }, {})
+  t.is(unmetered.log[0].miningConsumptionMWh, null, 'a month without rack readings is unknown, not 0')
+  t.is(unmetered.summary.totalMiningConsumptionMWh, null)
+})
+
 test('getCostSummary - central DCS reads site power from the DCS worker', async (t) => {
   let captured
   const mockCtx = withDataProxy({

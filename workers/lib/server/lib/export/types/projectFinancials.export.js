@@ -21,7 +21,7 @@ const FINANCIALS_COLUMNS = [
 
 const PRODUCTION_COLUMNS = [
   'btcMined', 'btcFromPayouts', 'btcFromRebates', 'btcMinedUsdAtReport',
-  'energyConsumedMwh', 'minedPct', 'soldPct', 'curtailedPct',
+  'energyConsumedMwh', 'miningConsumptionMwh', 'minedPct', 'soldPct', 'curtailedPct',
   'avgHashratePhs', 'pctOfNominal', 'avgEfficiencyJPerTh',
   'uptimePct', 'downtimeMwh',
   'btcProductionCostUsd', 'lcoeUsdPerMwh', 'currentBtcPriceUsd'
@@ -140,6 +140,7 @@ function productionRow (log, summary, hashrate, opts) {
     btcFromRebates: summary.totalRebateBTC,
     btcMinedUsdAtReport: summary.totalRevenueBTC * summary.currentBtcPrice,
     energyConsumedMwh: t.consumptionMWh,
+    miningConsumptionMwh: summary.totalMiningConsumptionMWh,
     minedPct: pct(t.consumptionMWh, t.capacityMWh),
     soldPct: pct(t.soldMWh, t.capacityMWh),
     curtailedPct: pct(sum(log, 'curtailmentMWh'), t.capacityMWh),

@@ -151,8 +151,8 @@ async function priceRebateAtReceipt (ctx, data) {
 async function getFeatureConfig (ctx) {
   const featureConfig = ctx.conf.featureConfig || {}
   return {
-    ...await getFeatures(ctx),
     ...featureConfig,
+    ...await getFeatures(ctx),
     lockedTimezone: featureConfig.lockedTimezone || LOCKED_TIMEZONE_DEFAULT
   }
 }
