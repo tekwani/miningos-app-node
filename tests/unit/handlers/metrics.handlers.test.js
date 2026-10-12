@@ -4236,6 +4236,92 @@ test('getHashrate - nominal adds per-bucket nominal and pct', async (t) => {
   t.pass()
 })
 
+test('getHashrate - siteNominal replaces the installed nominal with the configured site nominal', async (t) => {
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method) => {
+        if (method === 'getGlobalConfig') return { nominalSiteHashrate_MHS: 7.5e11 }
+        return [
+          { ts: 1700006400000, hashrate_mhs_5m_sum_aggr: 3e11, nominal_hashrate_mhs_sum_aggr: 2.6112e11 },
+          { ts: 1700010000000, hashrate_mhs_5m_sum_aggr: 6e11, nominal_hashrate_mhs_sum_aggr: 0 }
+        ]
+      }
+    }
+  })
+  const query = { start: 1700000000000, end: 1700100000000, nominal: true }
+
+  const site = await getHashrate(mockCtx, { query: { ...query, siteNominal: 'true' } })
+  t.alike(site.log.map((entry) => entry.nominalHashrateMhs), [7.5e11, 7.5e11], 'every bucket carries the site nominal')
+  t.alike(site.log.map((entry) => entry.pctOfNominal), [40, 80])
+  t.is(site.summary.nominalHashrateMhs, 7.5e11)
+
+  const installed = await getHashrate(mockCtx, { query })
+  t.is(installed.log[0].nominalHashrateMhs, 2.6112e11, 'without siteNominal the installed nominal is unchanged')
+
+  const noNominal = await getHashrate(mockCtx, { query: { ...query, nominal: false, siteNominal: true } })
+  t.absent('nominalHashrateMhs' in noNominal.log[0], 'siteNominal alone does not opt into the nominal series')
+  t.pass()
+})
+
+test('getHashrate - siteNominal prefers the invoice nominal over the site nominal', async (t) => {
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method) => {
+        if (method === 'getGlobalConfig') {
+          return { invoiceNominalHashrate_MHS: 7.5e11, nominalSiteHashrate_MHS: 7.09032e11 }
+        }
+        return [{ ts: 1700006400000, hashrate_mhs_5m_sum_aggr: 3e11, nominal_hashrate_mhs_sum_aggr: 2.6112e11 }]
+      }
+    }
+  })
+
+  const result = await getHashrate(mockCtx, {
+    query: { start: 1700000000000, end: 1700100000000, nominal: true, siteNominal: true }
+  })
+  t.is(result.log[0].nominalHashrateMhs, 7.5e11, 'the contracted invoice nominal wins')
+  t.is(result.log[0].pctOfNominal, 40)
+  t.pass()
+})
+
+test('getHashrate - siteNominal uses the site nominal when no invoice nominal is configured', async (t) => {
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method) => {
+        if (method === 'getGlobalConfig') return { nominalSiteHashrate_MHS: 7.09032e11 }
+        return [{ ts: 1700006400000, hashrate_mhs_5m_sum_aggr: 3e11, nominal_hashrate_mhs_sum_aggr: 2.6112e11 }]
+      }
+    }
+  })
+
+  const result = await getHashrate(mockCtx, {
+    query: { start: 1700000000000, end: 1700100000000, nominal: true, siteNominal: true }
+  })
+  t.is(result.log[0].nominalHashrateMhs, 7.09032e11, 'existing sites keep the site nominal')
+  t.pass()
+})
+
+test('getHashrate - siteNominal falls back to the installed nominal when the site nominal is unset', async (t) => {
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method) => {
+        if (method === 'getGlobalConfig') return { nominalSiteHashrate_MHS: 0 }
+        return [{ ts: 1700006400000, hashrate_mhs_5m_sum_aggr: 1e11, nominal_hashrate_mhs_sum_aggr: 2e11 }]
+      }
+    }
+  })
+
+  const result = await getHashrate(mockCtx, {
+    query: { start: 1700000000000, end: 1700100000000, nominal: true, siteNominal: true }
+  })
+  t.is(result.log[0].nominalHashrateMhs, 2e11)
+  t.is(result.log[0].pctOfNominal, 50)
+  t.pass()
+})
+
 test('getHashrate - nominal accepts the string form and tolerates a zero nominal', async (t) => {
   const mockCtx = withDataProxy({
     conf: { orks: [{ rpcPublicKey: 'key1' }] },
@@ -5441,6 +5527,42 @@ test('bucketPoolHashrate - tolerates malformed rows and null hashrates', (t) => 
   t.pass()
 })
 
+test('bucketPoolHashrate - sums per-account averages within a pool', (t) => {
+  const t0 = 1700000000000 - (1700000000000 % FIVE_MIN_MS)
+  const row = (ts, aHs, bHs) => ({
+    ts: String(ts),
+    stats: [
+      { poolType: 'ocean', username: 'acct-a', hashrate: aHs },
+      { poolType: 'ocean', username: 'acct-b', hashrate: bHs }
+    ]
+  })
+
+  // acct-a avg = 100e12, acct-b avg = 50e12 -> the site hashes 150e12, not the
+  // 75e12 a cross-account average would report.
+  const log = bucketPoolHashrate(
+    [[[row(t0, 100e12, 50e12), row(t0 + 1000, 100e12, 50e12)]]],
+    FIVE_MIN_MS
+  )
+
+  t.is(log.length, 1)
+  t.alike(log[0].stats, [{ poolType: 'ocean', hashrate: 150e12 }])
+  t.pass()
+})
+
+test('bucketPoolHashrate - uneven sample counts still sum account averages', (t) => {
+  const t0 = 1700000000000 - (1700000000000 % FIVE_MIN_MS)
+  const log = bucketPoolHashrate(
+    [[[
+      { ts: t0, stats: [{ poolType: 'ocean', username: 'a', hashrate: 90 }, { poolType: 'ocean', username: 'b', hashrate: 40 }] },
+      { ts: t0 + 1000, stats: [{ poolType: 'ocean', username: 'a', hashrate: 110 }] }
+    ]]],
+    FIVE_MIN_MS
+  )
+
+  t.is(log[0].stats[0].hashrate, 140, 'avg(90,110) + avg(40)')
+  t.pass()
+})
+
 test('getPoolHashrate - queries week-sized stats-history windows with a trimmed projection', async (t) => {
   const captured = []
   const mockCtx = withDataProxy({
@@ -5463,7 +5585,7 @@ test('getPoolHashrate - queries week-sized stats-history windows with a trimmed 
     t.is(payload.type, 'minerpool')
     t.is(payload.query.key, 'stats-history')
     t.ok(payload.query.end - payload.query.start < METRICS_TIME.SEVEN_DAYS_MS, 'window fits in a week')
-    t.alike(payload.query.fields, { ts: 1, 'stats.poolType': 1, 'stats.hashrate': 1 }, 'only charted fields requested')
+    t.alike(payload.query.fields, { ts: 1, 'stats.poolType': 1, 'stats.hashrate': 1, 'stats.username': 1 }, 'only charted fields requested')
   }
   for (let i = 1; i < captured.length; i++) {
     t.is(captured[i].query.start, captured[i - 1].query.end + 1, 'windows do not overlap or leave gaps')
@@ -5494,4 +5616,265 @@ test('getPoolHashrate - returns the bucketed per-pool log', async (t) => {
   t.is(result.log[0].ts, t0)
   t.alike(result.log[0].stats, [{ poolType: 'ocean', hashrate: 200 }])
   t.pass()
+})
+
+const PHASE_HOUR_MS = 60 * 60 * 1000
+const PHASE_START = Date.UTC(2026, 9, 1)
+const PHASES_FEATURE = {
+  phases: [
+    { id: 'total', label: 'Total Site' },
+    {
+      id: 'phase1',
+      label: 'Phase 1',
+      pool: { accounts: [{ poolType: 'ocean', username: 'addr1' }] },
+      consumption: { source: 'remainder' },
+      minerTelemetry: true
+    },
+    {
+      id: 'phase1_5',
+      label: 'Phase 1.5',
+      pool: { accounts: [{ poolType: 'ocean', username: 'addr2' }] },
+      consumption: { source: 'manual' },
+      minerTelemetry: false,
+      groups: { minerType: 'HBM', container: 'acme-container' }
+    }
+  ]
+}
+
+function phaseCtx (jRequest, featureConfig = PHASES_FEATURE) {
+  return withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }], ...(featureConfig && { featureConfig }) },
+    net_r0: { jRequest }
+  })
+}
+
+function phaseHistorySamples () {
+  const samples = []
+  for (const username of ['addr1', 'addr2']) {
+    for (let i = 0; i < 4; i++) {
+      samples.push({
+        ts: PHASE_START + i * 15 * 60 * 1000,
+        poolType: 'ocean',
+        username,
+        hashrate: username === 'addr2' ? 5e13 : 6e14
+      })
+    }
+  }
+  return samples
+}
+
+test('getHashrate - rejects unknown or unconfigured phases', async (t) => {
+  const ctx = phaseCtx(async () => [])
+  const query = { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, interval: '1h' }
+
+  await t.exception(() => getHashrate(ctx, { query: { ...query, phase: 'nope' } }), /ERR_PHASE_INVALID/)
+
+  const bare = phaseCtx(async () => [], null)
+  await t.exception(() => getHashrate(bare, { query: { ...query, phase: 'phase1' } }), /ERR_PHASE_INVALID/)
+})
+
+test('getHashrate - pool-only phase serves its accounts from hashrate-history', async (t) => {
+  const calls = []
+  const ctx = phaseCtx(async (key, method, payload) => {
+    calls.push({ method, payload })
+    if (method === 'getWrkExtData') return [{ hashrateHistory: phaseHistorySamples() }]
+    if (method === 'getGlobalConfig') return { phaseNominals: { phase1_5: { nominalHashrate_MHS: 5e7, nominalPower_MW: 0.87, nominalEfficiency_WTHS: 17.2 } } }
+    return []
+  })
+
+  const res = await getHashrate(ctx, {
+    query: {
+      start: PHASE_START,
+      end: PHASE_START + PHASE_HOUR_MS - 1,
+      interval: '1h',
+      phase: 'phase1_5',
+      pool: true,
+      nominal: true
+    }
+  })
+
+  t.is(calls.filter((c) => c.method === 'tailLog').length, 0, 'no miner telemetry query for a pool-only phase')
+  t.is(res.log.length, 1)
+  t.is(res.log[0].hashrateMhs, 5e13 / 1e6, 'only the phase account, averaged, in MH/s')
+  t.is(res.log[0].poolHashrateMhs, res.log[0].hashrateMhs)
+  t.is(res.log[0].nominalHashrateMhs, 5e7)
+  t.is(res.summary.avgPoolHashrateMhs, 5e13 / 1e6)
+})
+
+test('getHashrate - pool overlay on a telemetry phase filters to its accounts', async (t) => {
+  const ctx = phaseCtx(async (key, method, payload) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, hashrate_mhs_5m_sum_aggr: 1e11 }]
+    }
+    if (method === 'getWrkExtData') return [{ hashrateHistory: phaseHistorySamples() }]
+    return []
+  })
+
+  const res = await getHashrate(ctx, {
+    query: {
+      start: PHASE_START,
+      end: PHASE_START + PHASE_HOUR_MS - 1,
+      interval: '1h',
+      phase: 'phase1',
+      pool: true
+    }
+  })
+
+  t.is(res.log[0].hashrateMhs, 1e11, 'telemetry series untouched')
+  t.is(res.log[0].poolHashrateMhs, 6e14 / 1e6, 'pool overlay only counts the phase account')
+})
+
+test('getHashrate - groupBy injects the synthetic pool-only group', async (t) => {
+  const extCalls = []
+  const ctx = phaseCtx(async (key, method, payload) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 2e11 } }]
+    }
+    if (method === 'getWrkExtData') {
+      extCalls.push(payload)
+      return [{ hashrateHistory: phaseHistorySamples() }]
+    }
+    return []
+  })
+
+  const res = await getHashrate(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, interval: '1d', groupBy: 'miner' }
+  })
+
+  t.is(res.log[0].hashrateMhs['miner-wm-m63'], 2e11, 'telemetry groups untouched')
+  t.is(res.log[0].hashrateMhs.HBM, 5e13 / 1e6, 'synthetic group carries the phase pool hashrate')
+  t.ok(res.summary.groupedBy.HBM)
+  t.is(extCalls.length, 1, 'one history read per pool-only phase')
+})
+
+test('getHashrate - groupBy with phase=total injects like a phase-less request', async (t) => {
+  const ctx = phaseCtx(async (key, method) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 2e11 } }]
+    }
+    if (method === 'getWrkExtData') {
+      return [{ hashrateHistory: phaseHistorySamples() }]
+    }
+    return []
+  })
+
+  const res = await getHashrate(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, interval: '1d', groupBy: 'miner', phase: 'total' }
+  })
+
+  t.is(res.log[0].hashrateMhs['miner-wm-m63'], 2e11)
+  t.is(res.log[0].hashrateMhs.HBM, 5e13 / 1e6, 'Total tab lists the phase group too')
+})
+
+test('getHashrate - groupBy with a concrete phase keeps the synthetic group out', async (t) => {
+  const ctx = phaseCtx(async (key, method) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 2e11 } }]
+    }
+    if (method === 'getWrkExtData') {
+      return [{ hashrateHistory: phaseHistorySamples() }]
+    }
+    return []
+  })
+
+  const res = await getHashrate(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, interval: '1d', groupBy: 'miner', phase: 'phase1' }
+  })
+
+  t.alike(Object.keys(res.log[0].hashrateMhs), ['miner-wm-m63'], 'phase-scoped grouped view holds only telemetry keys')
+})
+
+test('getHashrate - groupBy stays untouched without a phases config', async (t) => {
+  let extCalls = 0
+  const ctx = phaseCtx(async (key, method) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 2e11 } }]
+    }
+    extCalls++
+    return []
+  }, null)
+
+  const res = await getHashrate(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, interval: '1d', groupBy: 'miner' }
+  })
+
+  t.alike(Object.keys(res.log[0].hashrateMhs), ['miner-wm-m63'])
+  t.is(extCalls, 0, 'no pool reads when phases are not configured')
+})
+
+test('getPoolHashrate - phase filters stats to the phase accounts', async (t) => {
+  const ctx = phaseCtx(async (key, method, payload) => {
+    if (method === 'getWrkExtData') {
+      return [{
+        ts: Date.now() - 60 * 60 * 1000,
+        stats: [
+          { poolType: 'ocean', username: 'addr1', hashrate: 6e14 },
+          { poolType: 'ocean', username: 'addr2', hashrate: 5e13 }
+        ]
+      }]
+    }
+    return []
+  })
+
+  const scoped = await getPoolHashrate(ctx, { query: { interval: '3h', lookbackDays: 1, phase: 'phase1_5' } })
+  t.is(scoped.log.length, 1)
+  t.alike(scoped.log[0].stats, [{ poolType: 'ocean', hashrate: 5e13 }], 'only the phase account is averaged')
+
+  const site = await getPoolHashrate(ctx, { query: { interval: '3h', lookbackDays: 1 } })
+  t.is(site.log[0].stats[0].hashrate, 6e14 + 5e13, 'site view sums the per-account averages')
+})
+
+test('getEfficiency - pool-only phase divides site power by the phase pool hashrate', async (t) => {
+  const ctx = phaseCtx(async (key, method, payload) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, site_power_w: 870000 }]
+    }
+    if (method === 'getWrkExtData') return [{ hashrateHistory: phaseHistorySamples() }]
+    return []
+  })
+
+  const res = await getEfficiency(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS - 1, interval: '1h', phase: 'phase1_5' }
+  })
+
+  const expectedThs = (5e13 / 1e6) / 1e6
+  t.is(res.log.length, 1)
+  t.is(res.log[0].efficiencyWThs, 870000 / expectedThs)
+})
+
+test('getConsumption/getDowntime - non-total phase is rejected until supported', async (t) => {
+  const ctx = phaseCtx(async () => [])
+  const query = { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, phase: 'phase1_5' }
+
+  await t.exception(() => getConsumption(ctx, { query }), /ERR_PHASE_NOT_SUPPORTED/)
+  await t.exception(() => getDowntime(ctx, { query: { ...query, interval: '1h' } }), /ERR_PHASE_NOT_SUPPORTED/)
+
+  const total = await getConsumption(ctx, { query: { ...query, phase: 'total' } })
+  t.ok(total.log, 'phase=total passes through as the site view')
+})
+
+test('getHashrate - synthetic group never overwrites a colliding telemetry key', async (t) => {
+  const colliding = {
+    phases: [
+      {
+        id: 'phase1_5',
+        pool: { accounts: [{ poolType: 'ocean', username: 'addr2' }] },
+        minerTelemetry: false,
+        groups: { minerType: 'miner-wm-m63' }
+      }
+    ]
+  }
+  const ctx = phaseCtx(async (key, method) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 2e11 } }]
+    }
+    if (method === 'getWrkExtData') return [{ hashrateHistory: phaseHistorySamples() }]
+    return []
+  }, colliding)
+
+  const res = await getHashrate(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, interval: '1d', groupBy: 'miner' }
+  })
+
+  t.is(res.log[0].hashrateMhs['miner-wm-m63'], 2e11, 'telemetry value wins on a key collision')
 })

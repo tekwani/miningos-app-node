@@ -68,6 +68,12 @@ function processTransactions (results, opts, timezone) {
   const trackFees = opts && opts.trackFees
   const start = Number.isFinite(opts?.start) ? opts.start : -Infinity
   const end = Number.isFinite(opts?.end) ? opts.end : Infinity
+  // Pool-account scoping (phases): the workers tag every transaction with the
+  // account's username, so an unscoped call keeps summing everything.
+  const usernames = opts?.usernames instanceof Set ? opts.usernames : null
+  const excludeUsernames = opts?.excludeUsernames instanceof Set && opts.excludeUsernames.size
+    ? opts.excludeUsernames
+    : null
   const daily = {}
   const txEntries = []
   for (const res of results) {
@@ -80,6 +86,8 @@ function processTransactions (results, opts, timezone) {
       if (!Array.isArray(txList)) continue
       for (const t of txList) {
         if (!t) continue
+        if (usernames && !usernames.has(t.username)) continue
+        if (excludeUsernames && excludeUsernames.has(t.username)) continue
         const rawTs = t.mining_extra?.mining_date || t.ts || t.created_at || t.timestamp || t.time
         const rawMs = normalizeTimestampMs(rawTs)
         if (!rawMs || rawMs < start || rawMs > end) continue
@@ -92,7 +100,9 @@ function processTransactions (results, opts, timezone) {
         let feeBTC = 0
         if (t.satoshis_net_earned) {
           amountBTC = Math.abs(t.satoshis_net_earned) / BTC_SATS
-          feeBTC = (t.fees_colected_satoshis || 0) / BTC_SATS
+          // Ocean spells it fees_collected_satoshis; the single-l spelling is
+          // kept for any rows stored before this fix.
+          feeBTC = (t.fees_collected_satoshis || t.fees_colected_satoshis || 0) / BTC_SATS
         } else {
           amountBTC = Math.abs(t.changed_balance || t.amount || t.value || 0)
           feeBTC = (t.mining_extra?.tx_fee || 0)

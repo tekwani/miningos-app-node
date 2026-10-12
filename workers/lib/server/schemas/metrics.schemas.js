@@ -17,9 +17,11 @@ const schemas = {
         // Only read by the '1M' rollup, which cuts months in this zone rather than UTC.
         timezone: { type: 'string' },
         groupBy: { type: 'string', enum: ['miner', 'container', 'rack'] },
+        phase: { type: 'string', maxLength: 64, pattern: '^[A-Za-z0-9_]+$' },
         container: { type: 'string' },
         current: { type: 'boolean' },
         nominal: { type: 'boolean' },
+        siteNominal: { type: 'boolean' },
         pool: { type: 'boolean' },
         racks: { type: 'string' },
         offset: { type: 'integer', minimum: 0 },
@@ -37,6 +39,7 @@ const schemas = {
         interval: { type: 'string', enum: METRICS_INTERVALS },
         groupBy: { type: 'string', enum: ['miner', 'container', 'rack'] },
         byMeter: { type: 'boolean' },
+        phase: { type: 'string', maxLength: 64, pattern: '^[A-Za-z0-9_]+$' },
         racks: { type: 'string' },
         overwriteCache: { type: 'boolean' }
       },
@@ -49,6 +52,7 @@ const schemas = {
         end: { type: 'integer', minimum: 0 },
         interval: { type: 'string', enum: METRICS_INTERVALS },
         groupBy: { type: 'string', enum: ['miner', 'container', 'rack'] },
+        phase: { type: 'string', maxLength: 64, pattern: '^[A-Za-z0-9_]+$' },
         racks: { type: 'string' },
         overwriteCache: { type: 'boolean' }
       },
@@ -122,6 +126,7 @@ const schemas = {
       properties: {
         interval: { type: 'string', enum: Object.keys(POOL_HASHRATE_INTERVALS_MS) },
         lookbackDays: { type: 'integer', minimum: 1, maximum: 90 },
+        phase: { type: 'string', maxLength: 64, pattern: '^[A-Za-z0-9_]+$' },
         overwriteCache: { type: 'boolean' }
       },
       required: ['interval', 'lookbackDays']
@@ -162,6 +167,7 @@ const schemas = {
       properties: {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
+        phase: { type: 'string', maxLength: 64, pattern: '^[A-Za-z0-9_]+$' },
         interval: { type: 'string', enum: ['1h', '1d'] },
         timezone: { type: 'string', maxLength: 100 },
         overwriteCache: { type: 'boolean' }

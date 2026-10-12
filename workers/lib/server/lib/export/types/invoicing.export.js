@@ -81,7 +81,7 @@ function buildHashesEntry ({ type, interval, seconds, rollup, filenamePrefix, pe
     assertParams: assertRange,
     async fetchExport (ctx, { params, now, timezone }) {
       const { log } = await getHashrate(ctx, {
-        query: { start: params.start, end: params.end, interval, nominal: true, pool: true }
+        query: { start: params.start, end: params.end, interval, nominal: true, siteNominal: true, pool: true }
       })
       const buckets = rollup ? rollup(log, timezone) : log
 
@@ -163,7 +163,7 @@ const invoiceBreakdown = {
     // The UTC month is cut into UTC days; metrics days otherwise default to the site's zone.
     const query = localMonth ? { start, end, interval: '1h' } : { start, end, interval: '1d', timezone: 'UTC' }
     const [hashrate, consumption, costParameters, productionCosts] = await Promise.all([
-      getHashrate(ctx, { query: { ...query, nominal: true, pool: true } }),
+      getHashrate(ctx, { query: { ...query, nominal: true, pool: true, siteNominal: true } }),
       getConsumption(ctx, { query }),
       getCostParameters(ctx),
       getProductionCosts(ctx, start, end)

@@ -64,6 +64,7 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         period: { type: 'string', enum: ['daily', 'monthly', 'yearly'] },
+        phase: { type: 'string', maxLength: 64, pattern: '^[A-Za-z0-9_]+$' },
         overwriteCache: { type: 'boolean' },
         timezone: { type: 'string', maxLength: 100 }
       },
