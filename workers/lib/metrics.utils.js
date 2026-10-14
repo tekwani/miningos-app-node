@@ -1,7 +1,7 @@
 'use strict'
 
-const { getStartOfDay } = require('./period.utils')
-const { METRICS_TIME, LOG_KEYS } = require('./constants')
+const { getStartOfDay, zoneOffsetMs, localDayStart, localWeekStart, localMonthStartTs, requireZone } = require('./period.utils')
+const { METRICS_TIME, LOG_KEYS, LOCKED_TIMEZONE_DEFAULT } = require('./constants')
 
 /**
  * Parse timestamp from RPC entry.
@@ -41,6 +41,41 @@ function validateStartEnd (req) {
   }
 
   return { start, end }
+}
+
+function assertTimezone (timezone) {
+  try {
+    Intl.DateTimeFormat('en-US', { timeZone: timezone })
+    return timezone
+  } catch (err) {
+    throw new Error('ERR_INVALID_TIMEZONE')
+  }
+}
+
+// Always resolves to a real zone: the request's own `timezone`, else the site's
+// featureConfig.lockedTimezone, else the constants default. Used only for local
+// day/month bucketing - never to reinterpret start/end or to shift response timestamps,
+// which are true UTC instants in and out.
+function resolveTimezone (ctx, req) {
+  const timezone = req.query.timezone || ctx.conf?.featureConfig?.lockedTimezone || LOCKED_TIMEZONE_DEFAULT
+  return assertTimezone(timezone)
+}
+
+// start/end are always true UTC instants, exactly like /auth/export - `timezone` never
+// reinterprets them as wall-clock time. It still resolves (request, else lockedTimezone,
+// else the constants default) for callers that bucket by it.
+function resolveStartEnd (ctx, req) {
+  const { start, end } = validateStartEnd(req)
+  const timezone = resolveTimezone(ctx, req)
+
+  return { start, end, timezone }
+}
+
+// An optional start/end with a computed fallback: an explicitly-supplied value is a true
+// UTC instant, same as resolveStartEnd - the computed default already is one too.
+function resolveOptionalTimeMs (req, rawValue, defaultMs) {
+  if (rawValue === undefined) return defaultMs
+  return Number(rawValue)
 }
 
 function * iterateRpcEntries (results) {
@@ -257,10 +292,178 @@ function buildGroupPowerFromDCS (powerMeters, hashrateByGroup, energyLayout, min
   return groupPower
 }
 
+const sum = (values) => values.reduce((total, value) => total + value, 0)
+const mean = (values) => values.length ? sum(values) / values.length : null
+const finiteValues = (entries, field) => entries.map((entry) => entry[field]).filter(Number.isFinite)
+
+// Financial reports use pool data only: summed pool vs summed nominal over the
+// buckets carrying both, so a pool polling gap never dilutes the share. This is
+// the coverage basis used by the per-hour and per-day export rows.
+function poolPctOfNominal (entries) {
+  const pairs = entries.filter((entry) => Number.isFinite(entry.poolHashrateMhs) && entry.nominalHashrateMhs > 0)
+  if (!pairs.length) return null
+  return (sum(pairs.map((entry) => entry.poolHashrateMhs)) / sum(pairs.map((entry) => entry.nominalHashrateMhs))) * 100
+}
+
+// Pool share of nominal over the WHOLE invoice period: every bucket with a positive
+// nominal counts in the denominator and a bucket without pool data counts as zero
+// delivered. The invoice bills the calendar month, so hours the pool did not report
+// (site not mining yet, pool outage) lower the percentage instead of being dropped -
+// dropping them switched the denominator to "hours with pool data" and overstated a
+// mid-month start by the coverage ratio (August 2026: 78.9% instead of 52.5%,
+// inflating amortizationPayableUsd and monthlyInvoiceUsd). Null when the pool never
+// reported in the period, so a missing feed is not misread as zero production.
+// Mirrors moria-app-ui invoicePeriodPoolPctOfNominal (PR 3061).
+function invoicePeriodPoolPctOfNominal (entries) {
+  const nominalBuckets = entries.filter((entry) => entry.nominalHashrateMhs > 0)
+  const poolEverReported = nominalBuckets.some((entry) => Number.isFinite(entry.poolHashrateMhs))
+  if (!poolEverReported) return null
+
+  const pool = sum(nominalBuckets.map((entry) => Number.isFinite(entry.poolHashrateMhs) ? entry.poolHashrateMhs : 0))
+  return (pool / sum(nominalBuckets.map((entry) => entry.nominalHashrateMhs))) * 100
+}
+
+// Groups hourly buckets by the label `periodOf` gives them and aggregates each
+// group the way the invoicing rows need it. `poolSeconds` counts only the hours
+// that carried a pool sample, so a polling gap understates the period's delivered
+// hashes rather than reading as lost hashrate - the export marks that, it does not
+// silently fill it in.
+function rollupLocalPeriods (log, periodOf) {
+  const periods = new Map()
+
+  for (const entry of log) {
+    const key = periodOf.format(new Date(entry.ts))
+    if (!periods.has(key)) periods.set(key, [])
+    periods.get(key).push(entry)
+  }
+
+  return [...periods.values()].map((entries) => {
+    const pool = finiteValues(entries, 'poolHashrateMhs')
+
+    return {
+      ts: entries[0].ts,
+      hashrateMhs: mean(finiteValues(entries, 'hashrateMhs')),
+      // The period's installed capacity, for callers that summarise a run of periods.
+      // `pctOfNominal` is NOT this over hashrateMhs - it stays on the pool basis below,
+      // which pairs the two series hour by hour and can only be computed here.
+      nominalHashrateMhs: mean(finiteValues(entries, 'nominalHashrateMhs')),
+      poolHashrateMhs: mean(pool),
+      pctOfNominal: poolPctOfNominal(entries),
+      poolSeconds: pool.length * 3600,
+      // How many hours the site reported at all, against which poolSeconds says how
+      // many carried a pool sample - the UI marks a period where the two disagree.
+      reportedHours: entries.length
+    }
+  })
+}
+
+function localMonthKey (ts, timeZone) {
+  const zone = requireZone(timeZone, 'localMonthKey')
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit' })
+    .format(new Date(ts))
+  return parts.slice(0, 7)
+}
+
+/**
+ * Every calendar month in `timeZone` that [start, end] touches, chronologically, each
+ * with its own bounds. The store has no calendar-month bucket (groupRange '1M' is a
+ * rolling 30 days), so callers that need months build them from these.
+ */
+function localMonthsInRange (start, end, timeZone) {
+  const months = []
+  let [year, month] = localMonthKey(start, timeZone).split('-').map(Number)
+
+  for (;;) {
+    const monthStart = localMonthStartTs(year, month, timeZone)
+    if (monthStart > end) return months
+
+    const next = month === 12 ? { year: year + 1, month: 1 } : { year, month: month + 1 }
+    months.push({
+      key: `${year}-${String(month).padStart(2, '0')}`,
+      start: monthStart,
+      end: localMonthStartTs(next.year, next.month, timeZone) - 1
+    })
+    ;({ year, month } = next)
+  }
+}
+
+function rollupLocalDays (log, timezone) {
+  return rollupLocalPeriods(log, new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit'
+  }))
+}
+
+// The backend has no calendar-month bucket (groupRange '1M' is a rolling 30 days),
+// so a site-local month is rebuilt from its hourly buckets the same way a local day is.
+function rollupLocalMonths (log, timezone) {
+  return rollupLocalPeriods(log, new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone, year: 'numeric', month: '2-digit'
+  }))
+}
+
+// First instant of the local month (in `timezone`) containing `ts`.
+function localMonthStart (ts, timezone) {
+  const [year, month] = localMonthKey(ts, timezone).split('-').map(Number)
+  return localMonthStartTs(year, month, timezone)
+}
+
+// The day/week/month intervals the metrics endpoints cut in the site's zone. The store's
+// groupRange buckets on the UTC epoch grid ('1W' even starts on a Thursday), so these are
+// rebuilt app-side from hourly buckets - see groupLocalBuckets.
+const LOCAL_BUCKET_STARTS = {
+  '1d': localDayStart,
+  '1w': localWeekStart,
+  '1M': localMonthStart
+}
+
+// Stepping past the bucket's start by more than the longest local day/week/month and
+// re-deriving the start keeps the next boundary right across a DST shift.
+const LOCAL_BUCKET_STEPS_MS = {
+  '1d': 1.5 * METRICS_TIME.ONE_DAY_MS,
+  '1w': 7.5 * METRICS_TIME.ONE_DAY_MS,
+  '1M': 32 * METRICS_TIME.ONE_DAY_MS
+}
+
+function isLocalInterval (interval) {
+  return Object.hasOwn(LOCAL_BUCKET_STARTS, interval)
+}
+
+/**
+ * Groups hourly entries into `interval` buckets in `timezone` ('1d', '1w' or '1M'). Each
+ * bucket's ts/timeRange are clamped to [start, end], so a response never reaches outside
+ * the requested range: the first entry starts at `start` and the last ends at `end`.
+ * Returns { ts, timeRange, entries }; callers aggregate `entries` their own way.
+ */
+function groupLocalBuckets (log, { interval, timezone, start, end }) {
+  const bucketStartOf = LOCAL_BUCKET_STARTS[interval]
+  const zone = requireZone(timezone, 'groupLocalBuckets')
+  const buckets = new Map()
+
+  for (const entry of log) {
+    if (!Number.isFinite(entry?.ts)) continue
+    const bucketStart = bucketStartOf(entry.ts, zone)
+    if (!buckets.has(bucketStart)) buckets.set(bucketStart, [])
+    buckets.get(bucketStart).push(entry)
+  }
+
+  return [...buckets.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([bucketStart, entries]) => {
+      const bucketEnd = bucketStartOf(bucketStart + LOCAL_BUCKET_STEPS_MS[interval], zone) - 1
+      const startTs = Math.max(start, bucketStart)
+      const endTs = Math.min(end, bucketEnd)
+      return { ts: startTs, timeRange: { startTs, endTs }, entries }
+    })
+}
+
 module.exports = {
   parseEntryTs,
   parseEntryTimeRange,
   validateStartEnd,
+  assertTimezone,
+  resolveTimezone,
+  resolveStartEnd,
+  resolveOptionalTimeMs,
   iterateRpcEntries,
   forEachRangeAggrItem,
   sumObjectValues,
@@ -268,6 +471,17 @@ module.exports = {
   extractKeyEntry,
   resolveInterval,
   getIntervalConfig,
+  zoneOffsetMs,
+  rollupLocalDays,
+  rollupLocalMonths,
+  isLocalInterval,
+  groupLocalBuckets,
+  localMonthStart,
+  localMonthsInRange,
+  localMonthStartTs,
+  localMonthKey,
+  poolPctOfNominal,
+  invoicePeriodPoolPctOfNominal,
   mhsToPhs,
   mhsToThs,
   parseRackId,

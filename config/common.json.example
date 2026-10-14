@@ -24,9 +24,12 @@
     "/auth/metrics/miner-status": "8s",
     "/auth/metrics/containers/:id": "8s",
     "/auth/metrics/cooling": "8s",
+    "/auth/metrics/downtime": "1m",
+    "/auth/metrics/pool-hashrate": "1m",
     "/auth/actions": "10s",
     "/auth/actions/batch": "10s",
     "/auth/actions/:type/:id": "10s",
+    "/auth/energy/consumption": "10s",
     "/auth/global/data": "15s"
   },
   "featureConfig": {
@@ -47,10 +50,41 @@
     "admeStats": true,
     "alertsHistoricalLogEnabled": true,
     "isReportingEnabled": true,
+    "projectFinancials": true,
+    "poolRebates": true,
+    "lockedTimezone": "America/Campo_Grande",
     "centralDCSSetup": {
       "enabled": false,
       "tag": "t-dcs"
-    }
+    },
+    "energyRollup": {
+      "sinceTs": null
+    },
+    "phases": [
+      {
+        "id": "phase1",
+        "label": "Phase 1",
+        "minerTelemetry": true,
+        "consumption": { "source": "remainder", "meterKey": "ccm" },
+        "pool": {
+          "accounts": [
+            { "poolType": "ocean", "username": "<site-btc-address>" }
+          ]
+        }
+      },
+      {
+        "id": "phase1_5",
+        "label": "Phase 1.5",
+        "minerTelemetry": false,
+        "consumption": { "source": "manual" },
+        "pool": {
+          "accounts": [
+            { "poolType": "ocean", "username": "<acme-btc-address>" }
+          ]
+        },
+        "groups": { "minerType": "HBM", "container": "acme-container" }
+      }
+    ]
   },
   "ttl": 300,
   "site": "SITE_NAME",

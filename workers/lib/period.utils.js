@@ -2,31 +2,111 @@
 
 const { PERIOD_TYPES, NON_METRIC_KEYS } = require('./constants')
 
+// These helpers have no ctx, so they can't see the site's featureConfig.lockedTimezone.
+// Rather than guess a zone (and bucket every other site on the wrong grid without a
+// sound), a missing one throws - callers resolve it via resolveTimezone and pass it,
+// or pass 'UTC' explicitly when they want the UTC grid.
+function requireZone (timeZone, fn) {
+  if (!timeZone) throw new Error(`${fn}: timezone is required`)
+  return timeZone
+}
+
 const getStartOfDay = (ts) => Math.floor(ts / 86400000) * 86400000
+
+// Milliseconds to add to a UTC instant to read it as wall-clock time in `timeZone`.
+function zoneOffsetMs (ts, timeZone) {
+  const parts = {}
+  const formatted = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  }).formatToParts(new Date(ts))
+  for (const { type, value } of formatted) parts[type] = value
+
+  const asUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second)
+  return asUtc - ts
+}
+
+// True when `ts` is the first instant of a wall-clock hour in `timeZone` (DST-safe:
+// the offset is taken at `ts`). The whole-minute check comes first because
+// zoneOffsetMs only resolves seconds, so a sub-minute remainder would otherwise be
+// absorbed into the offset. Mirrored by the DCS worker's consumption store.
+function isLocalHourStart (ts, timeZone) {
+  const zone = requireZone(timeZone, 'isLocalHourStart')
+  if (!Number.isSafeInteger(ts) || ts < 0 || ts % 60000 !== 0) return false
+  return (ts + zoneOffsetMs(ts, zone)) % 3600000 === 0
+}
+
+// First instant of the local calendar day (in `timeZone`) containing `ts`. DST-safe:
+// resolved twice because the naive guess can land on the wrong side of a shift.
+const localDayStart = (ts, timeZone) => {
+  const zone = requireZone(timeZone, 'localDayStart')
+  if (zone === 'UTC') return getStartOfDay(ts)
+
+  const parts = {}
+  const formatted = new Intl.DateTimeFormat('en-US', {
+    timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(new Date(ts))
+  for (const { type, value } of formatted) parts[type] = value
+
+  const wallClock = Date.UTC(+parts.year, +parts.month - 1, +parts.day)
+  const asTs = wallClock - zoneOffsetMs(wallClock, zone)
+  const settled = zoneOffsetMs(asTs, zone)
+  return settled === zoneOffsetMs(wallClock, zone) ? asTs : wallClock - settled
+}
 
 const convertMsToSeconds = (timestampMs) => {
   return Math.floor(timestampMs / 1000)
 }
 
-const PERIOD_CALCULATORS = {
-  daily: (timestamp) => getStartOfDay(timestamp),
-  weekly: (timestamp) => {
-    const date = new Date(timestamp)
-    const day = date.getUTCDay()
-    const diff = date.getUTCDate() - day
-    return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), diff)).getTime()
-  },
-  monthly: (timestamp) => {
-    const date = new Date(timestamp)
-    return new Date(date.getFullYear(), date.getMonth(), 1).getTime()
-  },
-  yearly: (timestamp) => {
-    const date = new Date(timestamp)
-    return new Date(date.getFullYear(), 0, 1).getTime()
-  }
+// Y/M/D fields of `ts`, read in `timeZone`. 1-based month, matching Date's calendar
+// fields elsewhere in this file.
+const localDateParts = (ts, timeZone) => {
+  const zone = requireZone(timeZone, 'localDateParts')
+  const parts = {}
+  for (const { type, value } of new Intl.DateTimeFormat('en-US', {
+    timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(new Date(ts))) parts[type] = value
+  return { year: +parts.year, month: +parts.month, day: +parts.day }
+}
+
+// First instant of the local calendar month in `timeZone`. `month` is 1-based, matching
+// localDateParts and localMonthKey. DST-safe via the same two-pass resolution as
+// localDayStart.
+const localMonthStartTs = (year, month, timeZone) => {
+  const zone = requireZone(timeZone, 'localMonthStartTs')
+  if (zone === 'UTC') return Date.UTC(year, month - 1, 1)
+
+  const wallClock = Date.UTC(year, month - 1, 1)
+  const asTs = wallClock - zoneOffsetMs(wallClock, zone)
+  const settled = zoneOffsetMs(asTs, zone)
+  return settled === zoneOffsetMs(wallClock, zone) ? asTs : wallClock - settled
+}
+
+const localYearStart = (year, timeZone) => localMonthStartTs(year, 1, timeZone)
+
+// Monday-start local week (in `timeZone`) containing `ts`. Finance and pools both
+// bucket weeks through this one function, so they can't drift apart.
+const localWeekStart = (ts, timeZone) => {
+  const zone = requireZone(timeZone, 'localWeekStart')
+  const dayStart = localDayStart(ts, zone)
+  const dow = new Date(dayStart + zoneOffsetMs(dayStart, zone)).getUTCDay() // 0=Sun..6=Sat
+  const daysSinceMonday = (dow + 6) % 7
+  if (!daysSinceMonday) return dayStart
+  // A rough step back by whole days, corrected by re-deriving the exact local day
+  // start - keeps the result right even if a DST shift falls inside the week.
+  return localDayStart(dayStart - daysSinceMonday * 86400000, zone)
 }
 
 const aggregateByPeriod = (log, period, nonMetricKeys = [], options = {}) => {
+  // Checked before the daily early return so a call site that forgets the zone fails
+  // in its daily tests too, not only once someone requests weekly/monthly.
+  const timeZone = requireZone(options.timezone, 'aggregateByPeriod')
   if (period === PERIOD_TYPES.DAILY) {
     return log
   }
@@ -35,28 +115,18 @@ const aggregateByPeriod = (log, period, nonMetricKeys = [], options = {}) => {
   const meanKeys = new Set(options.meanKeys || [])
 
   const grouped = log.reduce((acc, entry) => {
-    let date
-    try {
-      date = new Date(Number(entry.ts))
-
-      if (isNaN(date.getTime())) {
-        return acc
-      }
-    } catch (error) {
-      return acc
-    }
+    const ts = Number(entry.ts)
+    if (!Number.isFinite(ts)) return acc
 
     let groupKey
 
     if (period === PERIOD_TYPES.MONTHLY) {
-      groupKey = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`
+      const { year, month } = localDateParts(ts, timeZone)
+      groupKey = `${year}-${String(month).padStart(2, '0')}`
     } else if (period === PERIOD_TYPES.YEARLY) {
-      groupKey = `${date.getUTCFullYear()}`
+      groupKey = `${localDateParts(ts, timeZone).year}`
     } else if (period === PERIOD_TYPES.WEEKLY) {
-      const day = date.getUTCDay()
-      const diff = date.getUTCDate() - day
-      const weekStart = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), diff))
-      groupKey = `${weekStart.getTime()}`
+      groupKey = `${localWeekStart(ts, timeZone)}`
     } else {
       groupKey = `${entry.ts}`
     }
@@ -96,25 +166,23 @@ const aggregateByPeriod = (log, period, nonMetricKeys = [], options = {}) => {
     try {
       if (period === PERIOD_TYPES.MONTHLY) {
         const [year, month] = groupKey.split('-').map(Number)
-
-        const newDate = new Date(Date.UTC(year, month - 1, 1))
-        if (isNaN(newDate.getTime())) {
+        const ts = localMonthStartTs(year, month, timeZone)
+        if (!Number.isFinite(ts)) {
           throw new Error(`Invalid date for monthly grouping: ${groupKey}`)
         }
 
-        aggregated.ts = newDate.getTime()
+        aggregated.ts = ts
         aggregated.month = month
         aggregated.year = year
-        aggregated.monthName = newDate.toLocaleString('en-US', { month: 'long', timeZone: 'UTC' })
+        aggregated.monthName = new Date(ts).toLocaleString('en-US', { month: 'long', timeZone })
       } else if (period === PERIOD_TYPES.YEARLY) {
         const year = parseInt(groupKey)
-
-        const newDate = new Date(Date.UTC(year, 0, 1))
-        if (isNaN(newDate.getTime())) {
+        const ts = localYearStart(year, timeZone)
+        if (!Number.isFinite(ts)) {
           throw new Error(`Invalid date for yearly grouping: ${groupKey}`)
         }
 
-        aggregated.ts = newDate.getTime()
+        aggregated.ts = ts
         aggregated.year = year
       } else if (period === PERIOD_TYPES.WEEKLY) {
         aggregated.ts = Number(groupKey)
@@ -123,14 +191,15 @@ const aggregateByPeriod = (log, period, nonMetricKeys = [], options = {}) => {
       aggregated.ts = entries[0].ts
 
       try {
-        const fallbackDate = new Date(Number(entries[0].ts))
-        if (!isNaN(fallbackDate.getTime())) {
+        const fallbackTs = Number(entries[0].ts)
+        if (Number.isFinite(fallbackTs)) {
+          const { year, month } = localDateParts(fallbackTs, timeZone)
           if (period === PERIOD_TYPES.MONTHLY) {
-            aggregated.month = fallbackDate.getMonth() + 1
-            aggregated.year = fallbackDate.getFullYear()
-            aggregated.monthName = fallbackDate.toLocaleString('en-US', { month: 'long' })
+            aggregated.month = month
+            aggregated.year = year
+            aggregated.monthName = new Date(fallbackTs).toLocaleString('en-US', { month: 'long', timeZone })
           } else if (period === PERIOD_TYPES.YEARLY) {
-            aggregated.year = fallbackDate.getFullYear()
+            aggregated.year = year
           }
         }
       } catch (fallbackError) {
@@ -144,60 +213,14 @@ const aggregateByPeriod = (log, period, nonMetricKeys = [], options = {}) => {
   return aggregatedResults.sort((a, b) => Number(b.ts) - Number(a.ts))
 }
 
-const getPeriodKey = (timestamp, period) => {
-  const calculator = PERIOD_CALCULATORS[period] || PERIOD_CALCULATORS.daily
-  return calculator(timestamp)
-}
-
-const getPeriodEndDate = (periodTs, period) => {
-  const periodEnd = new Date(periodTs)
-
-  switch (period) {
-    case PERIOD_TYPES.WEEKLY:
-      periodEnd.setDate(periodEnd.getDate() + 7)
-      break
-    case PERIOD_TYPES.MONTHLY:
-      periodEnd.setMonth(periodEnd.getMonth() + 1)
-      break
-    case PERIOD_TYPES.YEARLY:
-      periodEnd.setFullYear(periodEnd.getFullYear() + 1)
-      break
-  }
-
-  return periodEnd
-}
-
-const isTimestampInPeriod = (timestamp, periodTs, period) => {
-  if (period === PERIOD_TYPES.DAILY) return timestamp === periodTs
-
-  const periodEnd = getPeriodEndDate(periodTs, period)
-  return timestamp >= periodTs && timestamp < periodEnd.getTime()
-}
-
-const getFilteredPeriodData = (
-  sourceData,
-  periodTs,
-  period,
-  filterFn = (entries) => entries
-) => {
-  if (period === PERIOD_TYPES.DAILY) {
-    return sourceData[periodTs] || (typeof filterFn === 'function' ? {} : 0)
-  }
-
-  const entriesInPeriod = Object.entries(sourceData).filter(([tsStr]) => {
-    const timestamp = Number(tsStr)
-    return isTimestampInPeriod(timestamp, periodTs, period)
-  })
-
-  return filterFn(entriesInPeriod, sourceData)
-}
-
 module.exports = {
   getStartOfDay,
+  zoneOffsetMs,
+  isLocalHourStart,
+  localDayStart,
+  localWeekStart,
+  localMonthStartTs,
   convertMsToSeconds,
-  getPeriodEndDate,
   aggregateByPeriod,
-  getPeriodKey,
-  isTimestampInPeriod,
-  getFilteredPeriodData
+  requireZone
 }

@@ -2,7 +2,8 @@
 
 const {
   ENDPOINTS,
-  HTTP_METHODS
+  HTTP_METHODS,
+  AUTH_PERMISSIONS
 } = require('../../constants')
 const {
   getPools,
@@ -10,7 +11,7 @@ const {
   getPoolThingConfig,
   getPoolStatsContainers
 } = require('../handlers/pools.handlers')
-const { createCachedAuthRoute, createAuthRoute } = require('../lib/routeHelpers')
+const { createCachedAuthRoute, createAuthRoute, AUTH_ONLY } = require('../lib/routeHelpers')
 
 module.exports = (ctx) => {
   const schemas = require('../schemas/pools.schemas.js')
@@ -31,7 +32,8 @@ module.exports = (ctx) => {
           req.query.fields
         ],
         ENDPOINTS.POOLS,
-        getPools
+        getPools,
+        [AUTH_PERMISSIONS.REVENUE]
       )
     },
     {
@@ -47,10 +49,12 @@ module.exports = (ctx) => {
           req.params.pool,
           req.query.start,
           req.query.end,
-          req.query.range
+          req.query.range,
+          req.query.timezone
         ],
         ENDPOINTS.POOLS_BALANCE_HISTORY,
-        getPoolBalanceHistory
+        getPoolBalanceHistory,
+        [AUTH_PERMISSIONS.REVENUE]
       )
     },
     {
@@ -58,7 +62,8 @@ module.exports = (ctx) => {
       url: ENDPOINTS.POOLS_THING_CONFIG,
       ...createAuthRoute(
         ctx,
-        getPoolThingConfig
+        getPoolThingConfig,
+        AUTH_ONLY
       )
     },
     {
@@ -66,7 +71,8 @@ module.exports = (ctx) => {
       url: ENDPOINTS.POOLS_CONTAINERS_STATS,
       ...createAuthRoute(
         ctx,
-        getPoolStatsContainers
+        getPoolStatsContainers,
+        AUTH_ONLY
       )
     }
   ]

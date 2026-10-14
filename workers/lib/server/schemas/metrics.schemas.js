@@ -1,5 +1,7 @@
 'use strict'
 
+const { POOL_HASHRATE_INTERVALS_MS } = require('../../constants')
+
 // 1M is a 30-day month. Distinct from 1m (one minute) used by
 // powerModeTimeline / containerHistory.
 const METRICS_INTERVALS = ['1h', '1d', '1w', '1M']
@@ -12,10 +14,14 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         interval: { type: 'string', enum: METRICS_INTERVALS },
+        // Only read by the '1M' rollup, which cuts months in this zone rather than UTC.
+        timezone: { type: 'string' },
         groupBy: { type: 'string', enum: ['miner', 'container', 'rack'] },
+        phase: { type: 'string', maxLength: 64, pattern: '^[A-Za-z0-9_]+$' },
         container: { type: 'string' },
         current: { type: 'boolean' },
         nominal: { type: 'boolean' },
+        siteNominal: { type: 'boolean' },
         pool: { type: 'boolean' },
         racks: { type: 'string' },
         offset: { type: 'integer', minimum: 0 },
@@ -33,6 +39,7 @@ const schemas = {
         interval: { type: 'string', enum: METRICS_INTERVALS },
         groupBy: { type: 'string', enum: ['miner', 'container', 'rack'] },
         byMeter: { type: 'boolean' },
+        phase: { type: 'string', maxLength: 64, pattern: '^[A-Za-z0-9_]+$' },
         racks: { type: 'string' },
         overwriteCache: { type: 'boolean' }
       },
@@ -45,6 +52,7 @@ const schemas = {
         end: { type: 'integer', minimum: 0 },
         interval: { type: 'string', enum: METRICS_INTERVALS },
         groupBy: { type: 'string', enum: ['miner', 'container', 'rack'] },
+        phase: { type: 'string', maxLength: 64, pattern: '^[A-Za-z0-9_]+$' },
         racks: { type: 'string' },
         overwriteCache: { type: 'boolean' }
       },
@@ -110,6 +118,19 @@ const schemas = {
       },
       required: ['start', 'end']
     },
+    // No start/end: the window is lookbackDays back from now, so the cache key
+    // stays a handful of interval:days combinations instead of a fresh entry
+    // per request timestamp.
+    poolHashrate: {
+      type: 'object',
+      properties: {
+        interval: { type: 'string', enum: Object.keys(POOL_HASHRATE_INTERVALS_MS) },
+        lookbackDays: { type: 'integer', minimum: 1, maximum: 90 },
+        phase: { type: 'string', maxLength: 64, pattern: '^[A-Za-z0-9_]+$' },
+        overwriteCache: { type: 'boolean' }
+      },
+      required: ['interval', 'lookbackDays']
+    },
     powerModeTimeline: {
       type: 'object',
       properties: {
@@ -137,6 +158,18 @@ const schemas = {
         start: { type: 'integer', minimum: 0 },
         end: { type: 'integer', minimum: 0 },
         interval: { type: 'string', enum: [...METRICS_INTERVALS, 'hourly', 'daily', 'weekly'] },
+        overwriteCache: { type: 'boolean' }
+      },
+      required: ['start', 'end']
+    },
+    downtime: {
+      type: 'object',
+      properties: {
+        start: { type: 'integer', minimum: 0 },
+        end: { type: 'integer', minimum: 0 },
+        phase: { type: 'string', maxLength: 64, pattern: '^[A-Za-z0-9_]+$' },
+        interval: { type: 'string', enum: ['1h', '1d'] },
+        timezone: { type: 'string', maxLength: 100 },
         overwriteCache: { type: 'boolean' }
       },
       required: ['start', 'end']

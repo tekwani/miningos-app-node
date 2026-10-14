@@ -284,6 +284,12 @@ test('Api security', { timeout: 90000 }, async (main) => {
   await sleep(2000)
   await createUser(admin1, 'admin')
   await createUser(admin2, 'admin')
+  // Startup migrates every oauth-config user as read_only_user; routes now require explicit
+  // permissions, so the operator needs its real role. Not via /auth/users: its schema
+  // rejects the TLD-less test address.
+  const operator = await worker.worker.auth_a0.getUserByEmail(siteOperatorUser)
+  await worker.worker.auth_a0.deleteUser(operator.id)
+  await worker.worker.auth_a0.createUser({ email: siteOperatorUser, roles: ['site_operator'] })
 
   await main.test('Api: list-things', async (n) => {
     const api = `${appNodeBaseUrl}${ENDPOINTS.LIST_THINGS}`
@@ -322,6 +328,28 @@ test('Api security', { timeout: 90000 }, async (main) => {
     const api = `${appNodeBaseUrl}${ENDPOINTS.SETTINGS}`
     const body = { rackId: 1, entries: { val: 1 } }
     await testPutEndpointSecurity(n, httpClient, api, invalidToken, body, siteOperatorUser, encoding)
+  })
+
+  await main.test('Api: get energy consumption', async (n) => {
+    const api = `${appNodeBaseUrl}${ENDPOINTS.ENERGY_CONSUMPTION}?start=0&end=3600000`
+    await testGetEndpointSecurity(n, httpClient, api, invalidToken, readonlyUser, encoding)
+  })
+
+  await main.test('Api: post energy consumption', async (n) => {
+    const api = `${appNodeBaseUrl}${ENDPOINTS.ENERGY_CONSUMPTION}`
+    const body = {
+      entries: [{ ts: Date.UTC(2026, 0, 1), totalConsumptionMWh: 1, cduConsumptionMWh: 0, rectifier1ConsumptionMWh: 0.5, rectifier2ConsumptionMWh: 0.5 }]
+    }
+    const options = { body }
+    await runTestCases(n, [
+      { name: 'api should fail for missing auth token', test: () => testMissingAuthToken(httpClient, 'post', api, { ...options, encoding }) },
+      { name: 'api should fail for invalid auth token', test: () => testInvalidAuthToken(httpClient, 'post', api, invalidToken, { ...options, encoding }) },
+      { name: 'api should fail for read-only powermeter permission', test: () => testInvalidPermissions(httpClient, 'post', api, readonlyUser, 'ERR_AUTH_FAIL_NO_PERMS', { ...options, encoding }) }
+    ])
+    // passes auth; with no DCS rack confirming, the write must not report success
+    await n.test('api should pass auth for powermeter:rw and refuse an unconfirmed write', async (t) => {
+      await testEndpointWithAuthAndError(t, httpClient, 'post', api, admin1, 'ERR_CONSUMPTION_SAVE_FAILED', { ...options, encoding })
+    })
   })
 
   await main.test('Api: get worker-config', async (n) => {
@@ -484,6 +512,18 @@ test('Api security', { timeout: 90000 }, async (main) => {
         encoding
       })
     })
+  })
+
+  await main.test('Api: resource-gated reads deny read-only users', async (n) => {
+    for (const path of [
+      `${ENDPOINTS.METRICS_REVENUE_HOURLY}?start=1&end=2`,
+      `${ENDPOINTS.GLOBAL_DATA}?type=alertParameters`,
+      `${ENDPOINTS.THING_CONFIG}?type=miner&requestType=poolConfig`
+    ]) {
+      await n.test(path, async (t) => {
+        await testEndpointWithAuthAndError(t, httpClient, 'get', `${appNodeBaseUrl}${path}`, readonlyUser, 'ERR_AUTH_FAIL_NO_PERMS', { encoding })
+      })
+    }
   })
 
   await main.test('Api: get users', async (n) => {

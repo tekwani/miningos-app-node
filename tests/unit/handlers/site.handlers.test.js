@@ -1020,6 +1020,60 @@ test('getSiteEfficiency - computes efficiency correctly', async (t) => {
   t.pass()
 })
 
+test('getSiteEfficiency - site efficiency divides by miner plus pool-only phase hashrate', async (t) => {
+  const listThingsResponse = [{
+    id: 'dcs-1',
+    type: 'dcs-central',
+    tags: ['t-dcs'],
+    last: {
+      snap: {
+        config: {
+          energy_layout: {
+            site_meter: 'PM-SITE',
+            branches: [{ board: 'DB-1', meter: 'PM-1', feeds: 'Groups 1-2' }]
+          }
+        },
+        stats: {
+          dcs_specific: {
+            equipment: {
+              power_meters: [
+                { equipment: 'PM-SITE', role: 'site_main', power: { value: 100, unit: 'kW' } },
+                { equipment: 'PM-1', role: 'rack', power: { value: 80, unit: 'kW' } }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }]
+  const makeCtx = (phases) => withDataProxy({
+    conf: {
+      orks: [{ rpcPublicKey: 'key1' }],
+      featureConfig: { centralDCSSetup: { enabled: true, tag: 't-dcs' }, ...(phases && { phases }) }
+    },
+    net_r0: {
+      jRequest: async (key, method) => {
+        // 2 TH/s of miners
+        if (method === 'tailLogMulti') return [[{ hashrate_mhs_5m_container_group_sum_aggr: { 'group-1': 1000000, 'group-2': 1000000 } }]]
+        if (method === 'listThings') return listThingsResponse
+        // 2 TH/s at the pool-only account; the telemetry phase's account must not be added again
+        if (method === 'getWrkExtData') return [{ stats: [{ poolType: 'ocean', username: 'acme', hashrate: 2e12 }, { poolType: 'ocean', username: 'site', hashrate: 2e12 }] }]
+        return {}
+      }
+    }
+  })
+
+  const phased = await getSiteEfficiency(makeCtx([
+    { id: 'phase1', minerTelemetry: true, pool: { accounts: [{ poolType: 'ocean', username: 'site' }] } },
+    { id: 'phase1_5', minerTelemetry: false, pool: { accounts: [{ poolType: 'ocean', username: 'acme' }] } }
+  ]), { query: {} })
+  t.is(phased.summary.site_efficiency.value, 25000, '100 kW over 2 + 2 TH/s')
+  t.is(phased.summary.mining_efficiency.value, 40000, 'mining efficiency stays rack meters over miners')
+
+  const plain = await getSiteEfficiency(makeCtx(null), { query: {} })
+  t.is(plain.summary.site_efficiency.value, 50000, 'without phases only the miners count')
+})
+
 test('getSiteEfficiency - computes C&A overhead', async (t) => {
   const tailLogResponse = [
     [{
@@ -1360,5 +1414,40 @@ test('getSiteOverviewUnits - empty site', async (t) => {
   const mockCtx = createUnitsCtx()
   const result = await getSiteOverviewUnits(mockCtx, { query: {} })
   t.alike(result.units, [], 'should return empty units')
+  t.pass()
+})
+
+test('composeSiteStatus - pool-only phase hashrate joins the efficiency divisor', (t) => {
+  const { composeSiteStatus, sumPoolOnlyPhasesHashrateMhs } = require('../../../workers/lib/server/handlers/site.utils')
+
+  const poolData = [[{
+    ts: 1,
+    stats: [
+      { poolType: 'ocean', username: 'addr1', hashrate: 6e14, active_workers_count: 10, worker_count: 12 },
+      { poolType: 'ocean', username: 'addr2', hashrate: 5e13, active_workers_count: 2, worker_count: 2 }
+    ]
+  }]]
+
+  const ctx = {
+    conf: {
+      featureConfig: {
+        phases: [
+          { id: 'phase1', minerTelemetry: true, pool: { accounts: [{ poolType: 'ocean', username: 'addr1' }] } },
+          { id: 'phase1_5', minerTelemetry: false, pool: { accounts: [{ poolType: 'ocean', username: 'addr2' }] } }
+        ]
+      }
+    }
+  }
+
+  const poolOnlyMhs = sumPoolOnlyPhasesHashrateMhs(ctx, poolData)
+  t.is(poolOnlyMhs, 5e13 / 1e6, 'only pool-only phase accounts are summed')
+  t.is(sumPoolOnlyPhasesHashrateMhs({ conf: {} }, poolData), 0, 'zero without a phases config')
+
+  const minerLogs = [[[{ hashrate_mhs_1m_sum_aggr: 1e8, nominal_hashrate_mhs_sum_aggr: 2e8 }]]]
+  const base = composeSiteStatus(minerLogs, poolData, [], { powerW: 8.7e6, alert: '' })
+  const combined = composeSiteStatus(minerLogs, poolData, [], { powerW: 8.7e6, alert: '' }, null, null, poolOnlyMhs)
+
+  t.ok(combined.efficiency.value < base.efficiency.value, 'combined hashrate lowers W/THs')
+  t.is(combined.hashrate.value, base.hashrate.value, 'the MOS hashrate tile stays miner-only')
   t.pass()
 })

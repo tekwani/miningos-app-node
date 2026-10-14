@@ -8,9 +8,10 @@ const {
   calculatePoolsSummary,
   getPoolBalanceHistory,
   flattenTransactionResults,
-  flattenPoolStatsHistory,
+  flattenPoolHashrateHistory,
   resolvePoolHashrateForBuckets,
   groupByBucket,
+  localBucketStartTs,
   getPoolThingConfig,
   getPoolStatsContainers
 } = require('../../../workers/lib/server/handlers/pools.handlers')
@@ -286,7 +287,7 @@ test('flattenTransactionResults - extracts daily entries from ext-data', (t) => 
       ]
     }]
   ]
-  const entries = flattenTransactionResults(results)
+  const entries = flattenTransactionResults(results, 'UTC')
   t.is(entries.length, 1, 'should have 1 daily entry')
   t.ok(entries[0].revenue > 0, 'should have revenue')
   t.ok(entries[0].hashrate > 0, 'should have hashrate')
@@ -295,7 +296,7 @@ test('flattenTransactionResults - extracts daily entries from ext-data', (t) => 
 
 test('flattenTransactionResults - handles error results', (t) => {
   const results = [{ error: 'timeout' }]
-  const entries = flattenTransactionResults(results)
+  const entries = flattenTransactionResults(results, 'UTC')
   t.is(entries.length, 0, 'should be empty for errors')
   t.pass()
 })
@@ -306,15 +307,28 @@ test('groupByBucket - groups by daily bucket', (t) => {
     { ts: 1700050000000, revenue: 200 },
     { ts: 1700092800000, revenue: 300 }
   ]
-  const bucketSize = 86400000
-  const buckets = groupByBucket(entries, bucketSize)
+  const buckets = groupByBucket(entries, '1D', 'UTC')
   t.ok(typeof buckets === 'object', 'should return object')
   t.ok(Object.keys(buckets).length >= 1, 'should have at least one bucket')
   t.pass()
 })
 
+test('groupByBucket - groups by local calendar week/month', (t) => {
+  const entries = [
+    { ts: Date.UTC(2026, 0, 5), revenue: 100 }, // Monday
+    { ts: Date.UTC(2026, 0, 6), revenue: 200 }, // Tuesday, same week
+    { ts: Date.UTC(2026, 1, 1), revenue: 300 } // different month
+  ]
+  const weekly = groupByBucket(entries, '1W', 'UTC')
+  t.is(Object.keys(weekly).length, 2, 'first two entries share a week bucket')
+
+  const monthly = groupByBucket(entries, '1M', 'UTC')
+  t.is(Object.keys(monthly).length, 2, 'entries split across two month buckets')
+  t.pass()
+})
+
 test('groupByBucket - handles empty entries', (t) => {
-  const buckets = groupByBucket([], 86400000)
+  const buckets = groupByBucket([], '1D', 'UTC')
   t.is(Object.keys(buckets).length, 0, 'should be empty')
   t.pass()
 })
@@ -324,33 +338,71 @@ test('groupByBucket - handles missing timestamps', (t) => {
     { revenue: 100 },
     { ts: 1700006400000, revenue: 200 }
   ]
-  const buckets = groupByBucket(entries, 86400000)
+  const buckets = groupByBucket(entries, '1D', 'UTC')
   t.ok(Object.keys(buckets).length >= 1, 'should skip items without ts')
   t.pass()
 })
 
-test('flattenPoolStatsHistory - extracts timestamped stats snapshots', (t) => {
+test('localBucketStartTs - dispatches by range', (t) => {
+  const ts = Date.UTC(2026, 0, 15, 6)
+  t.is(localBucketStartTs(ts, '1D', 'UTC'), Date.UTC(2026, 0, 15), '1D uses day start')
+  t.is(localBucketStartTs(ts, '1W', 'UTC'), Date.UTC(2026, 0, 12), '1W uses the Monday-start week')
+  t.is(localBucketStartTs(ts, '1M', 'UTC'), Date.UTC(2026, 0, 1), '1M uses month start')
+  t.pass()
+})
+
+test('getPoolBalanceHistory - timezone param never reinterprets start/end', async (t) => {
+  let capturedPayload = null
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        capturedPayload = payload
+        return [{ ts: '1700006400000', transactions: [] }]
+      }
+    }
+  })
+
+  const mockReq = {
+    query: { start: Date.UTC(2026, 0, 5), end: Date.UTC(2026, 0, 6), range: '1D', timezone: 'America/New_York' },
+    params: {}
+  }
+
+  await getPoolBalanceHistory(mockCtx, mockReq, {})
+  t.is(capturedPayload.query.start, Date.UTC(2026, 0, 5), 'start is a true UTC instant, same as export')
+  t.is(capturedPayload.query.end, Date.UTC(2026, 0, 6), 'end is a true UTC instant, same as export')
+  t.pass()
+})
+
+test('flattenPoolHashrateHistory - extracts timestamped hashrate samples', (t) => {
   const results = [
     [
-      { ts: '1770000000000', stats: [{ poolType: 'f2pool', username: 'a', hashrate: 1e6 }] },
-      { ts: 1770000300000, stats: [{ poolType: 'ocean', username: 'b', hashrate: 2e6 }] },
-      { ts: 1770000600000 }, // no stats array
-      { stats: [] } // no ts
+      {
+        ts: 'undefined',
+        hashrateHistory: [
+          { poolType: 'f2pool', ts: '1770000000000', username: 'a', hashrate: 1e6 },
+          { poolType: 'ocean', ts: 1770000300000, username: 'b', hashrate: 2e6 },
+          { poolType: 'f2pool', username: 'c', hashrate: 3e6 }, // no ts
+          null
+        ]
+      },
+      { ts: 1770000600000 }, // no hashrateHistory
+      { hashrateHistory: [] }
     ],
     { error: 'ERR_ORK_DOWN' },
     null
   ]
 
-  const entries = flattenPoolStatsHistory(results)
-  t.is(entries.length, 2, 'should keep only valid snapshots')
-  t.is(entries[0].ts, 1770000000000, 'should coerce string timestamps')
-  t.is(entries[1].stats[0].username, 'b')
+  const samples = flattenPoolHashrateHistory(results)
+  t.is(samples.length, 2, 'should keep only valid samples')
+  t.is(samples[0].ts, 1770000000000, 'should coerce string timestamps')
+  t.is(samples[1].username, 'b')
   t.pass()
 })
 
-test('flattenPoolStatsHistory - handles non-array input', (t) => {
-  t.alike(flattenPoolStatsHistory(null), [])
-  t.alike(flattenPoolStatsHistory(undefined), [])
+test('flattenPoolHashrateHistory - handles non-array input', (t) => {
+  t.alike(flattenPoolHashrateHistory(null), [])
+  t.alike(flattenPoolHashrateHistory(undefined), [])
   t.pass()
 })
 
@@ -361,11 +413,15 @@ test('resolvePoolHashrateForBuckets - averages per account then sums accounts', 
     net_r0: {
       jRequest: async (key, method, payload) => {
         capturedPayload = payload
-        return [
-          { ts: 1770000060000, stats: [{ poolType: 'f2pool', username: 'a', hashrate: 100e6 }] },
-          { ts: 1770000360000, stats: [{ poolType: 'f2pool', username: 'a', hashrate: 300e6 }, { poolType: 'ocean', username: 'b', hashrate: 50e6 }] },
-          { ts: 1770003660000, stats: [{ poolType: 'f2pool', username: 'a', hashrate: 500e6 }] }
-        ]
+        return [{
+          ts: 'undefined',
+          hashrateHistory: [
+            { poolType: 'f2pool', ts: 1770000060000, username: 'a', hashrate: 100e6 },
+            { poolType: 'f2pool', ts: 1770000360000, username: 'a', hashrate: 300e6 },
+            { poolType: 'ocean', ts: 1770000360000, username: 'b', hashrate: 50e6 },
+            { poolType: 'f2pool', ts: 1770003660000, username: 'a', hashrate: 500e6 }
+          ]
+        }]
       }
     }
   })
@@ -380,12 +436,7 @@ test('resolvePoolHashrateForBuckets - averages per account then sums accounts', 
   })
 
   t.is(capturedPayload.type, WORKER_TYPES.MINERPOOL, 'should query minerpool workers')
-  t.is(capturedPayload.query.key, 'stats-history', 'should read raw stats snapshots')
-  t.alike(
-    capturedPayload.query.fields,
-    { ts: 1, 'stats.poolType': 1, 'stats.username': 1, 'stats.hashrate': 1 },
-    'should project rack-side to only the fields the calculation reads'
-  )
+  t.is(capturedPayload.query.key, 'hashrate-history', 'should read hashrate history samples')
   t.is(byBucket.get(1770000000000), 250, 'avg of a (200e6) plus b (50e6), in MH/s')
   t.is(byBucket.get(1770003600000), 500, 'single sample bucket')
   t.is(byBucket.get(1770007200000), null, 'bucket without samples is null')
@@ -396,11 +447,13 @@ test('resolvePoolHashrateForBuckets - unsorted buckets and boundary samples', as
   const mockCtx = withDataProxy({
     conf: { orks: [{ rpcPublicKey: 'key1' }] },
     net_r0: {
-      jRequest: async () => [
-        { ts: 1770000000000, stats: [{ poolType: 'f2pool', username: 'a', hashrate: 100e6 }] }, // == startTs
-        { ts: 1770003599999, stats: [{ poolType: 'f2pool', username: 'a', hashrate: 300e6 }] }, // == endTs
-        { ts: 1770003600000, stats: [{ poolType: 'f2pool', username: 'a', hashrate: 900e6 }] } // next bucket
-      ]
+      jRequest: async () => [{
+        hashrateHistory: [
+          { poolType: 'f2pool', ts: 1770000000000, username: 'a', hashrate: 100e6 }, // == startTs
+          { poolType: 'f2pool', ts: 1770003599999, username: 'a', hashrate: 300e6 }, // == endTs
+          { poolType: 'f2pool', ts: 1770003600000, username: 'a', hashrate: 900e6 } // next bucket
+        ]
+      }]
     }
   })
 
@@ -530,6 +583,34 @@ test('getPoolThingConfig - container thing returns overriddenConfig count', asyn
   t.pass()
 })
 
+test('getPoolThingConfig - counts overridden miners beyond the single-page limit', async (t) => {
+  const TOTAL_MINERS = 150
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, params) => {
+        if (method !== RPC_METHODS.LIST_THINGS) return []
+        if (params?.query?.id) {
+          return [{ id: 'container-1', rack: 'container-unit-a', info: { container: 'unit-a', poolConfig: 'shared-cfg' } }]
+        }
+        if (params?.query?.tags) {
+          const offset = params.offset || 0
+          const remaining = TOTAL_MINERS - offset
+          const pageSize = Math.max(0, Math.min(params.limit, remaining))
+          return Array.from({ length: pageSize }, (_, i) => ({ id: `m${offset + i}`, info: { poolConfig: 'other-cfg' } }))
+        }
+        return []
+      }
+    }
+  })
+
+  const mockReq = { params: { id: 'container-1' } }
+  const result = await getPoolThingConfig(mockCtx, mockReq)
+
+  t.is(result.overriddenConfig, TOTAL_MINERS, 'should count all overridden miners, not capped at a single page')
+  t.pass()
+})
+
 test('getPoolThingConfig - container with no poolConfig returns null and zero overriden', async (t) => {
   const mockCtx = withDataProxy({
     conf: { orks: [{ rpcPublicKey: 'key1' }] },
@@ -590,6 +671,34 @@ test('getPoolStatsContainers - returns container stats with overriddenConfig', a
   t.ok(unitB, 'should have unit-b')
   t.is(unitA.overriddenConfig, 1, 'unit-a should have 1 miner with overridden config')
   t.is(unitB.overriddenConfig, 0, 'unit-b should have 0 overridden')
+  t.pass()
+})
+
+test('getPoolStatsContainers - counts overridden miners beyond the single-page limit', async (t) => {
+  const TOTAL_MINERS = 150
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, params) => {
+        if (method !== 'listThings') return []
+        if (params?.query?.tags?.$in?.includes('t-container')) {
+          return [{ info: { container: 'unit-a', poolConfig: 'shared-cfg' } }]
+        }
+        if (params?.query?.['info.container']?.$in) {
+          const offset = params.offset || 0
+          const remaining = TOTAL_MINERS - offset
+          const pageSize = Math.max(0, Math.min(params.limit, remaining))
+          return Array.from({ length: pageSize }, (_, i) => ({ info: { container: 'unit-a', poolConfig: 'other-cfg' } }))
+        }
+        return []
+      }
+    }
+  })
+
+  const result = await getPoolStatsContainers(mockCtx, {})
+
+  t.is(result.length, 1, 'should return one entry')
+  t.is(result[0].overriddenConfig, TOTAL_MINERS, 'should count all overridden miners, not capped at a single page')
   t.pass()
 })
 

@@ -5,13 +5,19 @@ const {
   RPC_METHODS,
   WORKER_TYPES,
   MINERPOOL_EXT_DATA_KEYS,
-  RANGE_BUCKETS,
   MINER_FIELD_MAP
 } = require('../../constants')
 const {
   parseJsonQueryParam,
-  getStartOfDay
+  flattenRpcResults,
+  localDayStart,
+  localWeekStart
 } = require('../../utils')
+const {
+  resolveStartEnd,
+  localMonthStartTs,
+  localMonthKey
+} = require('../../metrics.utils')
 
 async function getPools (ctx, req) {
   const filter = req.query.query ? parseJsonQueryParam(req.query.query, 'ERR_QUERY_INVALID_JSON') : null
@@ -94,29 +100,19 @@ function calculatePoolsSummary (pools) {
 }
 
 async function getPoolBalanceHistory (ctx, req) {
-  const start = Number(req.query.start)
-  const end = Number(req.query.end)
+  const { start, end, timezone } = resolveStartEnd(ctx, req)
   const range = req.query.range || '1D'
   const poolParam = req.params.pool || null
   const poolFilter = poolParam === 'all' ? null : poolParam
-
-  if (!start || !end) {
-    throw new Error('ERR_MISSING_START_END')
-  }
-
-  if (start >= end) {
-    throw new Error('ERR_INVALID_DATE_RANGE')
-  }
 
   const results = await ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
     type: 'minerpool',
     query: { key: MINERPOOL_EXT_DATA_KEYS.TRANSACTIONS, start, end, pool: poolFilter }
   })
 
-  const dailyEntries = flattenTransactionResults(results)
+  const dailyEntries = flattenTransactionResults(results, timezone)
 
-  const bucketSize = RANGE_BUCKETS[range] || RANGE_BUCKETS['1D']
-  const buckets = groupByBucket(dailyEntries, bucketSize)
+  const buckets = groupByBucket(dailyEntries, range, timezone)
 
   const log = Object.entries(buckets)
     .sort(([a], [b]) => Number(a) - Number(b))
@@ -138,7 +134,7 @@ async function getPoolBalanceHistory (ctx, req) {
   return { log }
 }
 
-function flattenTransactionResults (results) {
+function flattenTransactionResults (results, timezone) {
   const daily = []
   for (const res of results) {
     if (res.error || !res) continue
@@ -169,7 +165,7 @@ function flattenTransactionResults (results) {
       if (revenue === 0 && hashCount === 0) continue
 
       daily.push({
-        ts: getStartOfDay(ts),
+        ts: localDayStart(ts, timezone),
         revenue,
         hashrate: hashCount > 0 ? hashrate / hashCount : 0
       })
@@ -179,21 +175,30 @@ function flattenTransactionResults (results) {
   return daily
 }
 
-function groupByBucket (entries, bucketSize) {
+function localBucketStartTs (ts, range, timezone) {
+  if (range === '1W') return localWeekStart(ts, timezone)
+  if (range === '1M') {
+    const [year, month] = localMonthKey(ts, timezone).split('-').map(Number)
+    return localMonthStartTs(year, month, timezone)
+  }
+  return localDayStart(ts, timezone)
+}
+
+function groupByBucket (entries, range, timezone) {
   const buckets = {}
   for (const entry of entries) {
     const ts = entry.ts
     if (!ts) continue
-    const bucketTs = Math.floor(ts / bucketSize) * bucketSize
+    const bucketTs = localBucketStartTs(ts, range, timezone)
     if (!buckets[bucketTs]) buckets[bucketTs] = []
     buckets[bucketTs].push(entry)
   }
   return buckets
 }
 
-function flattenPoolStatsHistory (results) {
-  const entries = []
-  if (!Array.isArray(results)) return entries
+function flattenPoolHashrateHistory (results) {
+  const samples = []
+  if (!Array.isArray(results)) return samples
 
   for (const res of results) {
     if (!res || res.error) continue
@@ -201,19 +206,27 @@ function flattenPoolStatsHistory (results) {
     if (!Array.isArray(data)) continue
 
     for (const entry of data) {
-      if (!entry) continue
-      const ts = Number(entry.ts)
-      if (!ts || !Array.isArray(entry.stats)) continue
-      entries.push({ ts, stats: entry.stats })
+      if (!entry || !Array.isArray(entry.hashrateHistory)) continue
+      for (const sample of entry.hashrateHistory) {
+        if (!sample) continue
+        const ts = Number(sample.ts)
+        if (!ts) continue
+        samples.push({
+          ts,
+          poolType: sample.poolType,
+          username: sample.username,
+          hashrate: sample.hashrate
+        })
+      }
     }
   }
 
-  return entries
+  return samples
 }
 
 /**
  * Site-wide pool-reported hashrate per report bucket, from the minerpool
- * workers' raw stats snapshots (H/s). Each account's samples are averaged
+ * workers' hashrate-history samples (H/s). Each account's samples are averaged
  * within the bucket before summing across accounts, so accounts polling at
  * different rates (or served by different racks) don't skew the site total.
  *
@@ -221,20 +234,16 @@ function flattenPoolStatsHistory (results) {
  * bucket `ts` with the pool hashrate in MH/s, or null for windows without
  * samples.
  */
-async function resolvePoolHashrateForBuckets (ctx, { start, end, buckets }) {
+async function resolvePoolHashrateForBuckets (ctx, { start, end, buckets, accounts }) {
   const byBucket = new Map()
   if (!Array.isArray(buckets) || !buckets.length) return byBucket
 
   const results = await ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
     type: WORKER_TYPES.MINERPOOL,
     query: {
-      key: MINERPOOL_EXT_DATA_KEYS.STATS_HISTORY,
+      key: MINERPOOL_EXT_DATA_KEYS.HASHRATE_HISTORY,
       start,
-      end,
-      // Projected on the rack before the data travels: a month of raw 5m
-      // snapshots is ~10MB with full stat docs but ~2MB with only the fields
-      // this calculation reads.
-      fields: { ts: 1, 'stats.poolType': 1, 'stats.username': 1, 'stats.hashrate': 1 }
+      end
     }
   })
 
@@ -257,19 +266,19 @@ async function resolvePoolHashrateForBuckets (ctx, { start, end, buckets }) {
     return idx >= 0 && ts <= sorted[idx].endTs ? idx : -1
   }
 
-  for (const { ts, stats } of flattenPoolStatsHistory(results)) {
-    const idx = findBucketIdx(ts)
+  for (const sample of flattenPoolHashrateHistory(results)) {
+    const account = `${sample.poolType}:${sample.username}`
+    if (accounts && !accounts.has(account)) continue
+
+    const idx = findBucketIdx(sample.ts)
     if (idx === -1) continue
 
-    for (const stat of stats) {
-      const hashrate = Number(stat?.hashrate)
-      if (!Number.isFinite(hashrate)) continue
-      const account = `${stat.poolType}:${stat.username}`
-      const acc = accountsPerBucket[idx].get(account) || { total: 0, count: 0 }
-      acc.total += hashrate
-      acc.count++
-      accountsPerBucket[idx].set(account, acc)
-    }
+    const hashrate = Number(sample.hashrate)
+    if (!Number.isFinite(hashrate)) continue
+    const acc = accountsPerBucket[idx].get(account) || { total: 0, count: 0 }
+    acc.total += hashrate
+    acc.count++
+    accountsPerBucket[idx].set(account, acc)
   }
 
   sorted.forEach((bucket, idx) => {
@@ -297,29 +306,31 @@ const getPoolThingConfig = async (ctx, req) => {
     return { poolConfig: info?.poolConfig || null, overriddenConfig: 0 }
   }
 
-  const miners = await ctx.dataProxy.requestData(RPC_METHODS.LIST_THINGS, {
+  const miners = await ctx.dataProxy.requestDataAllPages(RPC_METHODS.LIST_THINGS, {
     query: { tags: { $in: [`container-${info.container}`] } },
     fields: { 'info.poolConfig': 1 }
   })
-  const overriddenConfig = miners?.[0]?.filter(m => m.info?.poolConfig && m.info?.poolConfig !== info?.poolConfig)?.length || 0
+  const overriddenConfig = flattenRpcResults(miners).filter(m => m.info?.poolConfig && m.info?.poolConfig !== info?.poolConfig).length
   return { poolConfig: info?.poolConfig || null, overriddenConfig }
 }
 
 const getPoolStatsContainers = async (ctx, req) => {
   const fields = { [MINER_FIELD_MAP.container]: 1, [MINER_FIELD_MAP.poolConfig]: 1 }
-  const containers = await ctx.dataProxy.requestData(RPC_METHODS.LIST_THINGS, {
+  const containers = await ctx.dataProxy.requestDataAllPages(RPC_METHODS.LIST_THINGS, {
     fields, query: { tags: { $in: ['t-container'] } }
   })
-  const containerIds = containers?.[0]?.filter(m => m.info?.poolConfig).map(m => m.info.container)
-  const miners = await ctx.dataProxy.requestData(RPC_METHODS.LIST_THINGS, {
+  const flatContainers = flattenRpcResults(containers)
+  const containerIds = flatContainers.filter(m => m.info?.poolConfig).map(m => m.info.container)
+  const miners = await ctx.dataProxy.requestDataAllPages(RPC_METHODS.LIST_THINGS, {
     fields, query: { [MINER_FIELD_MAP.container]: { $in: containerIds } }
   })
+  const flatMiners = flattenRpcResults(miners)
 
-  return containers?.[0]?.map(data => {
+  return flatContainers.map(data => {
     if (!data.info?.poolConfig) return { container: data.info.container, overriddenConfig: 0 }
     return {
       container: data.info.container,
-      overriddenConfig: miners?.[0]?.filter(m => m.info?.poolConfig && m.info?.container === data.info?.container && m.info?.poolConfig !== data.info?.poolConfig)?.length || 0
+      overriddenConfig: flatMiners.filter(m => m.info?.poolConfig && m.info?.container === data.info?.container && m.info?.poolConfig !== data.info?.poolConfig).length
     }
   })
 }
@@ -330,9 +341,10 @@ module.exports = {
   calculatePoolsSummary,
   getPoolBalanceHistory,
   flattenTransactionResults,
-  flattenPoolStatsHistory,
+  flattenPoolHashrateHistory,
   resolvePoolHashrateForBuckets,
   groupByBucket,
+  localBucketStartTs,
   getPoolThingConfig,
   getPoolStatsContainers
 }

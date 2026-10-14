@@ -306,6 +306,12 @@ test('Api', { timeout: 90000 }, async (main) => {
   await sleep(2000)
   await createUser(admin1, 'admin')
   await createUser(admin2, 'admin')
+  // Startup migrates every oauth-config user as read_only_user; routes now require explicit
+  // permissions, so the operator needs its real role. Not via /auth/users: its schema
+  // rejects the TLD-less test address.
+  const operator = await worker.worker.auth_a0.getUserByEmail(siteOperatorUser)
+  await worker.worker.auth_a0.deleteUser(operator.id)
+  await worker.worker.auth_a0.createUser({ email: siteOperatorUser, roles: ['site_operator'] })
 
   const minersApi = `${appNodeBaseUrl}${ENDPOINTS.MINERS}`
 
@@ -959,9 +965,11 @@ test('Api', { timeout: 90000 }, async (main) => {
           return Promise.resolve([{ ts: bucketTs, hashrate_mhs_5m_sum_aggr: 100000 }])
         }
         if (method === 'getWrkExtData') {
-          return Promise.resolve([
-            { ts: bucketTs + 60000, stats: [{ poolType: 'f2pool', username: 'a', hashrate: 100e6 }] }
-          ])
+          return Promise.resolve([{
+            hashrateHistory: [
+              { poolType: 'f2pool', ts: bucketTs + 60000, username: 'a', hashrate: 100e6 }
+            ]
+          }])
         }
         if (method === 'listThings') return Promise.resolve(mockMiners)
         if (method === 'getThingsCount') return Promise.resolve(mockMiners.length)

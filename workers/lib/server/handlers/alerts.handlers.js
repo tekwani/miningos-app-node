@@ -16,6 +16,7 @@ const {
   MINER_TYPE_REGEX,
   HISTORY_ALERTS_QUERY_MAP,
   ALERT_EXT_DATA_WORKER_TYPES,
+  MINERPOOL_EXT_DATA_KEYS,
   GLOBAL_DATA_TYPES,
   CUSTOM_ALERT_CONFIG,
   AUTH_PERMISSIONS,
@@ -28,7 +29,8 @@ const {
   DCS_POWER_METER_FIELDS
 } = require('../../constants')
 const { parseJsonQueryParam, validateFilter, applyMongoFilter, combineAnd, deduplicateAlerts } = require('../../utils')
-const { aggregateMinerStats, calculateSiteEfficiency } = require('./site.utils')
+const { aggregateMinerStats, calculateSiteEfficiency, sumPoolOnlyPhasesHashrateMhs } = require('./site.utils')
+const lPhases = require('../../phases.utils')
 const { getSiteConsumption } = require('./site.handlers')
 const { isCentralDCSEnabled, fetchDcsThing, extractSiteMainMeterPowerW } = require('../../dcs.utils')
 
@@ -106,7 +108,7 @@ function applySort (items, sort) {
 }
 
 function buildSeveritySummary (alerts) {
-  const summary = { critical: 0, high: 0, medium: 0, low: 0, total: alerts.length }
+  const summary = { critical: 0, high: 0, medium: 0, low: 0, warning: 0, total: alerts.length }
   for (const alert of alerts) {
     if (SEVERITY_LEVELS.has(alert.severity)) {
       summary[alert.severity]++
@@ -168,8 +170,12 @@ function alertTypeCondition (type) {
 // lighter-weight fetch (miner hashrate + site power only, no pools/globalConfig).
 async function computeSiteEfficiencyWPerTh (ctx) {
   const dcsEnabled = isCentralDCSEnabled(ctx)
+  // Pool-only phases (no MOS miners) put their consumption inside the site
+  // meter; without their pool hashrate in the divisor this alert would start
+  // firing the day such a phase goes live.
+  const hasPoolOnlyPhases = lPhases.getPoolOnlyPhases(ctx).length > 0
 
-  const [tailLogResults, powerSource] = await Promise.all([
+  const [tailLogResults, powerSource, poolDataResults] = await Promise.all([
     ctx.dataProxy.requestDataMap(RPC_METHODS.TAIL_LOG_MULTI, {
       keys: [{ key: LOG_KEYS.STAT_RTD, type: WORKER_TYPES.MINER, tag: WORKER_TAGS.MINER }],
       limit: 1,
@@ -178,12 +184,23 @@ async function computeSiteEfficiencyWPerTh (ctx) {
     }),
     dcsEnabled
       ? fetchDcsThing(ctx, { id: 1, code: 1, type: 1, tags: 1, ...DCS_POWER_METER_FIELDS })
-      : getSiteConsumption(ctx)
+      : getSiteConsumption(ctx),
+    hasPoolOnlyPhases
+      ? ctx.dataProxy.requestDataMap(RPC_METHODS.GET_WRK_EXT_DATA, {
+        type: WORKER_TYPES.MINERPOOL,
+        query: { key: MINERPOOL_EXT_DATA_KEYS.STATS }
+      }).catch(() => null)
+      : Promise.resolve([])
   ])
 
+  // Without the pool hashrate the divisor is wrong in the alarming direction;
+  // skipping this tick beats firing a false high-efficiency alert.
+  if (hasPoolOnlyPhases && !poolDataResults) return null
+
   const { hashrate } = aggregateMinerStats(tailLogResults)
+  const poolOnlyHashrateMhs = sumPoolOnlyPhasesHashrateMhs(ctx, poolDataResults)
   const consumptionW = dcsEnabled ? extractSiteMainMeterPowerW(powerSource) : (powerSource?.powerW || 0)
-  return calculateSiteEfficiency(hashrate, consumptionW)
+  return calculateSiteEfficiency(hashrate + poolOnlyHashrateMhs, consumptionW)
 }
 
 // Site efficiency has no backing thing, so it's synthesized here rather than
@@ -304,6 +321,40 @@ function restrictToNotesOnly (submittedData, existingConfig) {
   return notesOnlyData
 }
 
+const NON_THRESHOLD_FIELDS = ['enabled', 'notes']
+
+// An alert's threshold fields are its configSchema keys other than `enabled`/`notes`.
+function getThresholdFields (alertKey) {
+  const configSchema = CUSTOM_ALERT_CONFIG[alertKey]?.configSchema
+  return Object.keys(configSchema ?? {}).filter(
+    (field) => !NON_THRESHOLD_FIELDS.includes(field)
+  )
+}
+
+// Enabling an alert requires every one of its threshold fields to already be configured.
+function assertEnabledParamsAreSet (data) {
+  for (const alertKey in data) {
+    if (data[alertKey]?.enabled !== true) continue
+
+    const missing = getThresholdFields(alertKey).filter(
+      (field) => data[alertKey]?.[field] === undefined || data[alertKey]?.[field] === null
+    )
+    if (missing.length) {
+      throw new Error('ERR_ALERT_PARAMS_REQUIRED')
+    }
+  }
+}
+
+// setGlobalData persists `data` verbatim, so an unknown/made-up key would otherwise
+// be stored and echoed back from GET as if it were real alert config.
+function dropUnknownAlertKeys (data) {
+  const known = {}
+  for (const alertKey in data) {
+    if (CUSTOM_ALERT_CONFIG[alertKey]) known[alertKey] = data[alertKey]
+  }
+  return known
+}
+
 async function setAlertParams (ctx, req) {
   const type = GLOBAL_DATA_TYPES.ALERT_PARAMETERS
 
@@ -315,6 +366,10 @@ async function setAlertParams (ctx, req) {
     const [existingConfig] = await ctx.globalDataLib.getGlobalData({ type })
     data = restrictToNotesOnly(data, existingConfig)
   }
+
+  data = dropUnknownAlertKeys(data)
+
+  assertEnabledParamsAreSet(data)
 
   const byRackType = {}
   for (const alertKey in data) {
@@ -394,6 +449,9 @@ module.exports = {
   getAlertParams,
   setAlertParams,
   restrictToNotesOnly,
+  getThresholdFields,
+  assertEnabledParamsAreSet,
+  dropUnknownAlertKeys,
   extractAlertsFromThings,
   matchesSearch,
   applySort,

@@ -35,7 +35,8 @@ module.exports = (ctx) => {
           'finance/energy-balance',
           req.query.start,
           req.query.end,
-          req.query.period
+          req.query.period,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_ENERGY_BALANCE,
         getEnergyBalance,
@@ -54,7 +55,8 @@ module.exports = (ctx) => {
           'finance/ebitda',
           req.query.start,
           req.query.end,
-          req.query.period
+          req.query.period,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_EBITDA,
         getEbitda,
@@ -73,7 +75,8 @@ module.exports = (ctx) => {
           'finance/cost-summary',
           req.query.start,
           req.query.end,
-          req.query.period
+          req.query.period,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_COST_SUMMARY,
         getCostSummary,
@@ -92,7 +95,8 @@ module.exports = (ctx) => {
           'finance/subsidy-fees',
           req.query.start,
           req.query.end,
-          req.query.period
+          req.query.period,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_SUBSIDY_FEES,
         getSubsidyFees,
@@ -112,7 +116,8 @@ module.exports = (ctx) => {
           req.query.start,
           req.query.end,
           req.query.period,
-          req.query.pool
+          req.query.pool,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_REVENUE,
         getRevenue,
@@ -129,9 +134,11 @@ module.exports = (ctx) => {
         ctx,
         (req) => [
           'finance/revenue-summary',
+          req.query.phase,
           req.query.start,
           req.query.end,
-          req.query.period
+          req.query.period,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_REVENUE_SUMMARY,
         getRevenueSummary,
@@ -150,7 +157,8 @@ module.exports = (ctx) => {
           'finance/hash-revenue',
           req.query.start,
           req.query.end,
-          req.query.period
+          req.query.period,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_HASH_REVENUE,
         getHashRevenue,
@@ -168,7 +176,8 @@ module.exports = (ctx) => {
         (req) => [
           'finance/power-cost',
           req.query.start,
-          req.query.end
+          req.query.end,
+          req.query.timezone
         ],
         ENDPOINTS.FINANCE_POWER_COST,
         getPowerCost,

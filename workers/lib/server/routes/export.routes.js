@@ -3,7 +3,7 @@
 const { ENDPOINTS, HTTP_METHODS } = require('../../constants')
 const { EXPORT_TYPES, EXPORT_FORMATS } = require('../lib/export/registry')
 const { exportRoute } = require('../handlers/export.handlers')
-const { createAuthOnRequest } = require('../lib/routeHelpers')
+const { createAuthOnRequest, AUTH_ONLY } = require('../lib/routeHelpers')
 
 module.exports = (ctx) => [
   {
@@ -19,12 +19,14 @@ module.exports = (ctx) => [
           statKey: { type: 'string', enum: ['stat-1m', 'stat-5m', 'stat-3h'] },
           start: { type: 'integer', minimum: 0 },
           end: { type: 'integer', minimum: 0 },
-          timezone: { type: 'string', maxLength: 100 }
+          timezone: { type: 'string', maxLength: 100 },
+          valuation: { type: 'string', enum: ['receipt', 'report'] },
+          bucket: { type: 'string', enum: ['monthly', 'quarterly', 'yearly'] }
         },
         required: ['type']
       }
     },
-    onRequest: createAuthOnRequest(ctx),
+    onRequest: createAuthOnRequest(ctx, AUTH_ONLY),
     handler: (req, reply) => exportRoute(ctx, req, reply)
   }
 ]

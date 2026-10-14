@@ -6,6 +6,7 @@ const {
   WORK_ORDER_THING_TYPE,
   WORK_ORDER_TYPES,
   WORK_ORDER_TERMINAL_STATUSES,
+  WORK_ORDER_NOTE_KIND,
   WORK_ORDER_VALID_DEVICE_TYPES,
   SPARE_PART_INITIAL_LOCATION,
   MINER_ROOM_LOCATION,
@@ -112,7 +113,7 @@ async function _moveAttachedParts (ctx, req, { miner, deviceType, toLocation, wo
     const partResults = await submitWorkOrderAction(ctx, req, 'updateThing', {
       id: part.id,
       info: { location: toLocation, workOrderId: woId }
-    }, part.rack)
+    }, part.rack, { elevateRackWrite: part.type })
     assertActionApplied(partResults, `ERR_ATTACHED_PART_MOVE_PUSH_FAILED:${part.id}`)
     moves.push({
       partId: part.id,
@@ -174,6 +175,7 @@ async function createWorkOrder (ctx, req) {
       err.statusCode = 400
       throw err
     }
+    if (part.code) info.deviceCode = part.code
     info.partsMoves = [{
       partId: part.id,
       partCode: part.code,
@@ -185,7 +187,7 @@ async function createWorkOrder (ctx, req) {
       user: voter
     }]
     if (info.deviceStatus) {
-      const partResults = await submitWorkOrderAction(ctx, req, 'updateThing', { id: part.id, info: { status: info.deviceStatus, workOrderId: woId } }, part.rack)
+      const partResults = await submitWorkOrderAction(ctx, req, 'updateThing', { id: part.id, info: { status: info.deviceStatus, workOrderId: woId } }, part.rack, { elevateRackWrite: part.type })
       assertActionApplied(partResults, 'ERR_PART_MOVE_PUSH_FAILED')
     }
   } else if (type === WORK_ORDER_TYPES.REGISTER) {
@@ -195,6 +197,7 @@ async function createWorkOrder (ctx, req) {
       err.statusCode = 400
       throw err
     }
+    if (part.code) info.deviceCode = part.code
     info.partsMoves = [{
       partId: part.id,
       partCode: part.code,
@@ -224,6 +227,7 @@ async function createWorkOrder (ctx, req) {
       })
       : null
     const ts = Date.now()
+    if (part.code) info.deviceCode = part.code
     info.partsMoves = [{
       partId: part.id,
       partCode: part.code,
@@ -254,7 +258,7 @@ async function createWorkOrder (ctx, req) {
           ...(info.deviceStatus ? { status: info.deviceStatus } : {}),
           ...placement
         }
-      }, part.rack)
+      }, part.rack, { elevateRackWrite: part.type })
       assertActionApplied(partResults, 'ERR_PART_MOVE_PUSH_FAILED')
       info.partsMoves.push(...await _moveAttachedParts(ctx, req, {
         miner: part, deviceType, toLocation: info.location, woId, voter, ts
@@ -265,12 +269,20 @@ async function createWorkOrder (ctx, req) {
       const replacementResults = await submitWorkOrderAction(ctx, req, 'updateThing', {
         id: replacement.thing.id,
         info: _replacementInfo(replacement, woId)
-      }, replacement.thing.rack)
+      }, replacement.thing.rack, { elevateRackWrite: replacement.thing.type })
       assertActionApplied(replacementResults, 'ERR_WO_REPLACEMENT_PUSH_FAILED')
     }
   }
 
   await assertActionsExecuted(ctx, req, 'ERR_WO_DEVICE_UPDATE_FAILED')
+
+  // The destination socket is recorded in partsMoves (toContainer/toPos) and
+  // applied to the miner above. Keeping pos/container on the WO's own info
+  // would make the thing base tag the WO onto the destination socket, where
+  // container views would list it as a second device.
+  delete info.pos
+  delete info.container
+  delete info.subnet
 
   return submitWorkOrderAction(ctx, req, 'registerThing', { id: woId, info })
 }
@@ -372,6 +384,9 @@ async function createWorkOrdersBatch (ctx, req) {
     resolved.push({ device, part })
   }
 
+  const deviceCode = minerToRepair?.code ?? resolved[0]?.part.code
+  if (deviceCode) info.deviceCode = deviceCode
+
   const movingIds = new Set(resolved.map(r => r.part.id))
   const usedIds = new Set()
   for (const entry of resolved) {
@@ -405,7 +420,7 @@ async function createWorkOrdersBatch (ctx, req) {
           ...(info.deviceStatus ? { status: info.deviceStatus } : {}),
           ...placement
         }
-      }, part.rack)
+      }, part.rack, { elevateRackWrite: part.type })
       assertActionApplied(partResults, 'ERR_PART_MOVE_PUSH_FAILED')
       partsMoves.push(...await _moveAttachedParts(ctx, req, {
         miner: part, deviceType: device.deviceType, toLocation: info.location, woId, voter, ts
@@ -416,7 +431,7 @@ async function createWorkOrdersBatch (ctx, req) {
       const replacementResults = await submitWorkOrderAction(ctx, req, 'updateThing', {
         id: replacement.thing.id,
         info: _replacementInfo(replacement, woId)
-      }, replacement.thing.rack)
+      }, replacement.thing.rack, { elevateRackWrite: replacement.thing.type })
       assertActionApplied(replacementResults, 'ERR_WO_REPLACEMENT_PUSH_FAILED')
     }
   }
@@ -433,7 +448,7 @@ async function createWorkOrdersBatch (ctx, req) {
       ts,
       user: voter
     })
-    const minerResults = await submitWorkOrderAction(ctx, req, 'updateThing', { id: minerToRepair.id, info: { status: info.deviceStatus, workOrderId: woId } }, minerToRepair.rack)
+    const minerResults = await submitWorkOrderAction(ctx, req, 'updateThing', { id: minerToRepair.id, info: { status: info.deviceStatus, workOrderId: woId } }, minerToRepair.rack, { elevateRackWrite: minerToRepair.type })
     assertActionApplied(minerResults, 'ERR_PART_MOVE_PUSH_FAILED')
   }
 
@@ -444,9 +459,133 @@ async function createWorkOrdersBatch (ctx, req) {
   return submitWorkOrderAction(ctx, req, 'registerThing', { id: woId, info })
 }
 
+function _formatMacAddress (mac) {
+  if (!mac) return null
+  const raw = String(mac).trim().toUpperCase()
+  const hex = raw.replace(/[:-]/g, '')
+  if (/^[0-9A-F]{12}$/.test(hex)) return hex.match(/.{2}/g).join(':')
+  return raw
+}
+
+async function _appendWorkOrderNote (ctx, req, woId, text) {
+  const rackId = await getWorkOrderRackId(ctx)
+  await ctx.dataProxy.requestData('saveThingComment', {
+    rackId,
+    thingId: woId,
+    comment: text,
+    user: req._info.user.metadata.email,
+    kind: WORK_ORDER_NOTE_KIND
+  }, (res, arr) => { arr.push(res) })
+}
+
+// The attach flow stamps parentDeviceId with the WO's raw miner identifier,
+// which is not always the thing id — the code and serial written alongside it
+// identify the miner just as reliably.
+function _isPartAttachedToMiner (part, miner) {
+  const info = part.info || {}
+  if (info.parentDeviceId === miner.id) return true
+  if (miner.code && info.parentDeviceCode === miner.code) return true
+  return Boolean(miner.info?.serialNum && info.parentDeviceSN === miner.info.serialNum)
+}
+
+async function _pushMinerMacAddress (ctx, req, miner, macAddress, woId) {
+  const results = await submitWorkOrderAction(ctx, req, 'updateThing', {
+    id: miner.id,
+    info: { macAddress, workOrderId: woId }
+  }, miner.rack, { elevateRackWrite: miner.type })
+  assertActionApplied(results, 'ERR_WO_MINER_MAC_SYNC_FAILED')
+  const ids = results.map(r => r?.id).filter(Boolean)
+  await assertActionsExecuted(ctx, req, 'ERR_WO_MINER_MAC_SYNC_FAILED', ids)
+}
+
+const STRICT_MAC_RX = /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/
+
+// A MAC exists on exactly one physical board, so once the board is verified
+// attached to this WO's miner, any other miner on the same rack still
+// recording that MAC is a leftover from the board's previous life. Clear those
+// records so the rack's uniqueness check lets the reassignment through. Only
+// same-rack holders matter: the rack validates uniqueness against its own
+// things alone, so a match elsewhere never caused the refusal.
+async function _reclaimMinerMacAddress (ctx, req, wo, miner, macAddress) {
+  if (!STRICT_MAC_RX.test(macAddress)) return false
+
+  const pattern = `^${macAddress.split(':').map(escapeRegex).join('[:-]')}$`
+  const results = await ctx.dataProxy.requestData('listThings', {
+    query: {
+      tags: 't-miner',
+      'info.macAddress': { $regex: pattern, $options: 'i' }
+    }
+  })
+  const holders = flattenRpcResults(results).filter(t =>
+    t?.rack === miner.rack && t.id !== miner.id &&
+    _formatMacAddress(t.info?.macAddress) === macAddress)
+  if (!holders.length) return false
+
+  const clearIds = []
+  for (const holder of holders) {
+    const cleared = await submitWorkOrderAction(ctx, req, 'updateThing', {
+      id: holder.id,
+      info: { macAddress: null, workOrderId: wo.id }
+    }, holder.rack, { elevateRackWrite: holder.type })
+    assertActionApplied(cleared, 'ERR_WO_MINER_MAC_SYNC_FAILED')
+    clearIds.push(...cleared.map(r => r?.id).filter(Boolean))
+  }
+  await assertActionsExecuted(ctx, req, 'ERR_WO_MINER_MAC_SYNC_FAILED', clearIds)
+
+  await _pushMinerMacAddress(ctx, req, miner, macAddress, wo.id)
+  await _appendWorkOrderNote(ctx, req, wo.id,
+    `MAC ${macAddress} moved to ${miner.code || miner.id}; cleared the stale record on ${holders.map(h => h.code || h.id).join(', ')}`)
+  return true
+}
+
+// A miner's MAC address belongs to its control board, so a WO that records a
+// controller replacement must carry the new board's MAC onto the miner record —
+// otherwise Inventory keeps reporting the removed board's MAC.
+async function _syncMinerMacAddress (ctx, req, woId, partsMoves) {
+  if (!Array.isArray(partsMoves)) return
+  const replacement = partsMoves
+    .filter(m => m?.role === 'replacement' && m.deviceType === 'controller' && m.partId)
+    .pop()
+  if (!replacement) return
+
+  const wo = await _loadWorkOrderByIdOrCode(ctx, woId)
+  if (!wo?.info?.minerIdentifier) return
+
+  const miner = await _resolvePartByIdentifier(ctx, wo.info.minerIdentifier)
+  if (!miner || !_isMiner(miner)) return
+
+  const part = await _resolvePartByIdentifier(ctx, replacement.partId)
+  if (!part || !_isPartAttachedToMiner(part, miner)) return
+
+  const macAddress = _formatMacAddress(part.info?.macAddress)
+  if (!macAddress || macAddress === _formatMacAddress(miner.info?.macAddress)) return
+
+  // The rack can legitimately refuse the write and that must not block the WO
+  // from saving. A duplicate-MAC refusal means the board's previous miner
+  // still records this MAC — reclaim it; anything else becomes a note.
+  try {
+    await _pushMinerMacAddress(ctx, req, miner, macAddress, wo.id)
+  } catch (err) {
+    let failure = err
+    if (err.message.includes('ERR_THING_MACADDRESS_EXISTS')) {
+      try {
+        if (await _reclaimMinerMacAddress(ctx, req, wo, miner, macAddress)) return
+      } catch (retryErr) {
+        failure = retryErr
+      }
+    }
+    await _appendWorkOrderNote(ctx, req, wo.id,
+      `Miner ${miner.code || miner.id} MAC address was not updated to ${macAddress}: ${failure.message}`)
+  }
+}
+
 async function updateWorkOrder (ctx, req) {
   const { info: extraInfo, ...body } = req.body
-  return submitWorkOrderAction(ctx, req, 'updateThing', { id: req.params.id, info: { ...body, ...extraInfo } })
+  const info = { ...body, ...extraInfo }
+  const results = await submitWorkOrderAction(ctx, req, 'updateThing', { id: req.params.id, info })
+  const failed = (results || []).some(r => r?.errors?.length)
+  if (!failed) await _syncMinerMacAddress(ctx, req, req.params.id, info.partsMoves)
+  return results
 }
 
 async function closeWorkOrder (ctx, req) {
@@ -501,8 +640,22 @@ function _buildWorkOrderQuery (qs) {
   return query
 }
 
+async function _serialNumClause (ctx, serialNum) {
+  const part = await _resolvePartByIdentifier(ctx, serialNum)
+  return {
+    $or: [
+      { 'info.deviceIdentifier': { $in: [...new Set([serialNum, part?.id, part?.code, part?.info?.serialNum, part?.info?.macAddress].filter(Boolean))] } },
+      ...(part ? [{ 'info.partsMoves.partId': part.id }] : [])
+    ]
+  }
+}
+
 async function listWorkOrders (ctx, req) {
-  return listThingsWithCount(ctx, _buildWorkOrderQuery(req.query), {
+  const query = _buildWorkOrderQuery(req.query)
+  if (req.query.serialNum) {
+    query.$and = [...(query.$and ?? []), await _serialNumClause(ctx, req.query.serialNum)]
+  }
+  return listThingsWithCount(ctx, query, {
     offset: req.query.offset ?? 0,
     limit: req.query.limit ?? 100,
     sort: req.query.sort && parseJsonQueryParam(req.query.sort, 'ERR_SORT_INVALID_JSON'),
@@ -519,7 +672,15 @@ async function getWorkOrder (ctx, req) {
     err.statusCode = 404
     throw err
   }
-  return flat[0]
+  const wo = flat[0]
+  // WOs created before deviceCode was stored only carry the identifier, so
+  // resolve the code here to keep the detail response uniform for the UI.
+  const identifier = wo.info?.minerIdentifier ?? wo.info?.deviceIdentifier
+  if (!wo.info?.deviceCode && identifier) {
+    const part = await _resolvePartByIdentifier(ctx, identifier).catch(() => null)
+    if (part?.code) wo.info.deviceCode = part.code
+  }
+  return wo
 }
 
 async function appendWorkLogEntry (ctx, req) {
@@ -549,6 +710,48 @@ async function appendWorkLogEntry (ctx, req) {
     if (res?.error) arr.push({ error: res.error })
     else arr.push(res)
   })
+}
+
+async function appendWorkOrderNote (ctx, req) {
+  const rackId = await getWorkOrderRackId(ctx)
+
+  const wo = await ctx.dataProxy.requestData('listThings', {
+    query: { id: req.params.id, type: WORK_ORDER_THING_TYPE }
+  })
+  if (!flattenRpcResults(wo).length) {
+    const err = new Error('ERR_WORK_ORDER_NOT_FOUND')
+    err.statusCode = 404
+    throw err
+  }
+
+  return ctx.dataProxy.requestData('saveThingComment', {
+    rackId,
+    thingId: req.params.id,
+    comment: req.body.text,
+    user: req._info.user.metadata.email,
+    kind: WORK_ORDER_NOTE_KIND
+  }, (res, arr) => {
+    if (res?.error) arr.push({ error: res.error })
+    else arr.push(res)
+  })
+}
+
+async function listWorkOrderNotes (ctx, req) {
+  const results = await ctx.dataProxy.requestData('listThings', {
+    query: { id: req.params.id, type: WORK_ORDER_THING_TYPE },
+    commentsKind: WORK_ORDER_NOTE_KIND
+  })
+  const found = flattenRpcResults(results)[0]
+  if (!found) {
+    const err = new Error('ERR_WORK_ORDER_NOT_FOUND')
+    err.statusCode = 404
+    throw err
+  }
+
+  return (found.comments || [])
+    .filter((c) => c?.kind === WORK_ORDER_NOTE_KIND)
+    .sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0))
+    .map(({ id, ts, comment, user }) => ({ id, ts, text: comment, user }))
 }
 
 async function _loadWorkOrderByIdOrCode (ctx, idOrCode) {
@@ -600,10 +803,14 @@ async function _loadWorkOrdersByIdsOrCodes (ctx, idsParam) {
 async function exportWorkOrdersRma (ctx, req, rep) {
   const wos = (await _loadWorkOrdersByIdsOrCodes(ctx, req.query.ids))
     .filter(wo => wo?.info?.type === WORK_ORDER_TYPES.MICROBT_MINER)
+  const partIds = [...new Set(wos.flatMap(wo => (wo.info.partsMoves || []).map(m => m.partId)).filter(Boolean))]
+  const parts = partIds.length
+    ? flattenRpcResults(await ctx.dataProxy.requestData('listThings', { query: { id: { $in: partIds } }, limit: partIds.length }))
+    : []
 
   rep.header('content-type', 'text/csv; charset=utf-8')
   rep.header('content-disposition', 'attachment; filename="rma.csv"')
-  return rep.send(renderRmaCsv(wos))
+  return rep.send(renderRmaCsv(wos, parts))
 }
 
 // Bulk sibling of exportWorkOrder: N ids, one combined CSV, so a large list-page
@@ -645,6 +852,8 @@ module.exports = {
   reopenWorkOrder,
   assignWorkOrder,
   appendWorkLogEntry,
+  appendWorkOrderNote,
+  listWorkOrderNotes,
   getWorkOrderAudit,
   exportWorkOrder,
   exportWorkOrdersRma,

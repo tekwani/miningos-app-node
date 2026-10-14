@@ -262,6 +262,77 @@ test('pushAction - with valid permissions', async (t) => {
   t.pass()
 })
 
+test('pushAction - setupPools rejects a raw config payload in place of poolConfigId', async (t) => {
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    authLib: {
+      getTokenPerms: async () => ({ write: true, permissions: ['actions:write'] })
+    },
+    net_r0: {
+      jRequest: async (key, method, payload, opts) => {
+        return { id: 'new-action', success: true }
+      }
+    }
+  })
+
+  const mockReq = {
+    _info: {
+      authToken: 'token123',
+      user: { metadata: { email: 'test@example.com' } }
+    },
+    body: {
+      query: { status: 'pending' },
+      action: 'setupPools',
+      params: [{
+        config: {
+          id: 'attacker-config',
+          poolUrls: [{ url: 'stratum://evil.example.com:3333', workerName: 'w', workerPassword: 'p' }]
+        }
+      }]
+    }
+  }
+
+  try {
+    await pushAction(mockCtx, mockReq)
+    t.fail('should throw error')
+  } catch (err) {
+    t.is(err.message, 'ERR_RAW_CONFIG_NOT_ALLOWED', 'should reject a raw config bypassing poolConfigId approval')
+  }
+})
+
+test('pushAction - setupPools with a poolConfigId passes params through unchanged', async (t) => {
+  let capturedPayload = null
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    authLib: {
+      getTokenPerms: async () => ({ write: true, permissions: ['actions:write'] })
+    },
+    net_r0: {
+      jRequest: async (key, method, payload, opts) => {
+        capturedPayload = payload
+        return { id: 'new-action', success: true }
+      }
+    }
+  })
+
+  const mockReq = {
+    _info: {
+      authToken: 'token123',
+      user: { metadata: { email: 'test@example.com' } }
+    },
+    body: {
+      query: { status: 'pending' },
+      action: 'setupPools',
+      params: [{ poolConfigId: 'cfg-1' }]
+    }
+  }
+
+  const result = await pushAction(mockCtx, mockReq)
+
+  t.ok(Array.isArray(result), 'should return array')
+  t.alike(capturedPayload.params, [{ poolConfigId: 'cfg-1' }], 'params should pass through unchanged for a valid poolConfigId')
+})
+
 for (const action of ['registerConfig', 'updateConfig']) {
   test(`pushAction - ${action} resolves poolUrls to approved pool url/worker settings`, async (t) => {
     let capturedPayload = null
@@ -698,6 +769,97 @@ for (const action of ['registerConfig', 'updateConfig']) {
     t.pass()
   })
 
+  // The worker credentials used to be passed through unchecked while poolUrlId was
+  // validated strictly, so a client that omitted them stored `undefined` and every
+  // miner worker pushed `undefined` to the hardware.
+  const credentialCtx = () => withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    authLib: {
+      getTokenPerms: async () => ({ write: true, permissions: [] })
+    },
+    net_r0: {
+      jRequest: async (key, method, payload, opts) => {
+        if (method === 'getGlobalConfig') {
+          return { approvedPoolUrls: APPROVED_POOL_URLS }
+        }
+        return { id: 'new-action', success: true }
+      }
+    }
+  })
+
+  const credentialReq = (poolUrl) => ({
+    _info: {
+      authToken: 'token123',
+      user: { metadata: { email: 'test@example.com' } }
+    },
+    body: {
+      action,
+      params: [{ name: 'my-config', data: { poolUrls: [poolUrl] } }]
+    }
+  })
+
+  for (const [label, poolUrl, expected] of [
+    ['a missing workerName', { workerPassword: 'secret' }, 'ERR_INVALID_WORKER_NAME'],
+    ['a non-string workerName', { workerName: 42, workerPassword: 'secret' }, 'ERR_INVALID_WORKER_NAME'],
+    ['a missing workerPassword', { workerName: 'worker1' }, 'ERR_INVALID_WORKER_PASSWORD'],
+    ['a non-string workerPassword', { workerName: 'worker1', workerPassword: null }, 'ERR_INVALID_WORKER_PASSWORD']
+  ]) {
+    test(`pushAction - ${action} throws for ${label}`, async (t) => {
+      const mockReq = credentialReq({ poolUrlId: APPROVED_POOL_URLS[0].id, ...poolUrl })
+
+      try {
+        await pushAction(credentialCtx(), mockReq)
+        t.fail(`should throw error for ${label}`)
+      } catch (err) {
+        t.is(err.message, expected, `should throw ${expected}`)
+      }
+
+      t.pass()
+    })
+  }
+
+  // An endpoint may legitimately need no password, and a config registered before
+  // the UI collected one still carries a placeholder on endpoints nobody has
+  // corrected yet. updateConfig re-sends every endpoint, so rejecting either would
+  // fail the whole call and leave such a config impossible to repair.
+  for (const [label, workerPassword] of [
+    ['an empty password', ''],
+    ['the legacy placeholder', '.']
+  ]) {
+    test(`pushAction - ${action} accepts ${label}`, async (t) => {
+      let capturedPayload = null
+      const mockCtx = withDataProxy({
+        conf: { orks: [{ rpcPublicKey: 'key1' }] },
+        authLib: {
+          getTokenPerms: async () => ({ write: true, permissions: [] })
+        },
+        net_r0: {
+          jRequest: async (key, method, payload, opts) => {
+            if (method === 'getGlobalConfig') {
+              return { approvedPoolUrls: APPROVED_POOL_URLS }
+            }
+            capturedPayload = payload
+            return { id: 'new-action', success: true }
+          }
+        }
+      })
+
+      const mockReq = credentialReq({
+        poolUrlId: APPROVED_POOL_URLS[0].id,
+        workerName: 'worker1',
+        workerPassword
+      })
+
+      await pushAction(mockCtx, mockReq)
+
+      const [poolConfig] = capturedPayload.params
+      const [resolved] = poolConfig.data.poolUrls
+      t.is(resolved.workerPassword, workerPassword, `${label} should pass through untouched`)
+
+      t.pass()
+    })
+  }
+
   test(`pushAction - ${action} with no pool config passes params through unchanged`, async (t) => {
     let capturedPayload = null
     const mockCtx = withDataProxy({
@@ -883,12 +1045,12 @@ test('voteAction - with valid permissions', async (t) => {
     authLib: {
       getTokenPerms: async () => ({
         write: true,
-        caps: ['actions:vote']
+        permissions: ['miner:r']
       })
     },
     net_r0: {
       jRequest: async (key, method, payload, opts) => {
-        return { success: true, vote: payload.approve }
+        return { success: true, vote: payload.approve, authPerms: payload.authPerms }
       }
     }
   })
@@ -906,6 +1068,7 @@ test('voteAction - with valid permissions', async (t) => {
 
   t.ok(Array.isArray(result), 'should return array')
   t.ok(result[0].res.success === true, 'should return successful vote')
+  t.alike(result[0].res.authPerms, ['miner:r'], 'should forward level-bearing permissions')
 
   t.pass()
 })
