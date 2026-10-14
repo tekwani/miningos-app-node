@@ -270,13 +270,13 @@ test('UserService - getUser', async (t) => {
 })
 
 test('UserService - bindOAuthSubject binds the first subject and rejects any other', async (t) => {
-  const { promisify } = require('util')
-  const sqlite3 = require('sqlite3')
-  const db = new sqlite3.Database(':memory:')
+  // node:sqlite is built in, so this doesn't depend on the sqlite3 native addon (CI installs with --ignore-scripts)
+  const { DatabaseSync } = require('node:sqlite')
+  const db = new DatabaseSync(':memory:')
   const sqlite = {
-    execAsync: promisify(db.exec.bind(db)),
-    runAsync: promisify(db.run.bind(db)),
-    getAsync: promisify(db.get.bind(db))
+    execAsync: async (sql) => db.exec(sql),
+    runAsync: async (sql, params = []) => db.prepare(sql).run(...params),
+    getAsync: async (sql, params = []) => db.prepare(sql).get(...params)
   }
   const users = { 'bob@acme.com': { id: 7 } }
   const userService = new UserService({ sqlite, auth: { getUserByEmail: async (email) => users[email] } })
