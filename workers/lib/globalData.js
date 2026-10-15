@@ -2,23 +2,42 @@
 
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const mingo = require('mingo')
-const { GLOBAL_DATA_TYPES, LCOE_SOURCES, USER_SETTINGS_TYPE } = require('./constants')
+const { GLOBAL_DATA_TYPES, LCOE_SOURCES, USER_SETTINGS_TYPE, POOL_REBATE_SOURCES } = require('./constants')
 const gLibUtilBase = require('@bitfinex/lib-js-util-base')
 const { isValidJsonObject } = require('./utils')
 
+function isValidAmount (val) {
+  return val === undefined || val === null || (Number.isFinite(val) && val >= 0)
+}
+
+// Per-phase figures keyed by phase id. Top-level capexUsd stays the site
+// build-out's (Phase 1); a phase with its own build-out (Phase 1.5) stores its
+// capex here.
+function validatePhaseCostFields (phases) {
+  if (phases === undefined || phases === null) return
+  if (!isValidJsonObject(phases)) throw new Error('ERR_INVALID_PHASES')
+  for (const entry of Object.values(phases)) {
+    if (!isValidJsonObject(entry)) throw new Error('ERR_INVALID_PHASES')
+    if (!isValidAmount(entry.capexUsd)) throw new Error('ERR_INVALID_AMORTIZATION')
+  }
+}
+
 function validateCostParameterFields (data) {
-  const amounts = ['minerAmortizationUsd', 'infraAmortizationUsd']
+  const amounts = ['minerAmortizationUsd', 'infraAmortizationUsd', 'capexUsd']
   for (const field of amounts) {
-    const val = data[field]
-    if (val !== undefined && val !== null && (!Number.isFinite(val) || val < 0)) {
-      throw new Error('ERR_INVALID_AMORTIZATION')
-    }
+    if (!isValidAmount(data[field])) throw new Error('ERR_INVALID_AMORTIZATION')
   }
 
   const { marginPct } = data
   if (marginPct !== undefined && marginPct !== null &&
     (!Number.isFinite(marginPct) || marginPct < 0 || marginPct > 100)) {
     throw new Error('ERR_INVALID_MARGIN')
+  }
+
+  const { commissionedAt } = data
+  if (commissionedAt !== undefined && commissionedAt !== null &&
+    (!Number.isInteger(commissionedAt) || commissionedAt <= 0)) {
+    throw new Error('ERR_INVALID_COMMISSIONED_AT')
   }
 
   const lcoe = data.lcoe
@@ -154,17 +173,26 @@ class GlobalDataLib {
     const { year, month, ...fields } = data
     const current = await this.getGloabalDbDataForType(GLOBAL_DATA_TYPES.COST_PARAMETERS)
 
-    // No year/month: save the site defaults, keeping whatever monthly overrides are already stored.
+    // No year/month: save the site defaults, keeping whatever monthly overrides and
+    // per-phase figures are already stored when the payload leaves them out.
     if (year === undefined && month === undefined) {
       validateCostParameterFields(fields)
+      validatePhaseCostFields(fields.phases)
       return this.saveGlobalDataForType(
-        { ...fields, site: this.site, overrides: fields.overrides ?? current.overrides },
+        {
+          ...fields,
+          site: this.site,
+          overrides: fields.overrides ?? current.overrides,
+          phases: fields.phases ?? current.phases
+        },
         GLOBAL_DATA_TYPES.COST_PARAMETERS
       )
     }
 
     if (!Number.isInteger(year) || year < 0) throw new Error('ERR_INVALID_YEAR')
     if (!Number.isInteger(month) || month < 1 || month > 12) throw new Error('ERR_INVALID_MONTH')
+    // Capex is a one-off build-out figure, not a monthly one.
+    if (fields.phases !== undefined) throw new Error('ERR_INVALID_PHASES')
     validateCostParameterFields(fields)
 
     const monthKey = `${year}-${String(month).padStart(2, '0')}`
@@ -210,6 +238,63 @@ class GlobalDataLib {
     return true
   }
 
+  // Only user-entered rebates live here; synced (auto) rows belong to the
+  // mempool worker and are merged in at read time by the handlers.
+  async setPoolRebatesData (data) {
+    if (!Number.isInteger(data.ts) || data.ts <= 0) throw new Error('ERR_INVALID_TS')
+
+    const db = this._globalDataBee.sub(GLOBAL_DATA_TYPES.POOL_REBATES)
+
+    if (data.remove) {
+      await db.del(utilsStore.convIntToBin(data.ts))
+      return true
+    }
+
+    if (!Number.isFinite(data.amountBTC) || data.amountBTC <= 0) throw new Error('ERR_INVALID_AMOUNT')
+
+    const txid = data.txid ? String(data.txid).toLowerCase() : undefined
+    if (txid && !/^[0-9a-f]{64}$/.test(txid)) throw new Error('ERR_INVALID_TXID')
+
+    const { prevTs } = data
+    if (prevTs !== undefined && (!Number.isInteger(prevTs) || prevTs <= 0)) throw new Error('ERR_INVALID_TS')
+
+    const rows = await this.queryGlobalData(db)
+
+    if (txid && rows.some((row) => row.txid === txid && row.ts !== prevTs)) {
+      throw new Error('ERR_DUPLICATE_TXID')
+    }
+
+    let prevRow
+    if (prevTs !== undefined) {
+      prevRow = rows.find((row) => row.ts === prevTs)
+      if (!prevRow) throw new Error('ERR_REBATE_NOT_FOUND')
+      await db.del(utilsStore.convIntToBin(prevTs))
+    }
+
+    const { amountBTC, sender, receiver } = data
+
+    // priceUSD is the BTC price when the rebate was received, derived by the
+    // handler at write time. When an edit could not re-derive it (bucket not
+    // recorded, worker unreachable), the previous value is only safe to keep
+    // if the timestamp did not move - a shifted rebate with the old moment's
+    // price would be silently wrong.
+    let priceUSD = Number.isFinite(data.priceUSD) ? data.priceUSD : undefined
+    if (priceUSD === undefined && prevRow && prevRow.ts === data.ts) priceUSD = prevRow.priceUSD
+
+    // Keys are timestamps, so two manual rows at the same instant would
+    // otherwise overwrite each other.
+    let ts = data.ts
+    while (await db.get(utilsStore.convIntToBin(ts))) ts++
+
+    await db.put(
+      utilsStore.convIntToBin(ts),
+      JSON.stringify({
+        site: this.site, ts, amountBTC, txid, sender, receiver, priceUSD, source: POOL_REBATE_SOURCES.MANUAL
+      })
+    )
+    return true
+  }
+
   async setGlobalData (data, type) {
     if (!Object.values(GLOBAL_DATA_TYPES).includes(type)) {
       throw new Error('ERR_INVALID_TYPE')
@@ -225,6 +310,10 @@ class GlobalDataLib {
 
     if (type === GLOBAL_DATA_TYPES.CONTAINER_SETTINGS) {
       return this.setContainerSettingsData(data)
+    }
+
+    if (type === GLOBAL_DATA_TYPES.POOL_REBATES) {
+      return this.setPoolRebatesData(data)
     }
 
     return this.saveGlobalDataForType(data, type)

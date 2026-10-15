@@ -7,6 +7,7 @@ const {
   METRICS_TIME,
   METRICS_DEFAULTS,
   RANGE_BUCKETS,
+
   MINER_CATEGORIES,
   LOG_KEYS,
   WORKER_TAGS,
@@ -15,10 +16,13 @@ const {
   COOLING_METRICS_AGGR_FIELDS,
   SPARE_PART_TYPES,
   sparePartTag,
-  SITE_STATUS_LIVE_WINDOW_MS
+  SITE_STATUS_LIVE_WINDOW_MS,
+  ELECTRICITY_EXT_DATA_KEYS,
+  MINERPOOL_EXT_DATA_KEYS,
+  POOL_HASHRATE_INTERVALS_MS
 } = require('../../constants')
 const {
-  getStartOfDay,
+  localDayStart,
   safeDiv,
   flattenRpcResults
 } = require('../../utils')
@@ -30,6 +34,9 @@ const {
   parseEntryTs,
   parseEntryTimeRange,
   validateStartEnd,
+  resolveStartEnd,
+  resolveTimezone,
+  resolveOptionalTimeMs,
   iterateRpcEntries,
   sumObjectValues,
   extractContainerFromMinerKey,
@@ -37,11 +44,22 @@ const {
   getIntervalConfig,
   mergeGroupedField,
   extractKeyEntry,
+  rollupLocalMonths,
+  isLocalInterval,
+  groupLocalBuckets,
+  localMonthsInRange,
+  localMonthKey,
   mhsToThs,
   rackFilterFor
 } = require('../../metrics.utils')
 const { parseRacks } = require('../lib/queryUtils')
+const { assertTimezone } = require('../lib/export/mappers')
+const { createMonthlyHashesCache } = require('../lib/monthlyHashesCache')
+const lPhases = require('../../phases.utils')
 const { resolvePoolHashrateForBuckets } = require('./pools.handlers')
+const { getEnergyConsumption } = require('./energy.handlers')
+const { extractGlobalConfig } = require('./site.utils')
+const { normalizeAvailability } = require('../lib/export/types/forecast.export')
 
 function firstOrkEntries (res) {
   return Array.isArray(res?.[0]) ? res[0] : []
@@ -60,6 +78,10 @@ function hasRackFilter (req) {
 function avgObjectValues (obj) {
   const values = Object.values(obj || {}).map(Number).filter(Boolean)
   return safeDiv(values.reduce((sum, val) => sum + val, 0), values.length)
+}
+
+function hashrateAggrField (container) {
+  return container ? AGGR_FIELDS.HASHRATE_SUM_CONTAINER_GROUP_AGGR : AGGR_FIELDS.HASHRATE_SUM
 }
 
 function readHashrate (val, container) {
@@ -96,29 +118,143 @@ function pageHashrate (req, { log, summary }) {
   }
 }
 
-async function getHashrate (ctx, req) {
-  return pageHashrate(req, await resolveHashrate(ctx, req))
+const monthlyHashesCache = createMonthlyHashesCache()
+
+// A calendar month is rolled up from hourly buckets, so it is only offered for the
+// series that HAS hourly buckets: the site-wide one, optionally scoped to a container.
+// A grouped or rack-scoped request gets its local months from getGoupedHashrate instead,
+// where there is no per-hour pool pairing to roll up and an "hours reported" count would lie.
+function wantsMonthlyRollup (req) {
+  return req.query.interval === '1M' && !req.query.groupBy && !hasRackFilter(req)
 }
 
-async function resolveHashrate (ctx, req) {
+async function getHashrate (ctx, req) {
+  const phase = lPhases.resolvePhase(ctx, req)
+
+  // '1M' means a calendar-month rollup, as it already does for consumption - not the
+  // store's rolling-30-day bucket that getIntervalConfig would hand back for it.
+  if (wantsMonthlyRollup(req)) return getMonthlyHashrate(ctx, req, phase)
+
+  return pageHashrate(req, await resolveHashrate(ctx, req, phase))
+}
+
+/**
+ * Calendar months instead of raw buckets, cut in the resolved zone: the request's
+ * `timezone`, else the site's lockedTimezone (invoicing bills the site's own month).
+ *
+ * The store cannot bucket by calendar month (groupRange '1M' is a rolling 30 days)
+ * and its daily buckets are UTC-aligned, so a month is still built from hourly ones -
+ * but rolling them up HERE means the caller receives a handful of rows instead of the
+ * ~8,760 buckets a year of hours costs to ship and re-aggregate.
+ *
+ * Months that have ended are served from a per-process cache, so a repeat request
+ * only recomputes the running month. Months the site reported nothing for are absent
+ * rather than zero-filled; the caller knows the window it asked for and can say so.
+ */
+async function getMonthlyHashrate (ctx, req, phase = null) {
   const { start, end } = validateStartEnd(req)
+  // A zone the runtime does not know throws a raw RangeError out of Intl; the exports
+  // already turn that into a named 400, so the endpoint answers the same way. Without
+  // one, months are cut in the site's zone, as every other local bucketing is.
+  const timezone = req.query.timezone ? assertTimezone(req.query.timezone) : resolveTimezone(ctx, req)
+  const now = Date.now()
+  const flags = {
+    nominal: req.query.nominal === true || req.query.nominal === 'true',
+    siteNominal: req.query.siteNominal === true || req.query.siteNominal === 'true',
+    pool: req.query.pool === true || req.query.pool === 'true',
+    container: req.query.container || null,
+    phase: phase?.id || null
+  }
+
+  const months = localMonthsInRange(start, end, timezone)
+  // Only a month the request covers end to end is the month itself; a partial edge
+  // month is a slice of one, and must neither be stored as the whole nor answered
+  // with it. The running month still gains hours, so it is never cached either.
+  const cacheable = (month) => month.end < now && month.start >= start && month.end <= end
+  // overwriteCache skips cached months but still stores the fresh rollup, so a backfilled
+  // month is not served stale for the rest of the TTL.
+  const refresh = !!req.query.overwriteCache
+  const rows = new Map()
+  const missing = []
+
+  for (const month of months) {
+    const cached = cacheable(month) && !refresh
+      ? monthlyHashesCache.get(monthlyHashesCache.key(month.key, timezone, flags), now)
+      : undefined
+
+    if (cached !== undefined) rows.set(month.key, cached)
+    else missing.push(month)
+  }
+
+  if (missing.length) {
+    // One query over the span the misses cover, clamped to what was actually asked
+    // for: the first and last month of a range are usually partial.
+    const span = {
+      start: Math.max(start, missing[0].start),
+      end: Math.min(end, missing[missing.length - 1].end)
+    }
+    const { log } = await resolveHashrate(ctx, {
+      ...req,
+      query: { ...req.query, ...span, interval: '1h' }
+    }, phase)
+
+    for (const row of rollupLocalMonths(log, timezone)) {
+      rows.set(localMonthKey(row.ts, timezone), row)
+    }
+
+    // A completed month the site never reported is cached as null, not skipped: it
+    // produces no row to cache, so leaving it out keeps it permanently missing and
+    // the query span keeps stretching back over it on every request.
+    for (const month of missing) {
+      if (!cacheable(month)) continue
+
+      const key = monthlyHashesCache.key(month.key, timezone, flags)
+      monthlyHashesCache.set(key, rows.get(month.key) ?? null, now)
+    }
+  }
+
+  const log = months.map((month) => rows.get(month.key)).filter(Boolean)
+  const summary = calculateHashrateSummary(log, flags.nominal)
+
+  // The same summary fields the other intervals carry: a monthly response is a coarser
+  // view of the same series, not a different endpoint.
+  if (flags.pool) summary.avgPoolHashrateMhs = calculateAvgPoolHashrate(log)
+
+  if (req.query.current && lPhases.hasMinerTelemetry(phase)) {
+    summary.currentHashrateMhs = await getCurrentHashrate(ctx, hashrateAggrField(flags.container), flags.container)
+  }
+
+  return { log, totalCount: log.length, summary }
+}
+
+async function resolveHashrate (ctx, req, phase = null) {
+  const { start, end } = validateStartEnd(req)
+
+  // A phase without MOS miners has no telemetry series: its hashrate IS the
+  // pool-reported one, bucketed from its own accounts' samples.
+  if (!lPhases.hasMinerTelemetry(phase)) return resolvePoolOnlyHashrate(ctx, req, phase)
 
   if (req.query.groupBy) return getGoupedHashrate(ctx, req)
 
   if (hasRackFilter(req)) {
     const { log } = await getGoupedHashrate(ctx, rackGroupedReq(req))
-    const scoped = log.map(({ ts, hashrateMhs }) => ({ ts, hashrateMhs: sumObjectValues(hashrateMhs) }))
+    const scoped = log.map(({ ts, timeRange, hashrateMhs }) => ({ ts, ...(timeRange && { timeRange }), hashrateMhs: sumObjectValues(hashrateMhs) }))
     return { log: scoped, summary: calculateHashrateSummary(scoped) }
   }
 
-  const { key, groupRange } = getIntervalConfig(resolveInterval(start, end, req.query.interval))
+  const interval = resolveInterval(start, end, req.query.interval)
+  if (isLocalInterval(interval)) return resolveLocalHashrate(ctx, req, { interval, start, end }, phase)
+
+  const { key, groupRange } = getIntervalConfig(interval)
   const container = req.query.container || null
   const field = container ? LOG_FIELDS.HASHRATE_SUM_CONTAINER_GROUP : LOG_FIELDS.HASHRATE_SUM
-  const aggrField = container ? AGGR_FIELDS.HASHRATE_SUM_CONTAINER_GROUP_AGGR : AGGR_FIELDS.HASHRATE_SUM
+  const aggrField = hashrateAggrField(container)
   // Invoicing needs delivered hashrate against the capacity installed at the time of each
   // bucket, which only the per-bucket aggregate carries. Opt-in: the site nominal alone is
   // served by /auth/site/status/live.
   const withNominal = req.query.nominal === true || req.query.nominal === 'true'
+  // Invoicing bills against the configured site nominal instead of the installed capacity.
+  const withSiteNominal = withNominal && (req.query.siteNominal === true || req.query.siteNominal === 'true')
   // Opt-in pool-reported hashrate per bucket, so invoicing can compare the
   // miner-telemetry series against what the pools credited.
   const withPool = req.query.pool === true || req.query.pool === 'true'
@@ -134,21 +270,28 @@ async function resolveHashrate (ctx, req) {
     fields: { [field]: 1, ...(withNominal && { [LOG_FIELDS.NOMINAL_HASHRATE_SUM]: 1 }) },
     aggrFields: { [aggrField]: 1, ...(withNominal && { [AGGR_FIELDS.NOMINAL_HASHRATE_SUM]: 1 }) }
   })
+  const siteNominalMhs = withSiteNominal ? await getSiteNominalHashrate(ctx) : null
 
   const log = firstOrkEntries(res).map(val => {
-    const timeRange = parseEntryTimeRange(val.ts)
+    // The store labels a bucket with its start on the UTC grid, so in a zone off the whole
+    // hour (e.g. +05:30) the first hour began before `start`: it only holds samples from
+    // `start` on, but its ts sat in the previous local day and a '1d'/'1w' rollup opened
+    // with an empty, inverted bucket. Clamped like consumption's, it lands inside the range.
+    const ts = Math.max(start, parseEntryTs(val.ts))
+    const rawRange = parseEntryTimeRange(val.ts)
+    const timeRange = rawRange && { startTs: Math.max(start, rawRange.startTs), endTs: Math.min(end, rawRange.endTs) }
     const hashrateMhs = readHashrate(val[aggrField], container)
     if (!withNominal) {
       return {
-        ts: parseEntryTs(val.ts),
+        ts,
         ...(timeRange && { timeRange }),
         hashrateMhs
       }
     }
 
-    const nominalHashrateMhs = Number(val[AGGR_FIELDS.NOMINAL_HASHRATE_SUM]) || 0
+    const nominalHashrateMhs = siteNominalMhs ?? (Number(val[AGGR_FIELDS.NOMINAL_HASHRATE_SUM]) || 0)
     return {
-      ts: parseEntryTs(val.ts),
+      ts,
       ...(timeRange && { timeRange }),
       hashrateMhs,
       nominalHashrateMhs,
@@ -156,7 +299,10 @@ async function resolveHashrate (ctx, req) {
     }
   })
 
-  if (withPool) await mergePoolHashrate(ctx, log, { start, end, groupRange })
+  if (withPool) {
+    const accounts = phase ? lPhases.getPhaseAccountKeys(phase) : null
+    await mergePoolHashrate(ctx, log, { start, end, groupRange, accounts })
+  }
 
   const summary = calculateHashrateSummary(log, withNominal)
 
@@ -169,9 +315,52 @@ async function resolveHashrate (ctx, req) {
   return { log, summary }
 }
 
+// Days and weeks are cut in the site's zone from hourly buckets: the store's own '1D'/'1W'
+// sit on the UTC grid, so they started before `start` and spilled past `end` for any site
+// not on UTC. Each bucket averages its hours, as the store averaged its samples.
+async function resolveLocalHashrate (ctx, req, { interval, start, end }, phase = null) {
+  const timezone = resolveTimezone(ctx, req)
+  const withNominal = req.query.nominal === true || req.query.nominal === 'true'
+  const withPool = req.query.pool === true || req.query.pool === 'true'
+
+  const hourly = await resolveHashrate(ctx, { ...req, query: { ...req.query, interval: '1h' } }, phase)
+
+  const log = groupLocalBuckets(hourly.log, { interval, timezone, start, end }).map(({ ts, timeRange, entries }) => {
+    const hashrateMhs = meanOfField(entries, 'hashrateMhs')
+    const entry = { ts, timeRange, hashrateMhs }
+
+    if (withNominal) {
+      entry.nominalHashrateMhs = meanOfField(entries, 'nominalHashrateMhs')
+      entry.pctOfNominal = entry.nominalHashrateMhs ? (hashrateMhs / entry.nominalHashrateMhs) * 100 : null
+    }
+    // A bucket whose hours all lack a pool sample stays null, as an hourly one does.
+    if (withPool) entry.poolHashrateMhs = meanOfField(entries, 'poolHashrateMhs')
+
+    return entry
+  })
+
+  const summary = calculateHashrateSummary(log, withNominal)
+
+  if (withPool) summary.avgPoolHashrateMhs = calculateAvgPoolHashrate(log)
+  if (req.query.current) summary.currentHashrateMhs = hourly.summary.currentHashrateMhs
+
+  return { log, summary }
+}
+
+async function getSiteNominalHashrate (ctx) {
+  const res = await ctx.dataProxy.requestDataMap(RPC_METHODS.GLOBAL_CONFIG, {
+    fields: { invoiceNominalHashrate_MHS: 1, nominalSiteHashrate_MHS: 1 }
+  })
+  const pick = (key) => res.map((config) => Number(config?.[key])).find((mhs) => mhs > 0) ?? null
+  // Invoices bill against the contracted nominal where one is configured; it
+  // deliberately does not touch nominalSiteHashrate_MHS, which the dashboards
+  // read for their nominal lines.
+  return pick('invoiceNominalHashrate_MHS') ?? pick('nominalSiteHashrate_MHS')
+}
+
 // Attaches the pool-reported hashrate to each miner-telemetry bucket, using the
 // bucket's own time window so both series cover exactly the same period.
-async function mergePoolHashrate (ctx, log, { start, end, groupRange }) {
+async function mergePoolHashrate (ctx, log, { start, end, groupRange, accounts = null }) {
   if (!log.length) return
 
   const bucketMs = RANGE_BUCKETS[groupRange] || (60 * 60 * 1_000) // '1H'
@@ -181,7 +370,7 @@ async function mergePoolHashrate (ctx, log, { start, end, groupRange }) {
     endTs: entry.timeRange?.endTs ?? entry.ts + bucketMs - 1
   }))
 
-  const poolByBucket = await resolvePoolHashrateForBuckets(ctx, { start, end, buckets })
+  const poolByBucket = await resolvePoolHashrateForBuckets(ctx, { start, end, buckets, accounts })
 
   for (const entry of log) {
     entry.poolHashrateMhs = poolByBucket.get(entry.ts) ?? null
@@ -196,6 +385,121 @@ function calculateAvgPoolHashrate (log) {
   return safeDiv(values.reduce((sum, val) => sum + val, 0), values.length)
 }
 
+/**
+ * Hashrate series for a phase that has no MOS miners (`minerTelemetry: false`):
+ * buckets are generated over the requested range and filled from the phase's
+ * own pool accounts. Buckets the pool reported nothing for are absent rather
+ * than zero-filled, matching the monthly rollup's behavior.
+ */
+async function resolvePoolOnlyHashrate (ctx, req, phase) {
+  if (req.query.groupBy || hasRackFilter(req) || req.query.container) {
+    throw lPhases.phaseError('ERR_PHASE_INVALID')
+  }
+
+  const { start, end } = validateStartEnd(req)
+  const interval = resolveInterval(start, end, req.query.interval)
+  const accounts = lPhases.getPhaseAccountKeys(phase)
+
+  // Cut on the same grid as the phase's consumption and efficiency: whole hours inside
+  // the range, and days/weeks in the site's zone clamped to [start, end]. The UTC grid
+  // started the first bucket before `start` and ran the last one past `end`.
+  const hours = []
+  for (let ts = Math.ceil(start / HOUR_MS) * HOUR_MS; ts <= end; ts += HOUR_MS) {
+    hours.push({ ts, timeRange: { startTs: ts, endTs: ts + HOUR_MS - 1 } })
+  }
+  const slots = isLocalInterval(interval)
+    ? groupLocalBuckets(hours, { interval, timezone: resolveTimezone(ctx, req), start, end })
+    : hours
+  const buckets = slots.map(({ ts, timeRange }) => ({ ts, ...timeRange }))
+
+  const poolByBucket = await resolvePoolHashrateForBuckets(ctx, { start, end, buckets, accounts })
+
+  const withNominal = req.query.nominal === true || req.query.nominal === 'true'
+  const withPool = req.query.pool === true || req.query.pool === 'true'
+  const nominalHashrateMhs = withNominal ? await resolvePhaseNominalHashrate(ctx, phase) : null
+
+  const log = []
+  for (const bucket of buckets) {
+    const hashrateMhs = poolByBucket.get(bucket.ts)
+    if (!Number.isFinite(hashrateMhs)) continue
+
+    const entry = {
+      ts: bucket.ts,
+      timeRange: { startTs: bucket.startTs, endTs: bucket.endTs },
+      hashrateMhs
+    }
+
+    if (withNominal && Number.isFinite(nominalHashrateMhs)) {
+      entry.nominalHashrateMhs = nominalHashrateMhs
+      entry.pctOfNominal = nominalHashrateMhs ? (hashrateMhs / nominalHashrateMhs) * 100 : null
+    }
+
+    if (withPool) entry.poolHashrateMhs = hashrateMhs
+
+    log.push(entry)
+  }
+
+  const summary = calculateHashrateSummary(log, withNominal && Number.isFinite(nominalHashrateMhs))
+  if (withPool) summary.avgPoolHashrateMhs = calculateAvgPoolHashrate(log)
+
+  return { log, summary }
+}
+
+async function resolvePhaseNominalHashrate (ctx, phase) {
+  const results = await ctx.dataProxy.requestDataMap(RPC_METHODS.GLOBAL_CONFIG, {
+    fields: { phaseNominals: 1 }
+  })
+
+  return lPhases.getPhaseNominals(results, phase.id)?.hashrateMhs ?? null
+}
+
+/**
+ * Adds the configured synthetic group (e.g. the container's miner type) to the
+ * grouped series for every pool-only phase, so the Miner Type / Mining Unit
+ * views list the phase next to the telemetry-backed groups. Telemetry can
+ * never produce these keys - the phase has no MOS miners - so there is
+ * nothing to collide with.
+ */
+async function injectSyntheticHashrateGroups (ctx, req, log) {
+  if (!log.length) return
+  // `total` must list the phase groups exactly like a phase-less request -
+  // the Total tab sends it. Only a concrete phase scopes them out.
+  if (lPhases.resolvePhase(ctx, req)) return
+
+  const groupBy = req.query.groupBy
+  if (groupBy !== 'miner' && groupBy !== 'container') return
+
+  const phases = lPhases.getPoolOnlyPhases(ctx)
+  if (!phases.length) return
+
+  const { start, end } = req.query
+  const dayMs = 24 * 60 * 60 * 1_000
+  const buckets = log.map((entry) => ({
+    ts: entry.ts,
+    startTs: entry.timeRange?.startTs ?? entry.ts,
+    endTs: entry.timeRange?.endTs ?? entry.ts + dayMs - 1
+  }))
+
+  for (const phase of phases) {
+    const key = groupBy === 'miner' ? phase.groups?.minerType : phase.groups?.container
+    const accounts = lPhases.getPhaseAccountKeys(phase)
+    if (!key || !accounts) continue
+
+    const poolByBucket = await resolvePoolHashrateForBuckets(ctx, { start, end, buckets, accounts })
+
+    for (const entry of log) {
+      const hashrateMhs = poolByBucket.get(entry.ts)
+      if (!Number.isFinite(hashrateMhs)) continue
+      if (!entry.hashrateMhs || typeof entry.hashrateMhs !== 'object') entry.hashrateMhs = {}
+      // A synthetic key colliding with a real device-type key is a config
+      // error; losing telemetry to the overwrite would be worse than the
+      // phase group going missing.
+      if (entry.hashrateMhs[key] !== undefined) continue
+      entry.hashrateMhs[key] = hashrateMhs
+    }
+  }
+}
+
 const HASHRATE_GROUP_FIELDS = {
   miner: { field: LOG_FIELDS.HASHRATE_SUM_TYPE_GROUP, aggrField: AGGR_FIELDS.HASHRATE_SUM_TYPE_GROUP_AGGR },
   container: { field: LOG_FIELDS.HASHRATE_SUM_CONTAINER_GROUP, aggrField: AGGR_FIELDS.HASHRATE_SUM_CONTAINER_GROUP_AGGR },
@@ -203,14 +507,25 @@ const HASHRATE_GROUP_FIELDS = {
 }
 
 async function getGoupedHashrate (ctx, req) {
-  const { groupBy, start, end } = req.query
+  const { groupBy } = req.query
+  const { start, end } = validateStartEnd(req)
 
   const { field, aggrField } = HASHRATE_GROUP_FIELDS[groupBy]
+
+  // Days, weeks and months are cut in the site's zone from hourly buckets, as the
+  // ungrouped series is: stat-1d sits on UTC midnights, so for a site off UTC its first
+  // day fell before `start` and was dropped, and every row was a UTC day. A short range
+  // ('1h') reads the hourly buckets themselves, again as the ungrouped series does:
+  // stat-1d answered a one-day request with the UTC day's row, stamped after `start`
+  // and without a timeRange, so no pool sample paired with it.
+  const interval = resolveInterval(start, end, req.query.interval)
+  const local = isLocalInterval(interval)
 
   const res = await ctx.dataProxy.requestData(RPC_METHODS.TAIL_LOG, {
     type: WORKER_TYPES.MINER,
     tag: WORKER_TAGS.MINER,
-    key: LOG_KEYS.STAT_1D,
+    ...getIntervalConfig(local ? '1h' : interval),
+    shouldCalculateAvg: true,
     start,
     end,
     fields: { [field]: 1 },
@@ -219,14 +534,24 @@ async function getGoupedHashrate (ctx, req) {
 
   const rackFilter = groupBy === 'rack' ? rackFilterFor(parseRacks(req)) : null
 
-  const log = res[0].reduce((aggr, val) => {
+  const entries = firstOrkEntries(res).map((val) => {
     let hashrateMhs = val[aggrField]
     if (rackFilter && hashrateMhs && typeof hashrateMhs === 'object') {
       hashrateMhs = Object.fromEntries(Object.entries(hashrateMhs).filter(([rack]) => rackFilter(rack)))
     }
-    aggr.push({ ts: parseEntryTs(val.ts), hashrateMhs })
-    return aggr
-  }, [])
+    // An hour straddling `start` (zones off the whole hour) belongs to the range's first day.
+    const ts = Math.max(start, parseEntryTs(val.ts))
+    if (local) return { ts, hashrateMhs }
+    const rawRange = parseEntryTimeRange(val.ts)
+    const timeRange = rawRange && { startTs: Math.max(start, rawRange.startTs), endTs: Math.min(end, rawRange.endTs) }
+    return { ts, ...(timeRange && { timeRange }), hashrateMhs }
+  })
+
+  const log = local
+    ? rollupLocalGroupedHashrate(entries, { interval, timezone: resolveTimezone(ctx, req), start, end })
+    : entries
+
+  await injectSyntheticHashrateGroups(ctx, req, log)
 
   const summary = calculateGroupedHashrateSummary(log, groupBy)
 
@@ -252,6 +577,21 @@ function calculateHashrateSummary (log, withNominal = false) {
   summary.avgPctOfNominal = avgNominal ? (summary.avgHashrateMhs / avgNominal) * 100 : null
 
   return summary
+}
+
+// Each group averages the hours it reported in, as the store averaged its samples; an
+// hour without a group map (no data) is skipped rather than counted as zero.
+function rollupLocalGroupedHashrate (hourly, bucketing) {
+  return groupLocalBuckets(hourly, bucketing).map(({ ts, timeRange, entries }) => {
+    let counts = null
+    let total = null
+    for (const { hashrateMhs } of entries) {
+      if (!hashrateMhs || typeof hashrateMhs !== 'object') continue
+      counts = addBucketCounts(counts, hashrateMhs)
+      total = addBucketValues(total, hashrateMhs)
+    }
+    return { ts, timeRange, hashrateMhs: total ? averageBucketValues(total, counts) : null }
+  })
 }
 
 function calculateGroupedHashrateSummary (log, groupBy) {
@@ -301,39 +641,122 @@ function addBucketValues (acc, val) {
   return (acc || 0) + (Number(val) || 0)
 }
 
-function scaleBucketValues (val, factor) {
-  if (val && typeof val === 'object') {
-    return Object.fromEntries(Object.entries(val).map(([meter, v]) => [meter, v * factor]))
-  }
-  return (Number(val) || 0) * factor
+const ROLLUP_INTERVALS = new Set(['1h', '1d', '1w', '1M'])
+
+// The DCS worker persists hourly averages of the 5-minute power samples in its
+// energy-1h rollup log (12 samples/h vs the 2 the stat-30m path sees). The
+// rollup only exists from featureConfig.energyRollup.sinceTs onward (backfill
+// included), so older ranges keep using the legacy stat-log path.
+function canUseEnergyRollup (ctx, start, interval) {
+  if (!isCentralDCSEnabled(ctx) || !ROLLUP_INTERVALS.has(interval)) return false
+  const sinceTs = ctx.conf?.featureConfig?.energyRollup?.sinceTs
+  return Number.isFinite(sinceTs) && start >= sinceTs
 }
 
-function rollupMonthly (log) {
-  const months = new Map()
+async function fetchEnergyRollupEntries (ctx, start, end) {
+  const res = await ctx.dataProxy.requestData(RPC_METHODS.TAIL_LOG, {
+    type: WORKER_TYPES.DCS,
+    tag: getDCSTag(ctx),
+    key: LOG_KEYS.ENERGY_1H,
+    start,
+    end,
+    // the worker only sizes reads automatically for stat-* keys; without an
+    // explicit limit a ranged read of a non-stat log falls back to 100 entries
+    limit: Math.ceil((end - start) / HOUR_MS) + 2,
+    fields: { [LOG_FIELDS.SITE_POWER]: 1, [LOG_FIELDS.BY_METER_POWER]: 1 },
+    aggrFields: { [AGGR_FIELDS.SITE_POWER]: 1, [AGGR_FIELDS.BY_METER_POWER]: 1 }
+  })
 
-  for (const entry of log) {
-    const date = new Date(entry.ts)
-    const ts = Date.UTC(date.getUTCFullYear(), date.getUTCMonth())
-    const month = months.get(ts) || {
-      ts,
-      timeRange: { startTs: ts, endTs: Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1) - 1 },
-      days: 0,
-      powerW: null,
-      consumptionMWh: null
-    }
-    month.days++
-    month.powerW = addBucketValues(month.powerW, entry.powerW)
-    month.consumptionMWh = addBucketValues(month.consumptionMWh, entry.consumptionMWh)
-    months.set(ts, month)
-  }
-
-  return [...months.values()]
+  return firstOrkEntries(res)
+    .map(entry => ({ ...entry, ts: parseEntryTs(entry.ts) }))
+    .filter(entry => Number.isFinite(entry.ts))
     .sort((a, b) => a.ts - b.ts)
-    .map(({ days, ...month }) => ({ ...month, powerW: scaleBucketValues(month.powerW, 1 / days) }))
+}
+
+function rollupHourlyLog (entries, byMeter) {
+  return entries.map(entry => {
+    const timeRange = { startTs: entry.ts, endTs: entry.ts + HOUR_MS - 1 }
+
+    if (byMeter) {
+      const raw = entry[AGGR_FIELDS.BY_METER_POWER]
+      const powerW = raw && typeof raw === 'object' ? raw : {}
+      return {
+        ts: entry.ts,
+        timeRange,
+        powerW,
+        consumptionMWh: Object.fromEntries(
+          Object.entries(powerW).map(([meter, w]) => [meter, (Number(w) || 0) / 1000000])
+        )
+      }
+    }
+
+    const powerW = Number(entry[AGGR_FIELDS.SITE_POWER]) || 0
+    return { ts: entry.ts, timeRange, powerW, consumptionMWh: powerW / 1000000 }
+  })
+}
+
+function addBucketCounts (acc, val) {
+  if (val && typeof val === 'object') {
+    const out = { ...(acc || {}) }
+    for (const meter of Object.keys(val)) out[meter] = (out[meter] || 0) + 1
+    return out
+  }
+  return (acc || 0) + 1
+}
+
+function averageBucketValues (total, counts) {
+  if (total && typeof total === 'object') {
+    return Object.fromEntries(
+      Object.entries(total).map(([meter, v]) => [meter, safeDiv(v, counts?.[meter]) ?? 0])
+    )
+  }
+  return safeDiv(Number(total) || 0, counts) ?? 0
+}
+
+// Days, weeks and months in the site's zone, built from hourly buckets: consumption is the
+// exact sum of the hourly MWh, power the mean over the hours that reported. The store's own
+// '1D'/'1W' sit on the UTC grid, so they started before `start` and spilled past `end`.
+function rollupLocalConsumption (hourly, bucketing) {
+  return groupLocalBuckets(hourly, bucketing).map(({ ts, timeRange, entries }) => {
+    let counts = null
+    let powerW = null
+    let consumptionMWh = null
+    for (const entry of entries) {
+      counts = addBucketCounts(counts, entry.powerW)
+      powerW = addBucketValues(powerW, entry.powerW)
+      consumptionMWh = addBucketValues(consumptionMWh, entry.consumptionMWh)
+    }
+    return { ts, timeRange, powerW: averageBucketValues(powerW, counts), consumptionMWh }
+  })
+}
+
+function buildRollupConsumption (entries, bucketing, byMeter) {
+  const hourly = rollupHourlyLog(entries, byMeter)
+  const log = isLocalInterval(bucketing.interval) ? rollupLocalConsumption(hourly, bucketing) : hourly
+
+  const summary = byMeter
+    ? calculateByMeterConsumptionSummary(log)
+    : calculateConsumptionSummary(log)
+
+  return { log, summary }
 }
 
 async function getConsumption (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end, timezone } = resolveStartEnd(ctx, req)
+  const phase = lPhases.resolvePhase(ctx, req)
+
+  // Downstream grouped/by-meter/rack paths read start/end straight off req.query,
+  // so the converted UTC values have to replace the raw ones here for those to see them.
+  req = { ...req, query: { ...req.query, start, end } }
+
+  if (phase) {
+    // A phase is a single series built from hourly meter and manual values;
+    // there is no per-group, per-meter or per-rack split of it.
+    const byMeter = req.query.byMeter === true || req.query.byMeter === 'true'
+    if (req.query.groupBy || byMeter || hasRackFilter(req)) throw lPhases.phaseError('ERR_PHASE_NOT_SUPPORTED')
+    const interval = resolveInterval(start, end, req.query.interval)
+    return getPhaseConsumption(ctx, req, phase, { interval, timezone, start, end })
+  }
 
   if (req.query.groupBy) return getGroupedConsumption(ctx, req)
 
@@ -352,8 +775,16 @@ async function getConsumption (ctx, req) {
   if (byMeter) return getByMeterConsumption(ctx, req)
 
   const interval = resolveInterval(start, end, req.query.interval)
-  const monthly = interval === '1M'
-  const { key, groupRange } = getIntervalConfig(monthly ? '1d' : interval)
+  const bucketing = { interval, timezone, start, end }
+
+  if (canUseEnergyRollup(ctx, start, interval)) {
+    const entries = await fetchEnergyRollupEntries(ctx, start, end)
+    if (entries.length) return buildRollupConsumption(entries, bucketing, false)
+  }
+
+  // Local days/weeks/months are rolled up from hourly buckets (see rollupLocalConsumption).
+  const local = isLocalInterval(interval)
+  const { key, groupRange } = getIntervalConfig(local ? '1h' : interval)
 
   // Central-DCS sites report site power through the Siemens DCS worker's stat log
   // (site_power_w), not a powermeter worker
@@ -392,24 +823,99 @@ async function getConsumption (ctx, req) {
     }
   })
 
-  const log = monthly ? rollupMonthly(buckets) : buckets
+  const log = local ? rollupLocalConsumption(buckets, bucketing) : buckets
   const summary = calculateConsumptionSummary(log)
 
   return { log, summary }
 }
 
+const MANUAL_CONSUMPTION_FIELD = 'totalConsumptionMWh'
+
+// Meter ids are matched loosely: config may say 'CCM' for the 'ccm' by-meter key.
+const normalizeMeterKey = (id) => String(id).toLowerCase().replace(/[^a-z0-9]/g, '')
+
+// Manual MWh per hour start from the DCS worker's consumption log. Hours whose
+// value was never entered (or was cleared) are absent, not zero.
+async function fetchManualConsumptionByHour (ctx, start, end) {
+  const records = await getEnergyConsumption(ctx, { query: { start, end } })
+  const byHour = new Map()
+  for (const record of records) {
+    const mwh = record[MANUAL_CONSUMPTION_FIELD]
+    if (Number.isFinite(mwh)) byHour.set(record.ts, mwh)
+  }
+  return byHour
+}
+
+// Average W per hour start of one by_meter_power_w meter.
+async function fetchMeterPowerByHour (ctx, req, meterKey) {
+  const { log } = await getByMeterConsumption(ctx, { ...req, query: { ...req.query, interval: '1h' } })
+  const wanted = normalizeMeterKey(meterKey)
+  const byHour = new Map()
+  for (const entry of log) {
+    const match = Object.entries(entry.powerW || {}).find(([meter]) => normalizeMeterKey(meter) === wanted)
+    if (match && Number.isFinite(Number(match[1]))) byHour.set(entry.ts, Number(match[1]))
+  }
+  return byHour
+}
+
+/**
+ * Consumption of one phase, built hour by hour and then rolled up like the
+ * site series. A `manual` phase is the hourly MWh logged on the DCS worker; a
+ * `remainder` phase is its meter minus those manual entries, since the
+ * manually logged load is fed through that meter. An elapsed hour missing any
+ * input is left out of the series and counted in summary.missingHours rather
+ * than read as zero.
+ */
+async function getPhaseConsumption (ctx, req, phase, bucketing) {
+  const { source, meterKey } = lPhases.getPhaseConsumptionSource(phase)
+  const { start, end } = bucketing
+  if (!isCentralDCSEnabled(ctx)) throw new Error('ERR_PHASE_CONSUMPTION_REQUIRES_CENTRAL_DCS')
+
+  const [manualByHour, meterByHour] = await Promise.all([
+    fetchManualConsumptionByHour(ctx, start, end),
+    source === lPhases.CONSUMPTION_SOURCES.REMAINDER ? fetchMeterPowerByHour(ctx, req, meterKey) : null
+  ])
+
+  const hourly = []
+  let missingHours = 0
+  for (const ts of lPhases.elapsedHourStarts(start, end)) {
+    const manualMWh = manualByHour.get(ts)
+    const meterW = meterByHour ? meterByHour.get(ts) : 0
+    if (manualMWh === undefined || meterW === undefined) {
+      missingHours++
+      continue
+    }
+    const consumptionMWh = meterByHour ? meterW / 1000000 - manualMWh : manualMWh
+    hourly.push({
+      ts,
+      timeRange: { startTs: ts, endTs: ts + HOUR_MS - 1 },
+      powerW: consumptionMWh * 1000000,
+      consumptionMWh
+    })
+  }
+
+  const log = isLocalInterval(bucketing.interval) ? rollupLocalConsumption(hourly, bucketing) : hourly
+  return { log, summary: { ...calculateConsumptionSummary(log), missingHours } }
+}
+
 // by_meter_power_w is only produced by the DCS worker, so the per-meter breakdown
 // is only meaningful when Central-DCS is enabled.
 async function getByMeterConsumption (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end, timezone } = resolveStartEnd(ctx, req)
 
   if (!isCentralDCSEnabled(ctx)) {
     throw new Error('ERR_BY_METER_REQUIRES_CENTRAL_DCS')
   }
 
   const interval = resolveInterval(start, end, req.query.interval)
-  const monthly = interval === '1M'
-  const { key, groupRange } = getIntervalConfig(monthly ? '1d' : interval)
+  const bucketing = { interval, timezone, start, end }
+
+  if (canUseEnergyRollup(ctx, start, interval)) {
+    const entries = await fetchEnergyRollupEntries(ctx, start, end)
+    if (entries.length) return buildRollupConsumption(entries, bucketing, true)
+  }
+
+  const { key, groupRange } = getIntervalConfig(isLocalInterval(interval) ? '1h' : interval)
 
   const res = await ctx.dataProxy.requestData(RPC_METHODS.TAIL_LOG, {
     type: WORKER_TYPES.DCS,
@@ -425,12 +931,12 @@ async function getByMeterConsumption (ctx, req) {
 
   const hours = bucketHours(groupRange)
 
-  return buildByMeterConsumption(firstOrkEntries(res), AGGR_FIELDS.BY_METER_POWER, hours, monthly)
+  return buildByMeterConsumption(firstOrkEntries(res), AGGR_FIELDS.BY_METER_POWER, hours, bucketing)
 }
 
 // by_meter_power_w arrives as a { meter: powerW } map per bucket. Mirror the
 // grouped-consumption shape so each entry carries per-meter power/consumption.
-function buildByMeterConsumption (entries, aggrField, hours, monthly = false) {
+function buildByMeterConsumption (entries, aggrField, hours, bucketing) {
   const buckets = entries.map(val => {
     const raw = val[aggrField]
     const powerW = raw && typeof raw === 'object' ? raw : {}
@@ -445,7 +951,7 @@ function buildByMeterConsumption (entries, aggrField, hours, monthly = false) {
     }
   })
 
-  const log = monthly ? rollupMonthly(buckets) : buckets
+  const log = isLocalInterval(bucketing?.interval) ? rollupLocalConsumption(buckets, bucketing) : buckets
   const summary = calculateByMeterConsumptionSummary(log)
 
   return { log, summary }
@@ -602,7 +1108,17 @@ function calculateGroupedConsumptionSummary (log, groupBy) {
 }
 
 async function getEfficiency (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end, timezone } = resolveStartEnd(ctx, req)
+  const phase = lPhases.resolvePhase(ctx, req)
+  // Downstream grouped/rack paths read start/end straight off req.query, so the
+  // converted UTC values have to replace the raw ones here for those to see them.
+  req = { ...req, query: { ...req.query, start, end } }
+
+  if (!lPhases.hasMinerTelemetry(phase)) {
+    if (req.query.groupBy || hasRackFilter(req)) throw lPhases.phaseError('ERR_PHASE_INVALID')
+    const interval = resolveInterval(start, end, req.query.interval)
+    return getPoolOnlyEfficiency(ctx, req, phase, { interval, timezone, start, end })
+  }
 
   if (req.query.groupBy) return getGroupedEfficiency(ctx, req)
 
@@ -612,12 +1128,21 @@ async function getEfficiency (ctx, req) {
     return { log: scoped, summary: calculateEfficiencySummary(scoped) }
   }
 
-  const { key, groupRange } = getIntervalConfig(resolveInterval(start, end, req.query.interval))
+  const interval = resolveInterval(start, end, req.query.interval)
+  const bucketing = { interval, timezone, start, end }
+
+  // A telemetry phase's power is its own consumption series, not the site meter.
+  if (phase) return getTelemetryPhaseEfficiency(ctx, req, phase, bucketing)
+
+  // Local days/weeks/months are rolled up from hourly buckets: the store's own '1D'/'1W'
+  // sit on the UTC grid, so they started before `start` and spilled past `end`.
+  const local = isLocalInterval(interval)
+  const { key, groupRange } = getIntervalConfig(local ? '1h' : interval)
 
   // Central-DCS sites have no miner-reported site efficiency stat; derive it from
   // the DCS site meter (site_power_w) over miner hashrate
   if (isCentralDCSEnabled(ctx)) {
-    return getDCSEfficiency(ctx, { key, groupRange, start, end })
+    return getDCSEfficiency(ctx, { key, groupRange, start, end, bucketing: local ? bucketing : null })
   }
 
   const res = await ctx.dataProxy.requestData(RPC_METHODS.TAIL_LOG, {
@@ -632,7 +1157,7 @@ async function getEfficiency (ctx, req) {
     aggrFields: { [AGGR_FIELDS.EFFICIENCY]: 1 }
   })
 
-  const log = firstOrkEntries(res).map(val => {
+  const buckets = firstOrkEntries(res).map(val => {
     const timeRange = parseEntryTimeRange(val.ts)
     return {
       ts: parseEntryTs(val.ts),
@@ -641,6 +1166,13 @@ async function getEfficiency (ctx, req) {
     }
   })
 
+  const log = local
+    ? groupLocalBuckets(buckets, bucketing).map(({ ts, timeRange, entries }) => ({
+      ts,
+      timeRange,
+      efficiencyWThs: meanOfField(entries, 'efficiencyWThs')
+    }))
+    : buckets
   const summary = calculateEfficiencySummary(log)
 
   return { log, summary }
@@ -649,7 +1181,9 @@ async function getEfficiency (ctx, req) {
 // Site-meter efficiency (W/THs) per interval bucket: DCS site_power_w over total
 // miner hashrate for the same bucket. Both series share the interval/groupRange
 // so their timestamps align; we key hashrate by ts and divide per DCS power point.
-async function getDCSEfficiency (ctx, { key, groupRange, start, end }) {
+// With `bucketing`, the hourly power and hashrate are each averaged over the local
+// bucket first, so a bucket's efficiency is its mean power over its mean hashrate.
+async function getDCSEfficiency (ctx, { key, groupRange, start, end, bucketing }) {
   const [powerRes, hashrateRes] = await Promise.all([
     ctx.dataProxy.requestData(RPC_METHODS.TAIL_LOG, {
       type: WORKER_TYPES.DCS,
@@ -680,20 +1214,130 @@ async function getDCSEfficiency (ctx, { key, groupRange, start, end }) {
     hashrateByTs.set(val.ts, Number(val[AGGR_FIELDS.HASHRATE_SUM]) || 0)
   }
 
-  const log = firstOrkEntries(powerRes).map(val => {
-    const powerW = Number(val[AGGR_FIELDS.SITE_POWER]) || 0
-    const hashrateThs = mhsToThs(hashrateByTs.get(val.ts) || 0)
+  const points = firstOrkEntries(powerRes).map(val => {
     const timeRange = parseEntryTimeRange(val.ts)
     return {
       ts: parseEntryTs(val.ts),
       ...(timeRange && { timeRange }),
-      efficiencyWThs: hashrateThs > 0 ? powerW / hashrateThs : 0
+      powerW: Number(val[AGGR_FIELDS.SITE_POWER]) || 0,
+      hashrateMhs: hashrateByTs.get(val.ts) || 0
     }
+  })
+
+  // The site meter also feeds the pool-only phases (no miner telemetry), so
+  // their pool hashrate joins the miners' in the divisor. Points are hourly
+  // here (local intervals are rolled up below).
+  const poolOnlyAccounts = lPhases.getPoolOnlyAccountKeys(ctx)
+  if (poolOnlyAccounts.size && points.length) {
+    const buckets = points.map(({ ts, timeRange }) => ({
+      ts,
+      startTs: timeRange?.startTs ?? ts,
+      endTs: timeRange?.endTs ?? ts + HOUR_MS - 1
+    }))
+    const poolByBucket = await resolvePoolHashrateForBuckets(ctx, { start, end, buckets, accounts: poolOnlyAccounts })
+    for (const point of points) point.hashrateMhs += poolByBucket.get(point.ts) || 0
+  }
+
+  const buckets = bucketing
+    ? groupLocalBuckets(points, bucketing).map(({ ts, timeRange, entries }) => ({
+      ts,
+      timeRange,
+      powerW: meanOfField(entries, 'powerW'),
+      hashrateMhs: meanOfField(entries, 'hashrateMhs')
+    }))
+    : points
+
+  const log = buckets.map(({ powerW, hashrateMhs, ...bucket }) => {
+    const hashrateThs = mhsToThs(hashrateMhs)
+    return { ...bucket, efficiencyWThs: hashrateThs > 0 ? powerW / hashrateThs : 0 }
   })
 
   const summary = calculateEfficiencySummary(log)
 
   return { log, summary }
+}
+
+/**
+ * Efficiency for a phase without MOS miners: its own consumption series (see
+ * getPhaseConsumption) over its own pool hashrate, bucket by bucket.
+ */
+async function getPoolOnlyEfficiency (ctx, req, phase, bucketing) {
+  const { start, end } = bucketing
+  const consumption = await getPhaseConsumption(ctx, req, phase, bucketing)
+  if (!consumption.log.length) {
+    return { log: [], summary: { ...calculateEfficiencySummary([]), missingHours: consumption.summary.missingHours } }
+  }
+
+  const buckets = consumption.log.map(({ ts, timeRange }) => ({ ts, ...timeRange }))
+  const accounts = lPhases.getPhaseAccountKeys(phase)
+  const poolByBucket = await resolvePoolHashrateForBuckets(ctx, { start, end, buckets, accounts })
+
+  const log = consumption.log.map(({ ts, timeRange, powerW }) => {
+    const hashrateThs = mhsToThs(poolByBucket.get(ts) || 0)
+    return { ts, timeRange, efficiencyWThs: hashrateThs > 0 ? powerW / hashrateThs : 0 }
+  })
+
+  return { log, summary: { ...calculateEfficiencySummary(log), missingHours: consumption.summary.missingHours } }
+}
+
+/**
+ * Efficiency for a phase whose miners report to MOS: its consumption series
+ * (for a remainder phase, its meter minus the manual entries) over the fleet's
+ * miner hashrate, joined hour by hour and then averaged per bucket like the
+ * site series. An hour without a hashrate sample is counted in missingHours
+ * along with the hours the consumption series already left out.
+ */
+async function getTelemetryPhaseEfficiency (ctx, req, phase, bucketing) {
+  const { start, end, interval } = bucketing
+  const { key, groupRange } = getIntervalConfig('1h')
+
+  const [consumption, hashrateRes] = await Promise.all([
+    getPhaseConsumption(ctx, req, phase, { ...bucketing, interval: '1h' }),
+    ctx.dataProxy.requestData(RPC_METHODS.TAIL_LOG, {
+      type: WORKER_TYPES.MINER,
+      tag: WORKER_TAGS.MINER,
+      key,
+      groupRange,
+      shouldCalculateAvg: true,
+      start,
+      end,
+      fields: { [LOG_FIELDS.HASHRATE_SUM]: 1 },
+      aggrFields: { [AGGR_FIELDS.HASHRATE_SUM]: 1 }
+    })
+  ])
+
+  const hashrateByHour = new Map()
+  for (const val of firstOrkEntries(hashrateRes)) {
+    const hashrateMhs = Number(val[AGGR_FIELDS.HASHRATE_SUM])
+    if (Number.isFinite(hashrateMhs)) hashrateByHour.set(parseEntryTs(val.ts), hashrateMhs)
+  }
+
+  let missingHours = consumption.summary.missingHours
+  const points = []
+  for (const { ts, timeRange, powerW } of consumption.log) {
+    const hashrateMhs = hashrateByHour.get(ts)
+    if (hashrateMhs === undefined) {
+      missingHours++
+      continue
+    }
+    points.push({ ts, timeRange, powerW, hashrateMhs })
+  }
+
+  const buckets = isLocalInterval(interval)
+    ? groupLocalBuckets(points, bucketing).map(({ ts, timeRange, entries }) => ({
+      ts,
+      timeRange,
+      powerW: meanOfField(entries, 'powerW'),
+      hashrateMhs: meanOfField(entries, 'hashrateMhs')
+    }))
+    : points
+
+  const log = buckets.map(({ powerW, hashrateMhs, ...bucket }) => {
+    const hashrateThs = mhsToThs(hashrateMhs)
+    return { ...bucket, efficiencyWThs: hashrateThs > 0 ? powerW / hashrateThs : 0 }
+  })
+
+  return { log, summary: { ...calculateEfficiencySummary(log), missingHours } }
 }
 
 function calculateEfficiencySummary (log) {
@@ -788,9 +1432,14 @@ function calculateGroupedEfficiencySummary (log, groupBy) {
 }
 
 async function getMinerStatus (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end, timezone } = resolveStartEnd(ctx, req)
+  // getGroupedMinerStatus reads start/end straight off req.query, so the converted
+  // UTC values have to replace the raw ones here for it to see them.
+  req = { ...req, query: { ...req.query, start, end } }
+  // Days are the site's local calendar days, clamped to the requested range.
+  const bucketing = { interval: '1d', timezone, start, end }
 
-  if (req.query.groupBy) return getGroupedMinerStatus(ctx, req)
+  if (req.query.groupBy) return getGroupedMinerStatus(ctx, req, bucketing)
 
   const results = await ctx.dataProxy.requestData(RPC_METHODS.TAIL_LOG, {
     key: LOG_KEYS.STAT_3H,
@@ -798,6 +1447,7 @@ async function getMinerStatus (ctx, req) {
     tag: WORKER_TAGS.MINER,
     aggrFields: {
       [AGGR_FIELDS.TYPE_CNT]: 1,
+      [AGGR_FIELDS.MINING_CNT]: 1,
       [AGGR_FIELDS.OFFLINE_CNT]: 1,
       [AGGR_FIELDS.SLEEP_CNT]: 1,
       [AGGR_FIELDS.MAINTENANCE_CNT]: 1,
@@ -807,12 +1457,7 @@ async function getMinerStatus (ctx, req) {
     end
   })
 
-  const daily = processMinerStatusData(results)
-  const log = Object.keys(daily).sort().map(dayTs => ({
-    ts: Number(dayTs),
-    ...daily[dayTs]
-  }))
-
+  const log = processMinerStatusData(results, bucketing)
   const summary = calculateMinerStatusSummary(log)
 
   return { log, summary }
@@ -821,44 +1466,45 @@ async function getMinerStatus (ctx, req) {
 // Averages the day's stat snapshots app-side instead of via groupRange on the
 // worker: the worker-side average skips snapshots where a grouped-count key is
 // absent, so a status seen in a single snapshot was reported at its full count
-// for the whole day.
-function processMinerStatusData (results) {
-  const daily = {}
+// for the whole day. Days are local to `bucketing.timezone` and clamped to
+// [bucketing.start, bucketing.end] - see groupLocalBuckets.
+function processMinerStatusData (results, bucketing) {
+  const snapshots = []
   for (const entry of iterateRpcEntries(results)) {
-    const rawTs = parseEntryTs(entry.ts || entry.timestamp)
-    const ts = rawTs ? getStartOfDay(rawTs) : null
-    if (!ts) continue
-    if (!daily[ts]) {
-      daily[ts] = { total: 0, offline: 0, sleep: 0, maintenance: 0, error: 0, snapshots: new Set() }
-    }
-
-    const bucket = daily[ts]
-    bucket.snapshots.add(rawTs)
-    bucket.offline += sumObjectValues(entry[AGGR_FIELDS.OFFLINE_CNT] || entry.aggrFields?.[AGGR_FIELDS.OFFLINE_CNT])
-    bucket.sleep += sumObjectValues(entry[AGGR_FIELDS.SLEEP_CNT] || entry.aggrFields?.[AGGR_FIELDS.SLEEP_CNT])
-    bucket.maintenance += sumObjectValues(entry[AGGR_FIELDS.MAINTENANCE_CNT] || entry.aggrFields?.[AGGR_FIELDS.MAINTENANCE_CNT])
-    bucket.error += sumObjectValues(entry[AGGR_FIELDS.ERROR_CNT] || entry.aggrFields?.[AGGR_FIELDS.ERROR_CNT])
-    bucket.total += sumObjectValues(entry[AGGR_FIELDS.TYPE_CNT]) || entry.total_cnt || entry.count || 0
+    const ts = parseEntryTs(entry.ts || entry.timestamp)
+    if (ts) snapshots.push({ ts, entry })
   }
 
-  const averaged = {}
-  for (const [ts, bucket] of Object.entries(daily)) {
-    const snapshots = bucket.snapshots.size || 1
-    const offline = Math.round(bucket.offline / snapshots)
-    const sleep = Math.round(bucket.sleep / snapshots)
-    const maintenance = Math.round(bucket.maintenance / snapshots)
-    const error = Math.round(bucket.error / snapshots)
-    const total = Math.round(bucket.total / snapshots)
-    averaged[ts] = {
-      online: Math.max(0, total - offline - sleep - maintenance - error),
-      offline,
-      sleep,
-      maintenance,
-      error,
-      timeRange: { startTs: Number(ts), endTs: Number(ts) + METRICS_TIME.ONE_DAY_MS - 1 }
+  return groupLocalBuckets(snapshots, bucketing).map(({ ts, timeRange, entries }) => {
+    const bucket = { total: 0, mining: null, offline: 0, sleep: 0, maintenance: 0, error: 0, snapshots: new Set() }
+    for (const { ts: rawTs, entry } of entries) {
+      bucket.snapshots.add(rawTs)
+      bucket.offline += sumObjectValues(entry[AGGR_FIELDS.OFFLINE_CNT] || entry.aggrFields?.[AGGR_FIELDS.OFFLINE_CNT])
+      bucket.sleep += sumObjectValues(entry[AGGR_FIELDS.SLEEP_CNT] || entry.aggrFields?.[AGGR_FIELDS.SLEEP_CNT])
+      bucket.maintenance += sumObjectValues(entry[AGGR_FIELDS.MAINTENANCE_CNT] || entry.aggrFields?.[AGGR_FIELDS.MAINTENANCE_CNT])
+      bucket.error += sumObjectValues(entry[AGGR_FIELDS.ERROR_CNT] || entry.aggrFields?.[AGGR_FIELDS.ERROR_CNT])
+      bucket.total += sumObjectValues(entry[AGGR_FIELDS.TYPE_CNT]) || entry.total_cnt || entry.count || 0
+
+      const mining = entry[AGGR_FIELDS.MINING_CNT] ?? entry.aggrFields?.[AGGR_FIELDS.MINING_CNT]
+      if (typeof mining === 'number') bucket.mining = (bucket.mining || 0) + mining
     }
-  }
-  return averaged
+
+    const count = bucket.snapshots.size || 1
+    const offline = Math.round(bucket.offline / count)
+    const sleep = Math.round(bucket.sleep / count)
+    const maintenance = Math.round(bucket.maintenance / count)
+    const error = Math.round(bucket.error / count)
+    const total = Math.round(bucket.total / count)
+    // Online is the actual mining count (same field the live site header uses;
+    // excludes the maintenance container), so the chart agrees with the header
+    // regardless of whether the worker's type_cnt includes maintenance miners.
+    // Workers without the field fall back to the derived value: their type_cnt
+    // still counts maintenance miners, so maintenance is subtracted back out.
+    const online = bucket.mining !== null
+      ? Math.round(bucket.mining / count)
+      : Math.max(0, total - offline - sleep - maintenance - error)
+    return { ts, online, offline, sleep, maintenance, error, timeRange }
+  })
 }
 
 function calculateMinerStatusSummary (log) {
@@ -898,7 +1544,7 @@ const MINER_STATUS_TYPE_FIELDS = {
   error: AGGR_FIELDS.ERROR_TYPE_CNT
 }
 
-async function getGroupedMinerStatus (ctx, req) {
+async function getGroupedMinerStatus (ctx, req, bucketing) {
   const { start, end } = req.query
 
   const aggrFields = {}
@@ -913,49 +1559,44 @@ async function getGroupedMinerStatus (ctx, req) {
     end
   })
 
-  const daily = processGroupedMinerStatusData(results)
-  const log = Object.keys(daily).sort().map(dayTs => ({
-    ts: Number(dayTs),
-    ...daily[dayTs]
-  }))
-
-  return { log }
+  return { log: processGroupedMinerStatusData(results, bucketing) }
 }
 
-// Same day-bucket averaging as processMinerStatusData, per miner type.
-function processGroupedMinerStatusData (results) {
-  const daily = {}
+// Same local-day bucket averaging as processMinerStatusData, per miner type.
+function processGroupedMinerStatusData (results, bucketing) {
+  const snapshots = []
   for (const entry of iterateRpcEntries(results)) {
-    const rawTs = parseEntryTs(entry.ts || entry.timestamp)
-    const ts = rawTs ? getStartOfDay(rawTs) : null
-    if (!ts) continue
-    if (!daily[ts]) {
-      daily[ts] = { total: {}, online: {}, offline: {}, sleep: {}, maintenance: {}, error: {}, snapshots: new Set() }
-    }
-    const bucket = daily[ts]
-    bucket.snapshots.add(rawTs)
-    mergeGroupedField(bucket.total, entry[AGGR_FIELDS.TYPE_CNT])
-    mergeGroupedField(bucket.offline, entry[AGGR_FIELDS.OFFLINE_TYPE_CNT])
-    mergeGroupedField(bucket.sleep, entry[AGGR_FIELDS.SLEEP_TYPE_CNT])
-    mergeGroupedField(bucket.maintenance, entry[AGGR_FIELDS.MAINTENANCE_CNT])
-    mergeGroupedField(bucket.error, entry[AGGR_FIELDS.ERROR_TYPE_CNT])
+    const ts = parseEntryTs(entry.ts || entry.timestamp)
+    if (ts) snapshots.push({ ts, entry })
   }
 
-  for (const [ts, bucket] of Object.entries(daily)) {
-    const snapshots = bucket.snapshots.size || 1
-    delete bucket.snapshots
+  return groupLocalBuckets(snapshots, bucketing).map(({ ts, timeRange, entries }) => {
+    const bucket = { total: {}, online: {}, offline: {}, sleep: {}, maintenance: {}, error: {} }
+    const seen = new Set()
+    for (const { ts: rawTs, entry } of entries) {
+      seen.add(rawTs)
+      mergeGroupedField(bucket.total, entry[AGGR_FIELDS.TYPE_CNT])
+      mergeGroupedField(bucket.offline, entry[AGGR_FIELDS.OFFLINE_TYPE_CNT])
+      mergeGroupedField(bucket.sleep, entry[AGGR_FIELDS.SLEEP_TYPE_CNT])
+      mergeGroupedField(bucket.maintenance, entry[AGGR_FIELDS.MAINTENANCE_CNT])
+      mergeGroupedField(bucket.error, entry[AGGR_FIELDS.ERROR_TYPE_CNT])
+    }
+
+    const count = seen.size || 1
     for (const field of ['total', 'offline', 'sleep', 'maintenance', 'error']) {
       for (const key of Object.keys(bucket[field])) {
-        bucket[field][key] = Math.round(bucket[field][key] / snapshots)
+        bucket[field][key] = Math.round(bucket[field][key] / count)
       }
     }
+    // type_cnt does not count miners parked in the maintenance container, so
+    // maintenance must not be subtracted here — it is a separate bucket, not a
+    // slice of the total.
     for (const type of Object.keys(bucket.total)) {
-      const online = bucket.total[type] - (bucket.offline[type] || 0) - (bucket.sleep[type] || 0) - (bucket.maintenance[type] || 0) - (bucket.error[type] || 0)
+      const online = bucket.total[type] - (bucket.offline[type] || 0) - (bucket.sleep[type] || 0) - (bucket.error[type] || 0)
       bucket.online[type] = Math.max(0, online)
     }
-    bucket.timeRange = { startTs: Number(ts), endTs: Number(ts) + METRICS_TIME.ONE_DAY_MS - 1 }
-  }
-  return daily
+    return { ts, ...bucket, timeRange }
+  })
 }
 
 const MINERS_BY_CONTAINER_AGGR_FIELDS = {
@@ -1304,7 +1945,7 @@ async function getInventoryMinerDistribution (ctx, req) {
 }
 
 async function getPowerMode (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
 
   const interval = resolveInterval(start, end, req.query.interval)
   const config = getIntervalConfig(interval)
@@ -1421,8 +2062,9 @@ function resolvePowerModeTimelineInterval (start, end, requested) {
 
 async function getPowerModeTimeline (ctx, req) {
   const now = Date.now()
-  const start = Number(req.query.start) || (now - METRICS_TIME.ONE_MONTH_MS)
-  const end = Number(req.query.end) || now
+  // An explicit start/end is a true UTC instant, same as the computed defaults below.
+  const start = resolveOptionalTimeMs(req, req.query.start, now - METRICS_TIME.ONE_MONTH_MS)
+  const end = resolveOptionalTimeMs(req, req.query.end, now)
   const container = req.query.container || null
 
   if (start >= end) {
@@ -1542,7 +2184,7 @@ function processPowerModeTimelineData (results, containerFilter) {
 }
 
 async function getTemperature (ctx, req) {
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
 
   const interval = resolveInterval(start, end, req.query.interval)
   const config = getIntervalConfig(interval)
@@ -1735,8 +2377,9 @@ async function getContainerHistory (ctx, req) {
   }
 
   const now = Date.now()
-  const start = Number(req.query.start) || (now - METRICS_TIME.ONE_DAY_MS)
-  const end = Number(req.query.end) || now
+  // An explicit start/end is a true UTC instant, same as the computed defaults below.
+  const start = resolveOptionalTimeMs(req, req.query.start, now - METRICS_TIME.ONE_DAY_MS)
+  const end = resolveOptionalTimeMs(req, req.query.end, now)
   const limit = Number(req.query.limit) || METRICS_DEFAULTS.CONTAINER_HISTORY_LIMIT
 
   if (start >= end) {
@@ -1801,7 +2444,7 @@ async function getCooling (ctx, req) {
     throw new Error('ERR_FEATURE_NOT_ENABLED')
   }
 
-  const { start, end } = validateStartEnd(req)
+  const { start, end } = resolveStartEnd(ctx, req)
 
   const requested = COOLING_INTERVAL_ALIASES[req.query.interval] || req.query.interval
   const interval = resolveInterval(start, end, requested)
@@ -1880,13 +2523,309 @@ function calculateCoolingSummary (log) {
   }
 }
 
+const HOUR_MS = 60 * 60 * 1000
+
+// Maps each forecast hour to the inputs the downtime split needs: whether the
+// forecast said not to mine (manualOverrideMine forces mining regardless of
+// the stored decision) and how much energy was available. availableW is the
+// power-production input (MW for the whole hour); a legacy yes/no flag maps to
+// full capacity / zero, and null means "assume full capacity".
+function indexForecastDecisionsByHour (forecastResults) {
+  const byHour = new Map()
+  for (const orkResult of Array.isArray(forecastResults) ? forecastResults : []) {
+    for (const payload of Array.isArray(orkResult) ? orkResult : []) {
+      if (!Array.isArray(payload?.hourlyForecast)) continue
+      for (const item of payload.hourlyForecast) {
+        const start = Number(item?.start)
+        if (!Number.isFinite(start)) continue
+        const hourTs = Math.floor(start / HOUR_MS) * HOUR_MS
+        // wait_prod / wait_spot hours are not mining hours either
+        const notMining = item.manualOverrideMine === true
+          ? false
+          : item.decision !== 'mine'
+        // hours without a power input carry availableMw: null, which is "no
+        // input" (fall back to the legacy flag), not an explicit 0 MW
+        const availableMw = typeof item.availableMw === 'number' ? item.availableMw : NaN
+        const availableW = Number.isFinite(availableMw) && availableMw >= 0
+          ? availableMw * 1e6
+          : normalizeAvailability(item) === 0 ? 0 : null
+        byHour.set(hourTs, { notMining, availableW })
+      }
+    }
+  }
+  return byHour
+}
+
+// Splits each hour's downtime into three buckets: curtailment is the energy
+// that was never available (nominal minus the power-production input, as a
+// share of nominal), energy sold is the available energy routed to the grid
+// on a not-mining hour, and the operational rate on a mining hour is the gap
+// between the hour's available energy and the metered draw, as a share of the
+// available energy — mining is assumed to take the full production, so this
+// bucket can exceed the nominal-based downtime when more than nominal was
+// available. Hours without a forecast entry count as 'mine' at full
+// availability, so an unexplained shortfall surfaces as an operational issue
+// rather than being hidden as curtailment.
+function buildHourlyDowntime (entries, nominalPowerW, decisionByHour) {
+  return entries.map(val => {
+    const ts = parseEntryTs(val.ts)
+    const timeRange = parseEntryTimeRange(val.ts)
+    const powerW = Number(val[AGGR_FIELDS.SITE_POWER]) || 0
+
+    let downtimeRate = null
+    let curtailmentRate = null
+    let energySoldRate = null
+    let operationalIssuesRate = null
+    if (nominalPowerW) {
+      downtimeRate = Math.max(0, nominalPowerW - powerW) / nominalPowerW
+      const hourTs = Math.floor(ts / HOUR_MS) * HOUR_MS
+      const hour = decisionByHour.get(hourTs)
+      const availableW = hour?.availableW ?? nominalPowerW
+
+      // capped at the observed downtime so the three buckets always sum to it
+      // (a site mining on purchased energy has no available production, yet no
+      // downtime either)
+      curtailmentRate = Math.min(
+        Math.max(0, nominalPowerW - availableW) / nominalPowerW,
+        downtimeRate
+      )
+      energySoldRate = hour?.notMining && availableW > 0
+        ? Math.min(availableW / nominalPowerW, downtimeRate - curtailmentRate)
+        : 0
+      operationalIssuesRate = !hour?.notMining && availableW > 0
+        ? Math.max(0, availableW - powerW) / availableW
+        : Math.max(0, downtimeRate - curtailmentRate - energySoldRate)
+    }
+
+    return {
+      ts,
+      ...(timeRange && { timeRange }),
+      powerW,
+      nominalPowerW,
+      downtimeRate,
+      curtailmentRate,
+      energySoldRate,
+      operationalIssuesRate
+    }
+  })
+}
+
+// Daily rates are the mean of the hourly rates over hours that have data, so
+// gaps in the stat log don't read as 100% downtime. Days are local calendar days in
+// `timezone`, the same grid finance/* buckets on, so pages that render both line up.
+function aggregateDowntimeDaily (hourlyLog, timezone) {
+  const byDay = new Map()
+  for (const entry of hourlyLog) {
+    const dayTs = localDayStart(entry.ts, timezone)
+    if (!byDay.has(dayTs)) byDay.set(dayTs, [])
+    byDay.get(dayTs).push(entry)
+  }
+
+  return [...byDay.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([dayTs, hours]) => ({
+      ts: dayTs,
+      // A local day is 23-25h across a DST shift, so its end is the next day's start.
+      timeRange: { startTs: dayTs, endTs: localDayStart(dayTs + 1.5 * METRICS_TIME.ONE_DAY_MS, timezone) - 1 },
+      powerW: hours.reduce((sum, h) => sum + h.powerW, 0) / hours.length,
+      nominalPowerW: hours[0].nominalPowerW,
+      downtimeRate: meanOfField(hours, 'downtimeRate'),
+      curtailmentRate: meanOfField(hours, 'curtailmentRate'),
+      energySoldRate: meanOfField(hours, 'energySoldRate'),
+      operationalIssuesRate: meanOfField(hours, 'operationalIssuesRate')
+    }))
+}
+
+function meanOfField (entries, field) {
+  const values = entries
+    .map(entry => entry[field])
+    .filter(value => value !== null && value !== undefined)
+  return values.length
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : null
+}
+
+function calculateDowntimeSummary (log, nominalPowerW, hasForecastData) {
+  const powers = log.map(entry => entry.powerW)
+  return {
+    avgDowntimeRate: meanOfField(log, 'downtimeRate'),
+    avgCurtailmentRate: meanOfField(log, 'curtailmentRate'),
+    avgEnergySoldRate: meanOfField(log, 'energySoldRate'),
+    avgOperationalIssuesRate: meanOfField(log, 'operationalIssuesRate'),
+    avgPowerW: meanOfField(log, 'powerW'),
+    minPowerW: powers.length ? Math.min(...powers) : null,
+    maxPowerW: powers.length ? Math.max(...powers) : null,
+    nominalPowerW,
+    hasForecastData
+  }
+}
+
+function resolveDowntimeInterval (start, end, interval) {
+  return interval || ((end - start) <= METRICS_TIME.TWO_DAYS_MS ? '1h' : '1d')
+}
+
+// Only the daily rollup cuts on the zone; hourly buckets are the same UTC instants in any
+// whole-hour zone. Runs before validation, so start/end may still be raw query strings.
+function downtimeUsesTimezone (req) {
+  const { start, end, interval } = req.query
+  return resolveDowntimeInterval(Number(start), Number(end), interval) === '1d'
+}
+
+async function getDowntime (ctx, req) {
+  if (req.query.phase && req.query.phase !== lPhases.PHASE_TOTAL) throw lPhases.phaseError('ERR_PHASE_NOT_SUPPORTED')
+
+  const { start, end, timezone } = resolveStartEnd(ctx, req)
+  const interval = resolveDowntimeInterval(start, end, req.query.interval)
+
+  // Attribution is decided per forecast hour, so power is always fetched at
+  // hourly resolution and rolled up to days afterwards when interval=1d.
+  const { key, groupRange } = getIntervalConfig('1h')
+
+  const requestParams = isCentralDCSEnabled(ctx)
+    ? { type: WORKER_TYPES.DCS, tag: getDCSTag(ctx) }
+    : { type: WORKER_TYPES.POWERMETER, tag: WORKER_TAGS.POWERMETER }
+
+  const [powerRes, forecastRes, globalConfigRes] = await Promise.all([
+    ctx.dataProxy.requestData(RPC_METHODS.TAIL_LOG, {
+      ...requestParams,
+      key,
+      groupRange,
+      shouldCalculateAvg: true,
+      start,
+      end,
+      fields: { [LOG_FIELDS.SITE_POWER]: 1 },
+      aggrFields: { [AGGR_FIELDS.SITE_POWER]: 1 }
+    }),
+    // A site without an electricity worker still gets a downtime report; every
+    // shortfall is then attributed to operational issues.
+    ctx.dataProxy.requestDataMap(RPC_METHODS.GET_WRK_EXT_DATA, {
+      type: WORKER_TYPES.ELECTRICITY,
+      query: { key: ELECTRICITY_EXT_DATA_KEYS.FORECAST_HISTORY },
+      start,
+      end
+    }).catch(() => []),
+    ctx.dataProxy.requestDataMap(RPC_METHODS.GLOBAL_CONFIG, {
+      fields: { nominalPowerAvailability_MW: 1, nominalAvailablePowerMWh: 1 }
+    })
+  ])
+
+  // Some deployments store the site capacity as nominalAvailablePowerMWh
+  // (MWh available per hour, i.e. MW) instead of nominalPowerAvailability_MW.
+  const globalConfig = extractGlobalConfig(globalConfigRes)
+  const nominalMW = globalConfig.nominalPowerAvailability_MW ||
+    globalConfig.nominalAvailablePowerMWh
+  const nominalPowerW = nominalMW > 0 ? nominalMW * 1000000 : null
+
+  const decisionByHour = indexForecastDecisionsByHour(forecastRes)
+  const hourly = buildHourlyDowntime(firstOrkEntries(powerRes), nominalPowerW, decisionByHour)
+  const log = interval === '1d' ? aggregateDowntimeDaily(hourly, timezone) : hourly
+  const summary = calculateDowntimeSummary(log, nominalPowerW, decisionByHour.size > 0)
+
+  return { log, summary }
+}
+
+// Serves the dashboard hash-rate chart's per-pool series, which the UI used to
+// assemble client-side by paginating 30-90 days of raw 5-min stats-history
+// rows through /auth/ext-data. Buckets are floor-aligned and hashrate is
+// averaged across every stats entry of a poolType in the bucket - deliberately
+// the same semantics the chart's downsampling produced, so the swap is not a
+// visual change. stats entries are per account and orks report disjoint racks,
+// so a multi-account pool (or one spread over orks) plots the per-account
+// average, not the pool total; balance-history-style avg-per-account-then-sum
+// would change the plotted numbers and is left as a deliberate follow-up.
+// Values stay in H/s; the UI converts.
+function bucketPoolHashrate (results, intervalMs, accounts = null) {
+  const buckets = new Map()
+
+  for (const windowRes of results) {
+    for (const orkRows of windowRes) {
+      if (!Array.isArray(orkRows)) continue
+      for (const row of orkRows) {
+        const ts = Number(row?.ts)
+        if (!Number.isFinite(ts) || !Array.isArray(row.stats)) continue
+
+        const bucketTs = Math.floor(ts / intervalMs) * intervalMs
+        let pools = buckets.get(bucketTs)
+        if (!pools) {
+          pools = new Map()
+          buckets.set(bucketTs, pools)
+        }
+
+        for (const stat of row.stats) {
+          if (!stat?.poolType) continue
+          if (accounts && !accounts.has(`${stat.poolType}:${stat.username}`)) continue
+          // Average per account before summing across accounts: pooling the
+          // samples would average a 100 TH/s and a 50 TH/s account into 75
+          // instead of the 150 the site actually hashes.
+          const key = `${stat.poolType}:${stat.username}`
+          const acc = pools.get(key) || { poolType: stat.poolType, sum: 0, count: 0 }
+          acc.sum += stat.hashrate || 0
+          acc.count++
+          pools.set(key, acc)
+        }
+      }
+    }
+  }
+
+  return [...buckets.entries()]
+    .sort(([tsA], [tsB]) => tsA - tsB)
+    .map(([ts, pools]) => {
+      const byPool = new Map()
+      for (const { poolType, sum, count } of pools.values()) {
+        byPool.set(poolType, (byPool.get(poolType) || 0) + sum / count)
+      }
+      return {
+        ts,
+        stats: [...byPool.entries()].map(([poolType, hashrate]) => ({ poolType, hashrate }))
+      }
+    })
+}
+
+async function getPoolHashrate (ctx, req) {
+  const phase = lPhases.resolvePhase(ctx, req)
+  const accounts = phase ? lPhases.getPhaseAccountKeys(phase) : null
+  const intervalMs = POOL_HASHRATE_INTERVALS_MS[req.query.interval]
+  const end = Date.now()
+  const start = end - req.query.lookbackDays * METRICS_TIME.ONE_DAY_MS
+
+  // The pool workers stream the whole start..end range in one response, so
+  // split long lookbacks into week-sized windows to keep each RPC well under
+  // the proxy timeout. Windows are inclusive on both ends worker-side, hence
+  // the -1ms so rows on the seam are not fetched twice.
+  const windows = []
+  for (let windowStart = start; windowStart < end; windowStart += METRICS_TIME.SEVEN_DAYS_MS) {
+    windows.push({
+      start: windowStart,
+      end: Math.min(windowStart + METRICS_TIME.SEVEN_DAYS_MS - 1, end)
+    })
+  }
+
+  const results = await Promise.all(windows.map((window) =>
+    ctx.dataProxy.requestDataMap(RPC_METHODS.GET_WRK_EXT_DATA, {
+      type: WORKER_TYPES.MINERPOOL,
+      query: {
+        key: MINERPOOL_EXT_DATA_KEYS.STATS_HISTORY,
+        start: window.start,
+        end: window.end,
+        fields: { ts: 1, 'stats.poolType': 1, 'stats.hashrate': 1, 'stats.username': 1 }
+      }
+    })
+  ))
+
+  return { log: bucketPoolHashrate(results, intervalMs, accounts) }
+}
+
 module.exports = {
+  wantsMonthlyRollup,
+  downtimeUsesTimezone,
   ...require('../../metrics.utils'),
   getHashrate,
+  getMonthlyHashrate,
+  monthlyHashesCache,
   calculateHashrateSummary,
   calculateGroupedHashrateSummary,
   getConsumption,
-  rollupMonthly,
+  rollupLocalConsumption,
   calculateConsumptionSummary,
   calculateByMeterConsumptionSummary,
   calculateGroupedConsumptionSummary,
@@ -1925,5 +2864,12 @@ module.exports = {
   processContainerHistoryData,
   getCooling,
   processCoolingData,
-  calculateCoolingSummary
+  calculateCoolingSummary,
+  getDowntime,
+  indexForecastDecisionsByHour,
+  buildHourlyDowntime,
+  aggregateDowntimeDaily,
+  calculateDowntimeSummary,
+  getPoolHashrate,
+  bucketPoolHashrate
 }

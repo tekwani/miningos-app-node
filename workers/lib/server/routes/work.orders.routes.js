@@ -17,12 +17,14 @@ const {
   reopenWorkOrder,
   assignWorkOrder,
   appendWorkLogEntry,
+  appendWorkOrderNote,
+  listWorkOrderNotes,
   getWorkOrderAudit,
   exportWorkOrder,
   exportWorkOrdersRma,
   exportWorkOrdersBulk
 } = require('../handlers/work.orders.handlers')
-const { createAuthRoute, createCachedAuthRoute } = require('../lib/routeHelpers')
+const { createAuthRoute, createCachedAuthRoute, rejectTimezone } = require('../lib/routeHelpers')
 const { stableJsonString } = require('../../utils')
 
 module.exports = (ctx) => [
@@ -42,6 +44,7 @@ module.exports = (ctx) => [
     method: HTTP_METHODS.GET,
     url: ENDPOINTS.WORK_ORDERS,
     schema: schemas.list,
+    preValidation: rejectTimezone(),
     ...createCachedAuthRoute(
       ctx,
       (req) => [
@@ -55,6 +58,7 @@ module.exports = (ctx) => [
         req.query.assignee,
         req.query.creator,
         req.query.partId,
+        req.query.serialNum,
         req.query.status,
         req.query.type,
         req.query.from,
@@ -74,6 +78,7 @@ module.exports = (ctx) => [
   {
     method: HTTP_METHODS.GET,
     url: ENDPOINTS.WORK_ORDER_AUDIT,
+    preValidation: rejectTimezone(),
     schema: schemas.audit,
     ...createCachedAuthRoute(
       ctx,
@@ -118,6 +123,18 @@ module.exports = (ctx) => [
     url: ENDPOINTS.WORK_ORDER_LOG,
     schema: schemas.log,
     ...createAuthRoute(ctx, appendWorkLogEntry, [AUTH_PERMISSIONS.WORK_ORDER])
+  },
+  {
+    method: HTTP_METHODS.POST,
+    url: ENDPOINTS.WORK_ORDER_NOTES,
+    schema: schemas.notesAppend,
+    ...createAuthRoute(ctx, appendWorkOrderNote, [AUTH_PERMISSIONS.WORK_ORDER])
+  },
+  {
+    method: HTTP_METHODS.GET,
+    url: ENDPOINTS.WORK_ORDER_NOTES,
+    schema: schemas.notesList,
+    ...createAuthRoute(ctx, listWorkOrderNotes, [AUTH_PERMISSIONS.WORK_ORDER])
   },
   {
     method: HTTP_METHODS.GET,

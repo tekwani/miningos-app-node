@@ -1,6 +1,6 @@
 'use strict'
 
-const { parseJsonQueryParam, flattenRpcResults } = require('../../utils')
+const { parseJsonQueryParam, flattenRpcResults, sanitizeIncludeFields } = require('../../utils')
 const {
   MINER_FIELD_MAP,
   MINER_PROJECTION_MAP,
@@ -176,15 +176,6 @@ async function listMiners (ctx, req) {
     limit,
     hasMore: offset + limit < totalCount
   }
-}
-
-function sanitizeIncludeFields (fields) {
-  if (!fields || typeof fields !== 'object') return null
-  const clean = {}
-  for (const [key, value] of Object.entries(fields)) {
-    if (value === 1) clean[key] = 1
-  }
-  return Object.keys(clean).length ? clean : null
 }
 
 function summarizeMinerActivity (miners) {

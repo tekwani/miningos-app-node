@@ -7,9 +7,11 @@ const {
   resolveCostParametersForMonth
 } = require('../../../handlers/finance.handlers')
 const { formatDateTime } = require('../mappers')
+const { rollupLocalDays, rollupLocalMonths, poolPctOfNominal, invoicePeriodPoolPctOfNominal } = require('../../../../metrics.utils')
 
-const SECONDS = { hour: 3600, day: 86400 }
+const SECONDS = { hour: 3600 }
 const EXPORT_PRECISION = 3
+const PCT_OF_NOMINAL_PRECISION = 2
 
 const BREAKDOWN_COLUMNS = [
   'year', 'month', 'energyConsumedMwh', 'lcoeUsdPerMwh', 'energyCostsUsd', 'operationalCostUsd',
@@ -48,12 +50,11 @@ function monthName (ts, timezone) {
   return new Intl.DateTimeFormat('en-US', { timeZone: timezone, month: 'long' }).format(new Date(ts))
 }
 
-// The UI rounds every exported figure to 3 decimals; matching it keeps a CSV
-// pulled from the API identical to one saved from the invoice screen.
 function roundRow (row) {
-  return Object.fromEntries(Object.entries(row).map(
-    ([column, value]) => [column, typeof value === 'number' ? Number(value.toFixed(EXPORT_PRECISION)) : value]
-  ))
+  return Object.fromEntries(Object.entries(row).map(([column, value]) => {
+    const precision = column === 'pctOfNominal' ? PCT_OF_NOMINAL_PRECISION : EXPORT_PRECISION
+    return [column, typeof value === 'number' ? Number(value.toFixed(precision)) : value]
+  }))
 }
 
 function num (value) {
@@ -68,7 +69,7 @@ function derive (inputs, fn) {
   return inputs.some((value) => value === null) ? null : fn(...inputs)
 }
 
-function buildHashesEntry ({ type, interval, seconds, filenamePrefix, periodColumns, mapPeriod }) {
+function buildHashesEntry ({ type, interval, seconds, rollup, filenamePrefix, periodColumns, mapPeriod }) {
   return {
     type,
     perms: ['reporting:r'],
@@ -80,18 +81,20 @@ function buildHashesEntry ({ type, interval, seconds, filenamePrefix, periodColu
     assertParams: assertRange,
     async fetchExport (ctx, { params, now, timezone }) {
       const { log } = await getHashrate(ctx, {
-        query: { start: params.start, end: params.end, interval, nominal: true, pool: true }
+        query: { start: params.start, end: params.end, interval, nominal: true, siteNominal: true, pool: true }
       })
+      const buckets = rollup ? rollup(log, timezone) : log
 
       async function * rows () {
-        for (const entry of log) {
+        for (const entry of buckets) {
           const hashrateMhs = num(entry.hashrateMhs)
+          const poolHashrateMhs = num(entry.poolHashrateMhs)
           yield roundRow({
             ...mapPeriod(entry.ts, timezone),
-            hashesDeliveredEh: derive([hashrateMhs], (mhs) => (mhs * seconds) / 1e12),
-            pctOfNominal: num(entry.pctOfNominal),
+            hashesDeliveredEh: derive([poolHashrateMhs], (mhs) => (mhs * (entry.poolSeconds ?? seconds)) / 1e12),
+            pctOfNominal: rollup ? entry.pctOfNominal : poolPctOfNominal([entry]),
             avgMinerHashratePhs: derive([hashrateMhs], (mhs) => mhs / 1e9),
-            avgPoolHashratePhs: derive([num(entry.poolHashrateMhs)], (mhs) => mhs / 1e9)
+            avgPoolHashratePhs: derive([poolHashrateMhs], (mhs) => mhs / 1e9)
           })
         }
       }
@@ -118,12 +121,25 @@ const invoicingHourlyHashes = buildHashesEntry({
 
 const invoicingDailyHashes = buildHashesEntry({
   type: 'invoicing-daily-hashes',
-  interval: '1d',
-  seconds: SECONDS.day,
+  interval: '1h',
+  rollup: rollupLocalDays,
   filenamePrefix: 'invoicing_daily_hashes_',
   periodColumns: ['month', 'day'],
   mapPeriod (ts, timezone) {
     return { month: monthName(ts, timezone), day: dateParts(ts, timezone).day }
+  }
+})
+
+// Same hourly source as the daily export: the site's calendar month cannot be formed
+// from the backend's UTC-aligned daily buckets, so the months are rolled up here.
+const invoicingMonthlyHashes = buildHashesEntry({
+  type: 'invoicing-monthly-hashes',
+  interval: '1h',
+  rollup: rollupLocalMonths,
+  filenamePrefix: 'invoicing_monthly_hashes_',
+  periodColumns: ['year', 'month'],
+  mapPeriod (ts, timezone) {
+    return { year: dateParts(ts, timezone).year, month: monthName(ts, timezone) }
   }
 })
 
@@ -138,17 +154,22 @@ const invoiceBreakdown = {
   assertParams: assertRange,
   async fetchExport (ctx, { params, now, timezone }) {
     const { start, end } = params
+    // localMonth: the caller sends the requested timezone's calendar month and the
+    // invoice is summed from hourly buckets, since daily ones are UTC-aligned and
+    // cannot form a local month. Without it the range is the UTC month the UI has
+    // always sent, read in UTC so a west-of-UTC label timezone does not bill the
+    // month before.
+    const localMonth = params.localMonth === true || params.localMonth === 'true'
+    // The UTC month is cut into UTC days; metrics days otherwise default to the site's zone.
+    const query = localMonth ? { start, end, interval: '1h' } : { start, end, interval: '1d', timezone: 'UTC' }
     const [hashrate, consumption, costParameters, productionCosts] = await Promise.all([
-      getHashrate(ctx, { query: { start, end, interval: '1d', nominal: true } }),
-      getConsumption(ctx, { query: { start, end, interval: '1d' } }),
+      getHashrate(ctx, { query: { ...query, nominal: true, pool: true, siteNominal: true } }),
+      getConsumption(ctx, { query }),
       getCostParameters(ctx),
       getProductionCosts(ctx, start, end)
     ])
 
-    // The invoice month is read in UTC, not in the requested timezone: the UI asks
-    // for exact UTC month bounds and only sends its own timezone to label rows, so
-    // resolving the month locally would bill a west-of-UTC site against the month before.
-    const { year, month } = dateParts(start, 'UTC')
+    const { year, month } = dateParts(start, localMonth ? timezone : 'UTC')
     const resolved = resolveCostParametersForMonth(costParameters, `${year}-${month}`)
     const costs = productionCosts.find(
       (entry) => Number(entry.year) === Number(year) && Number(entry.month) === Number(month)
@@ -160,7 +181,10 @@ const invoiceBreakdown = {
     const lcoeUsdPerMwh = num(resolved.lcoe?.effectiveUsdPerMwh)
     const energyCostsUsd = derive([energyConsumedMwh, lcoeUsdPerMwh], (mwh, lcoe) => mwh * lcoe)
     const operationalCostUsd = num(costs?.operationalCost ?? costs?.operationalCostsUSD)
-    const pctOfNominal = num(hashrate.summary.avgPctOfNominal)
+    // Invoice-month basis: hours without pool data count as zero delivered (see
+    // invoicePeriodPoolPctOfNominal) - the hourly/daily rows above keep the
+    // coverage basis on purpose.
+    const pctOfNominal = invoicePeriodPoolPctOfNominal(hashrate.log)
     const minerAmortizationUsd = num(resolved.minerAmortizationUsd)
     const infraAmortizationUsd = num(resolved.infraAmortizationUsd)
     const amortizationUsd = derive([minerAmortizationUsd, infraAmortizationUsd], (miner, infra) => miner + infra)
@@ -200,4 +224,4 @@ const invoiceBreakdown = {
   }
 }
 
-module.exports = { invoicingHourlyHashes, invoicingDailyHashes, invoiceBreakdown }
+module.exports = { invoicingHourlyHashes, invoicingDailyHashes, invoicingMonthlyHashes, invoiceBreakdown, assertRange }

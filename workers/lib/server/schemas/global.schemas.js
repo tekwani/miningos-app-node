@@ -20,18 +20,15 @@ const schemas = {
         lte: { type: 'integer' },
         lt: { type: 'integer' },
         limit: { type: 'integer' },
+        offset: { type: 'integer' },
         reverse: { type: 'boolean' },
         query: { type: 'string' },
+        sort: { type: 'string' },
+        fields: { type: 'string' },
         groupBy: { type: 'string' },
         overwriteCache: { type: 'boolean' }
       },
       required: ['type']
-    },
-    features: {
-      type: 'object',
-      properties: {
-        overwriteCache: { type: 'boolean' }
-      }
     },
     globalConfig: {
       type: 'object',

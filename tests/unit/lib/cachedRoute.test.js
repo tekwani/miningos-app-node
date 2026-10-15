@@ -1,7 +1,8 @@
 'use strict'
 
 const test = require('brittle')
-const { cachedRoute } = require('../../../workers/lib/server/lib/cachedRoute')
+const LRU = require('lru')
+const { cachedRoute, sweepExpired } = require('../../../workers/lib/server/lib/cachedRoute')
 
 test('cachedRoute - returns cached value', async (t) => {
   const cachedValue = { data: 'cached' }
@@ -250,4 +251,23 @@ test('cachedRoute - overwriteCache bypasses in-flight dedup and refetches', asyn
 
   await inflight
   t.pass()
+})
+
+test('sweepExpired - evicts entries past maxAge and keeps live ones', async (t) => {
+  const cache = new LRU({ max: 100, maxAge: 20 })
+  cache.set('old-1', 1)
+  cache.set('old-2', 2)
+  await new Promise(resolve => setTimeout(resolve, 40))
+  cache.set('live', 3)
+
+  const evicted = sweepExpired({ cache })
+
+  t.is(evicted, 2, 'two expired entries evicted')
+  t.alike(cache.keys, ['live'], 'live entry kept')
+  t.is(cache.get('live'), 3, 'live entry still readable')
+})
+
+test('sweepExpired - tolerates a stopped facility', (t) => {
+  t.is(sweepExpired({}), 0)
+  t.is(sweepExpired(undefined), 0)
 })

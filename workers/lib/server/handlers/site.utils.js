@@ -2,6 +2,7 @@
 
 const { extractKeyEntry, mhsToThs } = require('../../metrics.utils')
 const { WORKER_TAGS } = require('../../constants')
+const lPhases = require('../../phases.utils')
 
 function hsToMhs (hs) {
   return hs / 1000000
@@ -69,6 +70,28 @@ function aggregateContainerCapacity (tailLogResults) {
   return capacity
 }
 
+// Live pool hashrate (MH/s) of the phases that exist only at the pool, summed
+// from the already-fetched minerpool stats. Zero when phases are not configured.
+function sumPoolOnlyPhasesHashrateMhs (ctx, poolDataResults) {
+  const accounts = lPhases.getPoolOnlyAccountKeys(ctx)
+  if (!accounts.size) return 0
+
+  let totalHs = 0
+  for (const orkResult of poolDataResults) {
+    if (!Array.isArray(orkResult)) continue
+    for (const entry of orkResult) {
+      if (!entry || !entry.stats) continue
+      const pools = Array.isArray(entry.stats) ? entry.stats : [entry.stats]
+      for (const pool of pools) {
+        if (!pool || !accounts.has(`${pool.poolType}:${pool.username}`)) continue
+        totalHs += pool.hashrate || 0
+      }
+    }
+  }
+
+  return hsToMhs(totalHs)
+}
+
 // Each ork entry is { ts, stats: [...] }, one object per pool, hashrate in H/s
 function aggregatePoolStats (poolDataResults) {
   const stats = {
@@ -97,15 +120,17 @@ function aggregatePoolStats (poolDataResults) {
 function extractGlobalConfig (globalConfigResults) {
   const config = {
     nominalHashrate: 0,
-    nominalPowerAvailability_MW: 0
+    nominalPowerAvailability_MW: 0,
+    nominalAvailablePowerMWh: 0
   }
 
   for (const orkResult of globalConfigResults) {
     if (!orkResult || typeof orkResult !== 'object') continue
     if (orkResult.nominalHashrate) { config.nominalHashrate = orkResult.nominalHashrate }
-    if (orkResult.nominalPowerAvailability_MW) {
-      config.nominalPowerAvailability_MW =
-        orkResult.nominalPowerAvailability_MW
+    const nominalMW = orkResult.nominalPowerAvailability_MW || orkResult.nominalAvailablePowerMWh
+    if (nominalMW) { config.nominalPowerAvailability_MW = nominalMW }
+    if (orkResult.nominalAvailablePowerMWh) {
+      config.nominalAvailablePowerMWh = orkResult.nominalAvailablePowerMWh
     }
   }
 
@@ -176,7 +201,8 @@ function composeSiteStatus (
   globalConfigResults,
   consumption,
   minerCoolingStatus = null,
-  dcsMinerCapacity = null
+  dcsMinerCapacity = null,
+  poolOnlyHashrateMhs = 0
 ) {
   const minerStats = aggregateMinerStats(tailLogResults)
   const alertStats = aggregateAlertStats(tailLogResults)
@@ -190,7 +216,10 @@ function composeSiteStatus (
 
   const hashrateValue = minerStats.hashrate
   const consumptionW = consumption.powerW
-  const efficiencyWPerTh = calculateSiteEfficiency(hashrateValue, consumptionW)
+  // A pool-only phase's consumption sits inside the site meter while its
+  // hashrate never reaches miner telemetry, so efficiency divides by the
+  // combined hashrate or the site reads worse the moment that phase goes live.
+  const efficiencyWPerTh = calculateSiteEfficiency(hashrateValue + poolOnlyHashrateMhs, consumptionW)
 
   const alertTotal =
     alertStats.critical +
@@ -250,6 +279,7 @@ module.exports = {
   aggregateAlertStats,
   aggregateContainerCapacity,
   aggregatePoolStats,
+  sumPoolOnlyPhasesHashrateMhs,
   extractGlobalConfig,
   computeUtilization,
   getFirstOrkThings,

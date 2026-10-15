@@ -268,3 +268,30 @@ test('UserService - getUser', async (t) => {
 
   t.pass()
 })
+
+test('UserService - bindOAuthSubject binds the first subject and rejects any other', async (t) => {
+  // node:sqlite is built in, so this doesn't depend on the sqlite3 native addon (CI installs with --ignore-scripts)
+  const { DatabaseSync } = require('node:sqlite')
+  const db = new DatabaseSync(':memory:')
+  const sqlite = {
+    execAsync: async (sql) => db.exec(sql),
+    runAsync: async (sql, params = []) => db.prepare(sql).run(...params),
+    getAsync: async (sql, params = []) => db.prepare(sql).get(...params)
+  }
+  const users = { 'bob@acme.com': { id: 7 } }
+  const userService = new UserService({ sqlite, auth: { getUserByEmail: async (email) => users[email] } })
+  await userService.init()
+  await userService.init()
+
+  await userService.bindOAuthSubject('bob@acme.com', 'google', 'sub-1')
+  await userService.bindOAuthSubject('bob@acme.com', 'google', 'sub-1')
+  await userService.bindOAuthSubject('bob@acme.com', 'microsoft', 'oid-1')
+  await t.exception(userService.bindOAuthSubject('bob@acme.com', 'google', 'sub-2'), /ERR_USER_INVALID/)
+
+  await userService.bindOAuthSubject('nobody@acme.com', 'google', 'sub-3')
+  t.is(await sqlite.getAsync('SELECT * FROM oauth_subjects WHERE email = ?', ['nobody@acme.com']), undefined, 'unknown email binds nothing')
+
+  users['bob@acme.com'] = { id: 8 }
+  await userService.bindOAuthSubject('bob@acme.com', 'google', 'sub-2')
+  t.pass('recreated user row rebinds')
+})

@@ -48,7 +48,8 @@ test('constants - GLOBAL_DATA_TYPES', (t) => {
   t.is(GLOBAL_DATA_TYPES.CONTAINER_SETTINGS, 'containerSettings', 'should have CONTAINER_SETTINGS')
   t.is(GLOBAL_DATA_TYPES.COST_PARAMETERS, 'costParameters', 'should have COST_PARAMETERS')
   t.is(GLOBAL_DATA_TYPES.ALERT_PARAMETERS, 'alertParameters', 'should have ALERT_PARAMETERS')
-  t.is(Object.keys(GLOBAL_DATA_TYPES).length, 6, 'should have 6 types')
+  t.is(GLOBAL_DATA_TYPES.POOL_REBATES, 'poolRebates', 'should have POOL_REBATES')
+  t.is(Object.keys(GLOBAL_DATA_TYPES).length, 7, 'should have 7 types')
   t.pass()
 })
 
@@ -72,6 +73,120 @@ test('constants - CUSTOM_ALERT_CONFIG', (t) => {
   t.pass()
 })
 
+test('constants - CUSTOM_ALERT_CONFIG dcs sensor alerts', (t) => {
+  const dcsSensorFields = {
+    'custom.tower_vibration.VS-7581.critical': ['onError'],
+    'custom.tower_vibration.VS-7591.critical': ['onError']
+  }
+
+  for (const [key, fields] of Object.entries(dcsSensorFields)) {
+    const conf = CUSTOM_ALERT_CONFIG[key]
+    t.ok(conf, `${key} should be defined`)
+    t.alike(conf.rackTypes, ['dcs'], `${key} should only apply to dcs rack type`)
+    for (const field of fields) {
+      t.ok(conf.configSchema[field], `${key} configSchema should declare ${field}`)
+    }
+  }
+
+  t.pass()
+})
+
+test('constants - CUSTOM_ALERT_CONFIG group-wide temperature/flow/speed/fancoil_temperature alerts were replaced by per-sensor ones', (t) => {
+  const removedKeys = [
+    'custom.temperature.warning', 'custom.temperature.critical',
+    'custom.flow.warning', 'custom.flow.critical',
+    'custom.speed.warning', 'custom.speed.critical',
+    'custom.fancoil_temperature.warning', 'custom.fancoil_temperature.critical'
+  ]
+  for (const key of removedKeys) {
+    t.absent(CUSTOM_ALERT_CONFIG[key], `${key} should no longer exist`)
+  }
+
+  // Replaced by per-sensor entries, e.g.:
+  t.ok(CUSTOM_ALERT_CONFIG['custom.temperature.TT-7501-A.warning'], 'per-sensor temperature entry should exist')
+  t.ok(CUSTOM_ALERT_CONFIG['custom.flow.FT-7501.warning'], 'per-sensor flow entry should exist')
+  t.ok(CUSTOM_ALERT_CONFIG['custom.speed.V-7501.warning'], 'per-sensor speed entry should exist')
+  t.ok(CUSTOM_ALERT_CONFIG['custom.pump_current.B-7501.warning'], 'per-sensor pump_current entry should exist')
+  t.absent(CUSTOM_ALERT_CONFIG['custom.speed.B-7501.warning'], 'pumps no longer have a speed entry')
+  t.absent(CUSTOM_ALERT_CONFIG['custom.speed.B-7501.critical'], 'pumps no longer have a speed entry')
+  t.ok(CUSTOM_ALERT_CONFIG['custom.fancoil_temperature.FC-7513.warning'], 'per-sensor fancoil_temperature entry should exist')
+
+  t.pass()
+})
+
+test('constants - CUSTOM_ALERT_CONFIG high_differential_pressure/low_tank_level/level were split into per-sensor entries; high_supply_temp/pressure/vibration were dropped', (t) => {
+  const removedKeys = [
+    'custom.high_supply_temp.warning', 'custom.high_supply_temp.critical',
+    'custom.high_differential_pressure.warning', 'custom.high_differential_pressure.critical',
+    'custom.low_tank_level.warning', 'custom.low_tank_level.critical',
+    'custom.level.warning', 'custom.level.critical',
+    'custom.pressure.warning', 'custom.pressure.critical',
+    'custom.vibration.warning', 'custom.vibration.critical',
+    'custom.tower_vibration.critical'
+  ]
+  for (const key of removedKeys) {
+    t.absent(CUSTOM_ALERT_CONFIG[key], `${key} should no longer exist`)
+  }
+
+  t.ok(CUSTOM_ALERT_CONFIG['custom.tower_vibration.VS-7581.critical'], 'per-sensor tower_vibration entry should exist')
+  t.ok(CUSTOM_ALERT_CONFIG['custom.tower_vibration.VS-7591.critical'], 'per-sensor tower_vibration entry should exist')
+
+  // custom.high_supply_temp.* covered TT-7501/TT-7502 sensors, which already
+  // have their own custom.temperature.<tag>.* entries — no replacement needed.
+  t.ok(CUSTOM_ALERT_CONFIG['custom.temperature.TT-7501-A.warning'], 'TT-7501-A already has its own temperature entry')
+
+  t.ok(CUSTOM_ALERT_CONFIG['custom.high_differential_pressure.PT-7501-A.warning'], 'PT-7501-A already has its own differential-pressure entry')
+
+  // custom.high_differential_pressure.* split into one entry per PT sensor.
+  t.ok(CUSTOM_ALERT_CONFIG['custom.high_differential_pressure.PT-7501-A.warning'], 'per-sensor high_differential_pressure entry should exist')
+  t.ok(CUSTOM_ALERT_CONFIG['custom.high_differential_pressure.PT-7502-H.critical'], 'per-sensor high_differential_pressure entry should exist')
+
+  // custom.low_tank_level.* was renamed to embed its sensor tag, then expanded
+  // from just LT-7501 to every levels-group sensor once custom.level.* (its
+  // only remaining source of coverage for LT-7581/LT-7591/TQ-7502) was removed.
+  for (const tag of ['LT-7501', 'LT-7581', 'LT-7591', 'TQ-7502']) {
+    t.ok(CUSTOM_ALERT_CONFIG[`custom.low_tank_level.${tag}.warning`], `per-sensor low_tank_level entry should exist for ${tag}`)
+    t.ok(CUSTOM_ALERT_CONFIG[`custom.low_tank_level.${tag}.critical`], `per-sensor low_tank_level entry should exist for ${tag}`)
+  }
+
+  t.pass()
+})
+
+test('constants - CUSTOM_ALERT_CONFIG miner alerts', (t) => {
+  const minerFields = {
+    'custom.chip_temp.warning': ['lowTemp', 'normalTemp', 'highTemp'],
+    'custom.chip_temp.critical': ['lowTemp', 'normalTemp', 'highTemp'],
+    'custom.low_hashrate.warning': ['lowHashrate'],
+    'custom.low_hashrate.critical': ['lowHashrate'],
+    'custom.low_power.warning': ['lowPower'],
+    'custom.low_power.critical': ['lowPower'],
+    'custom.high_power.warning': ['highPower'],
+    'custom.high_power.critical': ['highPower'],
+    'custom.high_efficiency.warning': ['highEfficiency'],
+    'custom.high_efficiency.critical': ['highEfficiency'],
+    'custom.wrong_miner_pool.warning': [],
+    'custom.wrong_miner_pool.critical': [],
+    'custom.wrong_miner_subaccount.warning': [],
+    'custom.wrong_miner_subaccount.critical': [],
+    'custom.wrong_worker_name.warning': [],
+    'custom.wrong_worker_name.critical': [],
+    'custom.ip_worker_name.warning': [],
+    'custom.ip_worker_name.critical': []
+  }
+
+  for (const [key, fields] of Object.entries(minerFields)) {
+    const conf = CUSTOM_ALERT_CONFIG[key]
+    t.ok(conf, `${key} should be defined`)
+    t.alike(conf.rackTypes, ['miner'], `${key} should only apply to miner rack type`)
+    for (const field of fields) {
+      t.ok(conf.configSchema[field], `${key} configSchema should declare ${field}`)
+    }
+    t.ok(conf.configSchema.notes && conf.configSchema.notes.type === 'string', `${key} configSchema should declare notes`)
+  }
+
+  t.pass()
+})
+
 test('constants - POOL_PROTOCOL', (t) => {
   t.is(POOL_PROTOCOL, 'stratum+tcp', 'should be stratum+tcp')
   t.ok(typeof POOL_PROTOCOL === 'string', 'should be string')
@@ -80,9 +195,8 @@ test('constants - POOL_PROTOCOL', (t) => {
 
 test('constants - MIGRATED_USER_ROLES', (t) => {
   t.ok(typeof MIGRATED_USER_ROLES === 'object', 'should be object')
-  t.is(MIGRATED_USER_ROLES.DEFAULT, 'site_operator', 'should have DEFAULT role')
   t.is(MIGRATED_USER_ROLES.READ_ONLY, 'read_only_user', 'should have READ_ONLY role')
-  t.is(Object.keys(MIGRATED_USER_ROLES).length, 2, 'should have 2 roles')
+  t.is(Object.keys(MIGRATED_USER_ROLES).length, 1, 'should have 1 role')
   t.pass()
 })
 
@@ -135,6 +249,9 @@ test('constants - ENDPOINTS', (t) => {
   t.is(ENDPOINTS.TAIL_LOG, '/auth/tail-log', 'should have tail-log endpoint')
   t.is(ENDPOINTS.LIST_THINGS, '/auth/list-things', 'should have list-things endpoint')
   t.is(ENDPOINTS.WEBSOCKET, '/ws', 'should have websocket endpoint')
+  t.is(ENDPOINTS.ENERGY_FORECAST_OVERRIDE_HISTORY, '/auth/energy/forecast/override-history', 'should have forecast override history endpoint')
+  t.is(ENDPOINTS.ENERGY_AVAILABLE_HISTORY, '/auth/energy/available-history', 'should have available energy history endpoint')
+  t.is(ENDPOINTS.ENERGY_CONSUMPTION, '/auth/energy/consumption', 'should have energy consumption endpoint')
   t.ok(Object.keys(ENDPOINTS).length >= 20, 'should have multiple endpoints')
   t.pass()
 })
@@ -294,4 +411,13 @@ test('constants - COMMENT_ACTION values are strings', (t) => {
   })
 
   t.pass()
+})
+
+test('every fixed-width stat key has a bucket width for the range guard', (t) => {
+  const { LOG_KEYS, TAIL_LOG_BUCKET_MS, TAIL_LOG_UNBUCKETED_KEYS } = require('../../../workers/lib/constants')
+
+  for (const key of Object.values(LOG_KEYS)) {
+    t.ok(TAIL_LOG_BUCKET_MS[key] || TAIL_LOG_UNBUCKETED_KEYS.has(key), `${key} is range checkable`)
+  }
+  t.is(TAIL_LOG_BUCKET_MS[LOG_KEYS.STAT_POSITION_1D], 24 * 60 * 60 * 1000)
 })

@@ -6,7 +6,13 @@ const GLOBAL_DATA_TYPES = {
   FEATURES: 'features',
   SITE_ENERGY: 'siteEnergy',
   CONTAINER_SETTINGS: 'containerSettings',
-  ALERT_PARAMETERS: 'alertParameters'
+  ALERT_PARAMETERS: 'alertParameters',
+  POOL_REBATES: 'poolRebates'
+}
+
+const POOL_REBATE_SOURCES = {
+  AUTO: 'auto',
+  MANUAL: 'manual'
 }
 
 const LCOE_SOURCES = ['current', 'custom']
@@ -17,7 +23,6 @@ const SUPER_ADMIN_ID = '1'
 const SUPER_ADMIN_ROLE = '*'
 
 const MIGRATED_USER_ROLES = {
-  DEFAULT: 'site_operator',
   READ_ONLY: 'read_only_user'
 }
 
@@ -55,6 +60,7 @@ const WORK_ORDER_THING_TYPE = 'inventory-work_order'
 
 const WORK_ORDER_TYPES = { REGISTER: 1, MOVE: 2, MICROBT_MINER: 3, MICROBT_NON_MINER: 4 }
 const WORK_ORDER_TERMINAL_STATUSES = ['closed', 'cancelled']
+const WORK_ORDER_NOTE_KIND = 'note'
 const WORK_ORDER_VALID_DEVICE_TYPES = ['miner', 'psu', 'hashboard', 'controller']
 const MINER_LOCATIONS = ['workshop.warehouse', 'workshop.lab', 'site.warehouse', 'site.lab', 'site.container', 'miner.room', 'vendor', 'emca.container', 'scrapped', 'disposed', 'unknown']
 const MINER_ROOM_LOCATION = 'miner.room'
@@ -68,6 +74,7 @@ const WORK_ORDER_FILE_MAX_BYTES_DEFAULT = 10 * 1024 * 1024
 const WORK_ORDER_FILE_COUNT_CAP_DEFAULT = 20
 const WORK_ORDER_FILE_MIME_ALLOWLIST_DEFAULT = [
   'image/png', 'image/jpeg', 'image/webp', 'image/gif',
+  'image/heic', 'image/heif',
   'application/pdf', 'text/plain', 'text/csv', 'application/json'
 ]
 
@@ -182,6 +189,7 @@ const ENDPOINTS = {
 
   // Metrics endpoints
   METRICS_HASHRATE: '/auth/metrics/hashrate',
+  METRICS_POOL_HASHRATE: '/auth/metrics/pool-hashrate',
   METRICS_CONSUMPTION: '/auth/metrics/consumption',
   METRICS_EFFICIENCY: '/auth/metrics/efficiency',
   METRICS_MINER_STATUS: '/auth/metrics/miner-status',
@@ -195,6 +203,7 @@ const ENDPOINTS = {
   METRICS_POWER_MODE_TIMELINE: '/auth/metrics/power-mode/timeline',
   METRICS_TEMPERATURE: '/auth/metrics/temperature',
   METRICS_COOLING: '/auth/metrics/cooling',
+  METRICS_DOWNTIME: '/auth/metrics/downtime',
   METRICS_CONTAINER_TELEMETRY: '/auth/metrics/containers/:id',
   METRICS_CONTAINER_HISTORY: '/auth/metrics/containers/:id/history',
 
@@ -226,13 +235,17 @@ const ENDPOINTS = {
   ENERGY_FORECAST_HISTORY: '/auth/energy/forecast/history',
   ENERGY_FORECAST_SETTINGS: '/auth/energy/forecast/settings',
   ENERGY_FORECAST_OVERRIDE: '/auth/energy/forecast/override',
+  ENERGY_FORECAST_OVERRIDE_HISTORY: '/auth/energy/forecast/override-history',
   ENERGY_AVAILABLE: '/auth/energy/available',
+  ENERGY_AVAILABLE_HISTORY: '/auth/energy/available-history',
+  ENERGY_CONSUMPTION: '/auth/energy/consumption',
   // Work Order endpoints
   WORK_ORDERS: '/auth/work-orders',
   WORK_ORDERS_BATCH: '/auth/work-orders/batch',
   WORK_ORDER_BY_ID: '/auth/work-orders/:id',
   WORK_ORDER_AUDIT: '/auth/work-orders/:id/audit',
   WORK_ORDER_LOG: '/auth/work-orders/:id/log',
+  WORK_ORDER_NOTES: '/auth/work-orders/:id/notes',
   WORK_ORDER_FILES: '/auth/work-orders/:id/files',
   WORK_ORDER_FILE_BY_ID: '/auth/work-orders/:id/files/:fileId',
   WORK_ORDER_ASSIGN: '/auth/work-orders/:id/assign',
@@ -311,6 +324,12 @@ const DEFAULTS = {
   OPERATION_COUNT: 1
 }
 
+// Fallback site zone when common.json's featureConfig.lockedTimezone isn't set: shown by
+// getFeatureConfig, and resolved by resolveTimezone (metrics.utils.js) for every request
+// that omits `timezone`. That resolved zone cuts all finance/* day and month buckets and
+// metrics/downtime's daily ones. It never reinterprets start/end (always true UTC)
+const LOCKED_TIMEZONE_DEFAULT = 'America/Campo_Grande'
+
 const STATUS_CODES = {
   OK: 200,
   BAD_REQUEST: 400,
@@ -329,6 +348,7 @@ const RPC_METHODS = {
   SET_WRK_EXT_DATA: 'setWrkExtData',
   LIST_THINGS: 'listThings',
   GET_HISTORICAL_LOGS: 'getHistoricalLogs',
+  SAVE_HISTORICAL_LOG: 'saveHistoricalLog',
   TAIL_LOG: 'tailLog',
   TAIL_LOG_MULTI: 'tailLogMulti',
   GLOBAL_CONFIG: 'getGlobalConfig',
@@ -350,6 +370,21 @@ const WORKER_TYPES = {
   DCS: 'dcs-siemens'
 }
 
+// Historical log types owned by specific workers (served via getHistoricalLogs /
+// saveHistoricalLog). 'consumption' lives on the DCS worker.
+const HISTORICAL_LOG_TYPES = {
+  CONSUMPTION: 'consumption'
+}
+
+// Per-hour consumption values (MWh) stored on the DCS worker; mirrors the worker's
+// CONSUMPTION_FIELDS, all required on every entry.
+const CONSUMPTION_FIELDS = [
+  'totalConsumptionMWh',
+  'cduConsumptionMWh',
+  'rectifier1ConsumptionMWh',
+  'rectifier2ConsumptionMWh'
+]
+
 // Spare parts are inventory things tagged t-inventory-miner_part-<type>
 const SPARE_PART_TYPES = ['controller', 'hashboard', 'psu']
 const sparePartTag = (type) => `t-inventory-miner_part-${type}`
@@ -369,7 +404,7 @@ const COOLING_METRICS_AGGR_FIELDS = {
   pumps_running: 1
 }
 
-const SEVERITY_LEVELS = new Set(['critical', 'high', 'medium', 'low'])
+const SEVERITY_LEVELS = new Set(['critical', 'high', 'medium', 'low', 'warning'])
 
 // Rank for severity-aware sorting; higher = more severe, unknown severities rank lowest.
 const SEVERITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 }
@@ -454,7 +489,9 @@ const LOG_KEYS = {
   STAT_3H: 'stat-3h',
   STAT_5M: 'stat-5m',
   STAT_30M: 'stat-30m',
-  STAT_1D: 'stat-1D'
+  STAT_1D: 'stat-1D',
+  STAT_POSITION_1D: 'stat-position-1D',
+  ENERGY_1H: 'energy-1h'
 }
 
 const WORKER_TAGS = {
@@ -730,6 +767,7 @@ const AGGR_FIELDS = {
   TEMP_MAX: 'temperature_c_group_max_aggr',
   TEMP_AVG: 'temperature_c_group_avg_aggr',
   TYPE_CNT: 'type_cnt',
+  MINING_CNT: 'online_or_minor_error_miners_amount_aggr',
   OFFLINE_CNT: 'offline_cnt',
   SLEEP_CNT: 'power_mode_sleep_cnt',
   MAINTENANCE_CNT: 'maintenance_type_cnt',
@@ -767,7 +805,28 @@ const PERIOD_TYPES = {
 const MINERPOOL_EXT_DATA_KEYS = {
   TRANSACTIONS: 'transactions',
   STATS: 'stats',
-  STATS_HISTORY: 'stats-history'
+  STATS_HISTORY: 'stats-history',
+  HASHRATE_HISTORY: 'hashrate-history'
+}
+
+const MEMPOOL_EXT_DATA_KEYS = {
+  POOL_REBATES: 'POOL_REBATES',
+  POOL_REBATES_UPDATE: 'POOL_REBATES_UPDATE',
+  POOL_REBATES_DELETE: 'POOL_REBATES_DELETE',
+  PRICE_AT_TIMESTAMPS: 'PRICE_AT_TIMESTAMPS'
+}
+
+// Payouts are valued at the BTC price recorded for the 5-minute bucket they
+// landed in. Must match the mempool worker's own bucket size.
+const PRICE_BUCKET_MS = 5 * 60 * 1000
+
+// Bucket sizes /auth/metrics/pool-hashrate serves; keys are the wire values of
+// its interval param. stats-history rows arrive every 5 min, so 5m is the floor.
+const POOL_HASHRATE_INTERVALS_MS = {
+  '5m': 5 * 60 * 1000,
+  '30m': 30 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
+  '3h': 3 * 60 * 60 * 1000
 }
 
 const ELECTRICITY_EXT_DATA_KEYS = {
@@ -775,7 +834,9 @@ const ELECTRICITY_EXT_DATA_KEYS = {
   FORECAST_SETTINGS: 'forecastSettings',
   FORECAST_HISTORY: 'forecastHistory',
   AVAIL_ENERGY: 'availableEnergy',
-  FORECAST_OVERRIDE: 'forecastOverride'
+  AVAIL_ENERGY_HISTORY: 'availableEnergyHistory',
+  FORECAST_OVERRIDE: 'forecastOverride',
+  FORECAST_OVERRIDE_HISTORY: 'forecastOverrideHistory'
 }
 
 const NON_METRIC_KEYS = [
@@ -858,7 +919,9 @@ const TAIL_LOG_BUCKET_MS = {
   'stat-5m': 5 * 60 * 1000,
   'stat-30m': 30 * 60 * 1000,
   'stat-3h': 3 * 60 * 60 * 1000,
-  'stat-1D': 24 * 60 * 60 * 1000
+  'stat-1D': 24 * 60 * 60 * 1000,
+  'stat-position-1D': 24 * 60 * 60 * 1000,
+  'energy-1h': 60 * 60 * 1000
 }
 
 // The one stat key with no fixed bucket width: stat-rtd holds the latest sample
@@ -1000,6 +1063,56 @@ const EXPLORER_RACK_DEFAULT_LIMIT = 20
 const EXPLORER_RACK_MAX_LIMIT = 100
 const MICROSOFT_AUTH_SCOPE = ['openid', 'profile', 'email', 'User.Read']
 
+// Generates one CUSTOM_ALERT_CONFIG entry per sensor tag x {warning, critical},
+// mirroring the corresponding group-wide custom.<category>.* entries below but
+// scoped to a single sensor (see miningos-wrk-dcs-siemens/workers/lib/alerts.js
+// perSensorSpecs, which consumes these same custom.<category>.<tag>.<severity>
+// keys). numberFields are the threshold fields beyond enabled/notes.
+const dcsPerSensorAlertConfig = (tags, category, numberFields) => {
+  const entries = {}
+  for (const tag of tags) {
+    for (const severity of ['warning', 'critical']) {
+      entries[`custom.${category}.${tag}.${severity}`] = {
+        configSchema: {
+          enabled: { type: 'boolean' },
+          notes: { type: 'string' },
+          ...Object.fromEntries(numberFields.map((field) => [field, { type: 'number' }]))
+        },
+        rackTypes: ['dcs']
+      }
+    }
+  }
+  return entries
+}
+
+const DCS_TEMPERATURE_SENSOR_TAGS = ['TT-7501-A', 'TT-7501-B', 'TT-7502-A', 'TT-7502-B', 'TT-7581-A', 'TT-7581-B', 'TT-7591-A', 'TT-7591-B', 'TT-7591-C', 'TT-7591-D']
+const DCS_FLOW_SENSOR_TAGS = ['FT-7501', 'FT-7502']
+const DCS_SPEED_SENSOR_TAGS = ['V-7501', 'V-7502']
+const DCS_PUMP_CURRENT_SENSOR_TAGS = ['B-7501', 'B-7502', 'B-7505', 'B-7506', 'B-7509', 'B-7511', 'B-7512', 'B-7513', 'B-7514', 'B-7515', 'B-7516', 'B-7517', 'B-7518']
+const DCS_FANCOIL_SENSOR_TAGS = ['FC-7513', 'FC-7514', 'FC-7515', 'FC-7516', 'FC-7529', 'FC-7530', 'FC-7531', 'FC-7532', 'FC-7534', 'FC-7536']
+const DCS_DIFFERENTIAL_PRESSURE_SENSOR_TAGS = ['PT-7501-A', 'PT-7501-B', 'PT-7501-C', 'PT-7501-D', 'PT-7501-E', 'PT-7501-F', 'PT-7501-G', 'PT-7501-H', 'PT-7502-A', 'PT-7502-B', 'PT-7502-C', 'PT-7502-D', 'PT-7502-E', 'PT-7502-F', 'PT-7502-G', 'PT-7502-H']
+const DCS_LOW_TANK_LEVEL_SENSOR_TAGS = ['LT-7501', 'LT-7581', 'LT-7591', 'TQ-7502']
+const DCS_VIBRATION_SENSOR_TAGS = ['VS-7581', 'VS-7591']
+
+// Per-sensor counterpart of dcsPerSensorAlertConfig for custom.tower_vibration.*:
+// critical-only (no warning tier) and an `onError` boolean gate instead of
+// numeric threshold fields, matching miningos-wrk-dcs-siemens/workers/lib/alerts.js
+// perSensorVibrationSpecs.
+const dcsPerSensorVibrationAlertConfig = (tags) => {
+  const entries = {}
+  for (const tag of tags) {
+    entries[`custom.tower_vibration.${tag}.critical`] = {
+      configSchema: {
+        enabled: { type: 'boolean' },
+        notes: { type: 'string' },
+        onError: { type: 'boolean' }
+      },
+      rackTypes: ['dcs']
+    }
+  }
+  return entries
+}
+
 const CUSTOM_ALERT_CONFIG = {
   'custom.low_hashrate.warning': {
     configSchema: {
@@ -1009,7 +1122,7 @@ const CUSTOM_ALERT_CONFIG = {
       notes: {
         type: 'string'
       },
-      minHashRateMhs: {
+      lowHashrate: {
         type: 'number'
       }
     },
@@ -1023,7 +1136,7 @@ const CUSTOM_ALERT_CONFIG = {
       notes: {
         type: 'string'
       },
-      minHashRateMhs: {
+      lowHashrate: {
         type: 'number'
       }
     },
@@ -1057,90 +1170,6 @@ const CUSTOM_ALERT_CONFIG = {
     },
     rackTypes: ['miner']
   },
-  'custom.high_supply_temp.warning': {
-    configSchema: {
-      enabled: {
-        type: 'boolean'
-      },
-      notes: {
-        type: 'string'
-      },
-      maxTempC: {
-        type: 'number'
-      }
-    },
-    rackTypes: ['dcs']
-  },
-  'custom.high_supply_temp.critical': {
-    configSchema: {
-      enabled: {
-        type: 'boolean'
-      },
-      notes: {
-        type: 'string'
-      },
-      maxTempC: {
-        type: 'number'
-      }
-    },
-    rackTypes: ['dcs']
-  },
-  'custom.high_differential_pressure.warning': {
-    configSchema: {
-      enabled: {
-        type: 'boolean'
-      },
-      notes: {
-        type: 'string'
-      },
-      maxPressureBar: {
-        type: 'number'
-      }
-    },
-    rackTypes: ['dcs']
-  },
-  'custom.high_differential_pressure.critical': {
-    configSchema: {
-      enabled: {
-        type: 'boolean'
-      },
-      notes: {
-        type: 'string'
-      },
-      maxPressureBar: {
-        type: 'number'
-      }
-    },
-    rackTypes: ['dcs']
-  },
-  'custom.low_tank_level.warning': {
-    configSchema: {
-      enabled: {
-        type: 'boolean'
-      },
-      notes: {
-        type: 'string'
-      },
-      minLevelPct: {
-        type: 'number'
-      }
-    },
-    rackTypes: ['dcs']
-  },
-  'custom.low_tank_level.critical': {
-    configSchema: {
-      enabled: {
-        type: 'boolean'
-      },
-      notes: {
-        type: 'string'
-      },
-      minLevelPct: {
-        type: 'number'
-      }
-    },
-    rackTypes: ['dcs']
-  },
   'custom.high_site_power.warning': {
     configSchema: {
       enabled: {
@@ -1169,20 +1198,15 @@ const CUSTOM_ALERT_CONFIG = {
     },
     rackTypes: ['dcs']
   },
-  'custom.tower_vibration.critical': {
-    configSchema: {
-      enabled: {
-        type: 'boolean'
-      },
-      notes: {
-        type: 'string'
-      },
-      onError: {
-        type: 'boolean'
-      }
-    },
-    rackTypes: ['dcs']
-  },
+  ...dcsPerSensorAlertConfig(DCS_TEMPERATURE_SENSOR_TAGS, 'temperature', ['maxTempC']),
+  ...dcsPerSensorAlertConfig(DCS_FLOW_SENSOR_TAGS, 'flow', ['minFlowM3h', 'maxFlowM3h']),
+  ...dcsPerSensorAlertConfig(DCS_SPEED_SENSOR_TAGS, 'speed', ['minSpeedHz', 'maxSpeedHz']),
+  ...dcsPerSensorAlertConfig(DCS_PUMP_CURRENT_SENSOR_TAGS, 'pump_current', ['minCurrentA', 'maxCurrentA']),
+  ...dcsPerSensorAlertConfig(DCS_FANCOIL_SENSOR_TAGS, 'fancoil_temperature', ['minTempC', 'maxTempC']),
+  ...dcsPerSensorAlertConfig(DCS_DIFFERENTIAL_PRESSURE_SENSOR_TAGS, 'high_differential_pressure', ['maxPressureBar']),
+  ...dcsPerSensorAlertConfig(DCS_LOW_TANK_LEVEL_SENSOR_TAGS, 'low_tank_level', ['minLevelPct']),
+  ...dcsPerSensorVibrationAlertConfig(DCS_VIBRATION_SENSOR_TAGS),
+
   'custom.high_site_efficiency.warning': {
     configSchema: {
       enabled: {
@@ -1210,10 +1234,224 @@ const CUSTOM_ALERT_CONFIG = {
       }
     },
     rackTypes: []
+  },
+  'custom.chip_temp.warning': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      },
+      lowTemp: {
+        type: 'number'
+      },
+      normalTemp: {
+        type: 'number'
+      },
+      highTemp: {
+        type: 'number'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.chip_temp.critical': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      },
+      lowTemp: {
+        type: 'number'
+      },
+      normalTemp: {
+        type: 'number'
+      },
+      highTemp: {
+        type: 'number'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.low_power.warning': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      },
+      lowPower: {
+        type: 'number'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.low_power.critical': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      },
+      lowPower: {
+        type: 'number'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.high_power.warning': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      },
+      highPower: {
+        type: 'number'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.high_power.critical': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      },
+      highPower: {
+        type: 'number'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.high_efficiency.warning': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      },
+      highEfficiency: {
+        type: 'number'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.high_efficiency.critical': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      },
+      highEfficiency: {
+        type: 'number'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.wrong_miner_pool.warning': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.wrong_miner_pool.critical': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.wrong_miner_subaccount.warning': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.wrong_miner_subaccount.critical': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.wrong_worker_name.warning': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.wrong_worker_name.critical': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.ip_worker_name.warning': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      }
+    },
+    rackTypes: ['miner']
+  },
+  'custom.ip_worker_name.critical': {
+    configSchema: {
+      enabled: {
+        type: 'boolean'
+      },
+      notes: {
+        type: 'string'
+      }
+    },
+    rackTypes: ['miner']
   }
 }
 
 const POOL_PROTOCOL = 'stratum+tcp'
+const LRU_BUCKETS = ['8s', '10s', '15s', '30s', '1m', '15m']
+const LRU_SWEEP_INTERVAL_MS = 30000
 
 module.exports = {
   SUPER_ADMIN_ROLE,
@@ -1229,6 +1467,9 @@ module.exports = {
   HTTP_METHODS,
   OPERATIONS,
   DEFAULTS,
+  LOCKED_TIMEZONE_DEFAULT,
+  HISTORICAL_LOG_TYPES,
+  CONSUMPTION_FIELDS,
   STATUS_CODES,
   RPC_TIMEOUT,
   RPC_CONCURRENCY_LIMIT,
@@ -1256,6 +1497,10 @@ module.exports = {
   AGGR_FIELDS,
   PERIOD_TYPES,
   MINERPOOL_EXT_DATA_KEYS,
+  MEMPOOL_EXT_DATA_KEYS,
+  PRICE_BUCKET_MS,
+  POOL_REBATE_SOURCES,
+  POOL_HASHRATE_INTERVALS_MS,
   NON_METRIC_KEYS,
   BTC_SATS,
   RANGE_BUCKETS,
@@ -1306,6 +1551,7 @@ module.exports = {
   WORK_ORDER_THING_TYPE,
   WORK_ORDER_TYPES,
   WORK_ORDER_TERMINAL_STATUSES,
+  WORK_ORDER_NOTE_KIND,
   WORK_ORDER_VALID_DEVICE_TYPES,
   MINER_LOCATIONS,
   MINER_ROOM_LOCATION,
@@ -1323,5 +1569,7 @@ module.exports = {
   MINER_MODEL_DISPLAY_NAMES,
   MICROSOFT_AUTH_SCOPE,
   CUSTOM_ALERT_CONFIG,
-  POOL_PROTOCOL
+  POOL_PROTOCOL,
+  LRU_BUCKETS,
+  LRU_SWEEP_INTERVAL_MS
 }

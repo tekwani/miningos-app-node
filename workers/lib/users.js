@@ -6,6 +6,28 @@ class UserService {
     this._sqlite = sqlite
   }
 
+  async init () {
+    await this._sqlite.execAsync('CREATE TABLE IF NOT EXISTS oauth_subjects (userId INTEGER NOT NULL, email TEXT NOT NULL, provider TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY (userId, email, provider))')
+  }
+
+  // First login binds the provider's immutable subject; a later login for the same row and email must present it again
+  async bindOAuthSubject (email, provider, subject) {
+    const user = await this._auth.getUserByEmail(email)
+    if (!user) return
+
+    const key = [user.id, email, provider]
+    await this._sqlite.runAsync('INSERT OR IGNORE INTO oauth_subjects (userId, email, provider, subject) VALUES (?, ?, ?, ?)', [...key, subject])
+    const bound = await this._sqlite.getAsync('SELECT subject FROM oauth_subjects WHERE userId = ? AND email = ? AND provider = ?', key)
+    if (bound.subject !== subject) {
+      throw new Error('ERR_USER_INVALID')
+    }
+  }
+
+  async hasCreatedUsers () {
+    const row = await this._sqlite.getAsync('SELECT seq FROM sqlite_sequence WHERE name = \'users\'')
+    return row?.seq > 1
+  }
+
   parseUserRow (userRow) {
     const { email, roles, name, id, lastActiveAt } = userRow
     const role = JSON.parse(roles)[0]

@@ -82,8 +82,10 @@ test('work.order.export: RMA CSV maps a MicroBT Miner WO to the fixed columns', 
       createdBy: 'op@test',
       closedAt: 1730764800000,
       partsMoves: [
+        { role: 'diagnosis', partCode: 'CB-MAC' },
         { role: 'diagnosis', partCode: 'HB-OLD' },
-        { role: 'replacement', partCode: 'HB-NEW' }
+        { role: 'out', partCode: 'HB-OLD' },
+        { role: 'replacement', partCode: 'HB-NEW', replacesPartCode: 'HB-OLD' }
       ]
     }
   }
@@ -91,7 +93,7 @@ test('work.order.export: RMA CSV maps a MicroBT Miner WO to the fixed columns', 
   t.is(row[0], 'IVI-3-0001', 'Ticket')
   t.is(row[1], 'M63S++_VL28', 'Repaired type')
   t.is(row[2], 'MINER-SN-1', 'Repaired Miner Sn')
-  t.is(row[3], 'HB-OLD', 'Repaired part identifier')
+  t.is(row[3], 'HB-OLD', 'Repaired column shows the removed part, not a diagnosis entry')
   t.is(row[4], 'HB-NEW', 'Replaced part identifier')
   t.is(row[5], 'low hashrate', 'Repaired Analyze')
   t.is(row[6], 'replaced HB', 'Repaired Treatment')
@@ -111,12 +113,89 @@ test('work.order.export: RMA CSV leaves the replaced column empty when no part w
       remarks: 'repaired in place',
       assignedTo: 'eng@test',
       closedAt: 1730764800000,
-      partsMoves: [{ role: 'diagnosis', partCode: 'HB-REPAIRED' }]
+      partsMoves: [
+        { role: 'diagnosis', partCode: 'HB-REPAIRED' },
+        { role: 'out', partCode: 'HB-REPAIRED' }
+      ]
     }
   }
   const row = renderRmaCsv([wo]).trim().split('\r\n')[1].split(',')
   t.is(row[3], 'HB-REPAIRED', 'Repaired part identifier')
   t.is(row[4], '', 'Replaced column stays empty instead of repeating the repaired part')
+})
+
+test('work.order.export: RMA CSV leaves the repaired column empty when only diagnosis moves exist', (t) => {
+  const wo = {
+    code: 'IVI-3-0009',
+    info: {
+      type: 3,
+      deviceModel: 'M63S',
+      deviceIdentifier: 'MINER-SN-9',
+      closedAt: 1730764800000,
+      partsMoves: [
+        { role: 'diagnosis', partCode: 'A0:59:0F:00:04:BE' },
+        { role: 'diagnosis', partCode: 'HB-1' },
+        { role: 'diagnosis', partCode: 'PSU-1' }
+      ]
+    }
+  }
+  const row = renderRmaCsv([wo]).trim().split('\r\n')[1].split(',')
+  t.is(row[3], '', 'diagnosis entries (miner contents) do not leak into the repaired column')
+})
+
+test('work.order.export: RMA CSV falls back to the part whose status changed to repaired', (t) => {
+  const wo = {
+    code: 'IVI-3-0010',
+    info: {
+      type: 3,
+      deviceModel: 'M63S',
+      deviceIdentifier: 'MINER-SN-10',
+      closedAt: 1730764800000,
+      partsMoves: [
+        { role: 'diagnosis', partCode: 'CB-MAC' },
+        { role: 'original', partCode: 'PSU-1', fromStatus: 'faulty', toStatus: 'ok_repaired' }
+      ]
+    }
+  }
+  const row = renderRmaCsv([wo]).trim().split('\r\n')[1].split(',')
+  t.is(row[3], 'PSU-1', 'part switched to repaired fills the repaired column when nothing was removed')
+})
+
+test('work.order.export: RMA CSV prefers the removed part over a repaired-status change', (t) => {
+  const wo = {
+    code: 'IVI-3-0011',
+    info: {
+      type: 3,
+      deviceModel: 'M63S',
+      deviceIdentifier: 'MINER-SN-11',
+      closedAt: 1730764800000,
+      partsMoves: [
+        { role: 'original', partCode: 'HB-2', fromStatus: 'faulty', toStatus: 'ok_repaired' },
+        { role: 'out', partCode: 'PSU-OUT' },
+        { role: 'replacement', partCode: 'PSU-IN', replacesPartCode: 'PSU-OUT' }
+      ]
+    }
+  }
+  const row = renderRmaCsv([wo]).trim().split('\r\n')[1].split(',')
+  t.is(row[3], 'PSU-OUT', 'the out part wins over a status change')
+  t.is(row[4], 'PSU-IN', 'Replaced part identifier')
+})
+
+test('work.order.export: RMA CSV ignores moves that kept an already-repaired status', (t) => {
+  const wo = {
+    code: 'IVI-3-0012',
+    info: {
+      type: 3,
+      deviceModel: 'M63S',
+      deviceIdentifier: 'MINER-SN-12',
+      closedAt: 1730764800000,
+      partsMoves: [
+        { role: 'original', partCode: 'PSU-1', fromStatus: 'ok_repaired', toStatus: 'ok_repaired', fromLocation: 'Repair Room', toLocation: 'Warehouse' }
+      ]
+    }
+  }
+  const row = renderRmaCsv([wo]).trim().split('\r\n')[1].split(',')
+  t.is(row[3], '', 'a location-only move of an already-repaired part does not qualify')
 })
 
 test('work.order.export: RMA CSV takes Repaired Treatment from the work order notes', (t) => {
@@ -167,4 +246,25 @@ test('work.order.export: CSV maps a known miner type slug in the deviceModel col
   const lines = renderWorkOrderCsv(wo).trim().split('\r\n')
   const idx = lines[0].split(',').indexOf('deviceModel')
   t.is(lines[1].split(',')[idx], 'M63S', 'deviceModel column shows the friendly model name')
+})
+
+test('work.order.export: RMA CSV prints the part serial (HB/PSU) or MAC (controller) instead of the MOS code', (t) => {
+  const wo = {
+    code: 'IVI-3-0058',
+    info: {
+      type: 3,
+      partsMoves: [
+        { role: 'original', partId: 'hb-1', partCode: 'HB-WM-M63SPP-739', fromStatus: 'faulty', toStatus: 'ok_repaired' },
+        { role: 'replacement', partId: 'cb-1', partCode: 'CB-WM-1' }
+      ]
+    }
+  }
+  const parts = [
+    { id: 'hb-1', code: 'HB-WM-M63SPP-739', info: { serialNum: 'QAHB01-WM63SPP00802' } },
+    { id: 'cb-1', code: 'CB-WM-1', info: { serialNum: 'CB-SN', macAddress: '00:1A:2B:3C:4D:5E' } }
+  ]
+  const row = renderRmaCsv([wo], parts).trim().split('\r\n')[1].split(',')
+  t.is(row[3], 'QAHB01-WM63SPP00802', 'repaired HB serial, not HB-WM-M63SPP-739')
+  t.is(row[4], '00:1A:2B:3C:4D:5E', 'replaced controller MAC')
+  t.is(renderRmaCsv([wo]).trim().split('\r\n')[1].split(',')[3], 'HB-WM-M63SPP-739', 'falls back to the move code when the part is gone')
 })

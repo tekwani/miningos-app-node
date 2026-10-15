@@ -108,6 +108,7 @@ const list = {
       assignee: { type: 'string', minLength: 1, maxLength: 200 },
       creator: { type: 'string', minLength: 1, maxLength: 200 },
       partId: { type: 'string', minLength: 1, maxLength: 200 },
+      serialNum: { type: 'string', minLength: 1, maxLength: 200 },
       status: { type: 'string', enum: ['open', 'in_progress', 'closed', 'cancelled'] },
       type: types,
       from: { type: 'integer', minimum: 0 },
@@ -223,6 +224,15 @@ const log = {
   }
 }
 
+const notesAppend = {
+  params: byId.params,
+  body: log.body
+}
+
+const notesList = {
+  params: byId.params
+}
+
 const audit = {
   params: byId.params,
   querystring: {
@@ -266,4 +276,4 @@ const exportBulk = {
   querystring: idsQuerystring(8000)
 }
 
-module.exports = { create, createBatch, list, byId, update, close, cancel, reopen, assign, audit, log, export: exportRoute, exportRma, exportBulk }
+module.exports = { create, createBatch, list, byId, update, close, cancel, reopen, assign, audit, log, notesAppend, notesList, export: exportRoute, exportRma, exportBulk }

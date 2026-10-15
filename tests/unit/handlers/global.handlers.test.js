@@ -2,7 +2,7 @@
 
 const test = require('brittle')
 const { getGlobalConfig, setGlobalConfig, getFeatureConfig, getFeatures, setFeatures, getGlobalData, setGlobalData } = require('../../../workers/lib/server/handlers/global.handlers')
-const { GLOBAL_DATA_TYPES } = require('../../../workers/lib/constants')
+const { GLOBAL_DATA_TYPES, LOCKED_TIMEZONE_DEFAULT } = require('../../../workers/lib/constants')
 const { withDataProxy } = require('../helpers/mockHelpers')
 
 test('getGlobalConfig - with fields query param', async (t) => {
@@ -78,6 +78,7 @@ test('setGlobalConfig - basic functionality', async (t) => {
 
 test('getFeatureConfig - returns feature config from context', async (t) => {
   const mockCtx = {
+    globalDataLib: { getGlobalData: async () => ({}) },
     conf: {
       featureConfig: { feature1: true, feature2: false }
     }
@@ -87,6 +88,76 @@ test('getFeatureConfig - returns feature config from context', async (t) => {
   t.ok(typeof result === 'object', 'should return object')
   t.is(result.feature1, true, 'should return feature config')
   t.pass()
+})
+
+test('getFeatureConfig - serves phases without their pool accounts', async (t) => {
+  const phases = [
+    { id: 'phase1', label: 'Phase 1', minerTelemetry: true, consumption: { source: 'remainder' }, pool: { accounts: [{ poolType: 'ocean', username: 'bc1qsite' }] } },
+    { id: 'phase1_5', label: 'Phase 1.5', minerTelemetry: false, groups: { minerType: 'HBM' }, pool: { accounts: [{ poolType: 'ocean', username: 'bc1qacme' }] } }
+  ]
+  const mockCtx = {
+    globalDataLib: { getGlobalData: async () => ({}) },
+    conf: { featureConfig: { phases } }
+  }
+
+  const result = await getFeatureConfig(mockCtx)
+  t.alike(result.phases.map(p => p.id), ['phase1', 'phase1_5'])
+  t.ok(result.phases.every(p => p.pool === undefined), 'pool accounts stay server-side')
+  t.is(result.phases[1].groups.minerType, 'HBM', 'the rest of the phase is intact')
+  t.ok(phases[0].pool, 'config object is not mutated')
+  t.pass()
+})
+
+test('getFeatureConfig - passes through a configured lockedTimezone', async (t) => {
+  const mockCtx = {
+    globalDataLib: { getGlobalData: async () => ({}) },
+    conf: {
+      featureConfig: { lockedTimezone: 'America/Campo_Grande' }
+    }
+  }
+
+  const result = await getFeatureConfig(mockCtx)
+  t.is(result.lockedTimezone, 'America/Campo_Grande')
+  t.pass()
+})
+
+test('getFeatureConfig - defaults lockedTimezone when common.json omits it', async (t) => {
+  const mockCtx = {
+    globalDataLib: { getGlobalData: async () => ({}) },
+    conf: {
+      featureConfig: { feature1: true }
+    }
+  }
+
+  const result = await getFeatureConfig(mockCtx)
+  t.is(result.lockedTimezone, LOCKED_TIMEZONE_DEFAULT)
+  t.is(result.feature1, true, 'other feature flags still pass through')
+  t.pass()
+})
+
+test('getFeatureConfig - defaults lockedTimezone when featureConfig is missing entirely', async (t) => {
+  const mockCtx = { globalDataLib: { getGlobalData: async () => ({}) }, conf: {} }
+
+  const result = await getFeatureConfig(mockCtx)
+  t.is(result.lockedTimezone, LOCKED_TIMEZONE_DEFAULT)
+  t.pass()
+})
+
+test('getFeatureConfig - stored features override site config', async (t) => {
+  const mockCtx = {
+    globalDataLib: {
+      getGlobalData: async (req) => {
+        t.is(req.type, GLOBAL_DATA_TYPES.FEATURES)
+        return { inventory: true, flagOnly: true }
+      }
+    },
+    conf: { featureConfig: { inventory: false, siteOnly: true } }
+  }
+
+  const result = await getFeatureConfig(mockCtx)
+  t.is(result.flagOnly, true, 'flag-only keys are included')
+  t.is(result.inventory, true, 'stored features win on conflicts')
+  t.is(result.siteOnly, true, 'site-only keys still pass through')
 })
 
 test('getFeatures - returns features from globalDataLib', async (t) => {
@@ -204,4 +275,79 @@ test('setGlobalData - basic functionality', async (t) => {
   const result = await setGlobalData(mockCtx, mockReq)
   t.is(result, true, 'should return true')
   t.pass()
+})
+
+// A rebate is worth what BTC cost when it arrived, so that price is captured on
+// the way in rather than re-derived from a daily price whenever it is read back.
+const { priceBucket } = require('../../../workers/lib/server/handlers/finance.utils')
+
+const rebateCtx = (jRequest) => withDataProxy({
+  conf: { orks: [{ rpcPublicKey: 'key1' }] },
+  net_r0: { jRequest },
+  globalDataLib: { setGlobalData: async (data) => data }
+})
+
+test('setGlobalData - a rebate is stored with the BTC price it was received at', async (t) => {
+  const ts = Date.UTC(2024, 0, 15, 10, 32)
+  const bucketTs = priceBucket(ts)
+
+  const stored = await setGlobalData(
+    rebateCtx(async (_key, method, payload) => {
+      if (method === 'getWrkExtData' && payload.query.key === 'PRICE_AT_TIMESTAMPS') {
+        t.alike(payload.query.timestamps, [bucketTs], 'asks for the bucket the rebate landed in')
+        return { prices: { [bucketTs]: 42000 }, missing: [] }
+      }
+      return {}
+    }),
+    { body: { data: { ts, amountBTC: 0.5 } }, query: { type: GLOBAL_DATA_TYPES.POOL_REBATES } }
+  )
+
+  t.is(stored.priceUSD, 42000)
+})
+
+test('setGlobalData - a rebate with no recorded price is still stored', async (t) => {
+  const ts = Date.UTC(2024, 0, 15, 10, 32)
+
+  const stored = await setGlobalData(
+    rebateCtx(async () => ({ prices: {}, missing: [priceBucket(ts)] })),
+    { body: { data: { ts, amountBTC: 0.5 } }, query: { type: GLOBAL_DATA_TYPES.POOL_REBATES } }
+  )
+
+  t.absent(stored.priceUSD, 'a backdated rebate simply has no price yet')
+  t.is(stored.amountBTC, 0.5, 'and the entry itself is never lost over it')
+})
+
+test('setGlobalData - an unreachable price worker does not fail the rebate write', async (t) => {
+  const ts = Date.UTC(2024, 0, 15, 10, 32)
+
+  const stored = await setGlobalData(
+    rebateCtx(async () => { throw new Error('CHANNEL_CLOSED') }),
+    { body: { data: { ts, amountBTC: 0.5 } }, query: { type: GLOBAL_DATA_TYPES.POOL_REBATES } }
+  )
+
+  t.is(stored.amountBTC, 0.5)
+  t.absent(stored.priceUSD)
+})
+
+test('setGlobalData - a client-sent price is discarded, never trusted', async (t) => {
+  const ts = Date.UTC(2024, 0, 15, 10, 32)
+
+  const stored = await setGlobalData(
+    rebateCtx(async () => ({ prices: {}, missing: [] })),
+    { body: { data: { ts, amountBTC: 0.5, priceUSD: 1 } }, query: { type: GLOBAL_DATA_TYPES.POOL_REBATES } }
+  )
+
+  t.absent(stored.priceUSD, 'the price is derived server-side or absent')
+})
+
+test('setGlobalData - removing a rebate skips the price lookup', async (t) => {
+  let asked = false
+
+  const result = await setGlobalData(
+    rebateCtx(async () => { asked = true; return {} }),
+    { body: { data: { ts: 1700006400000, remove: true } }, query: { type: GLOBAL_DATA_TYPES.POOL_REBATES } }
+  )
+
+  t.absent(asked, 'a delete needs no price')
+  t.is(result, true)
 })

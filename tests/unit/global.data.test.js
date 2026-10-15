@@ -597,6 +597,12 @@ test('GlobalDataLib - setCostParametersData rejects invalid values', async funct
     [{ infraAmortizationUsd: 'free' }, 'ERR_INVALID_AMORTIZATION'],
     [{ marginPct: 101 }, 'ERR_INVALID_MARGIN'],
     [{ marginPct: -1 }, 'ERR_INVALID_MARGIN'],
+    [{ capexUsd: -5 }, 'ERR_INVALID_AMORTIZATION'],
+    [{ phases: [] }, 'ERR_INVALID_PHASES'],
+    [{ phases: { phase1_5: 400 } }, 'ERR_INVALID_PHASES'],
+    [{ phases: { phase1_5: { capexUsd: -1 } } }, 'ERR_INVALID_AMORTIZATION'],
+    [{ year: 2026, month: 1, phases: { phase1_5: { capexUsd: 400 } } }, 'ERR_INVALID_PHASES'],
+    [{ commissionedAt: 1.5 }, 'ERR_INVALID_COMMISSIONED_AT'],
     [{ lcoe: 'cheap' }, 'ERR_INVALID_LCOE'],
     [{ lcoe: { source: 'guess' } }, 'ERR_INVALID_LCOE_SOURCE'],
     [{ lcoe: { source: 'current', customUsdPerMwh: -5 } }, 'ERR_INVALID_LCOE_COST'],
@@ -674,6 +680,11 @@ test('GlobalDataLib - cost parameters round-trip through a real hyperbee', async
   await globalDataLib.setGlobalData({ marginPct: 12 }, GLOBAL_DATA_TYPES.COST_PARAMETERS)
   const overwritten = await globalDataLib.getGlobalData({ type: GLOBAL_DATA_TYPES.COST_PARAMETERS })
   t.alike(overwritten, { marginPct: 12, site: 'test-site' }, 'a later save replaces the singleton')
+
+  await globalDataLib.setGlobalData({ marginPct: 12, phases: { phase1_5: { capexUsd: 400 } } }, GLOBAL_DATA_TYPES.COST_PARAMETERS)
+  await globalDataLib.setGlobalData({ marginPct: 10, capexUsd: 1000 }, GLOBAL_DATA_TYPES.COST_PARAMETERS)
+  const keptPhases = await globalDataLib.getGlobalData({ type: GLOBAL_DATA_TYPES.COST_PARAMETERS })
+  t.alike(keptPhases.phases, { phase1_5: { capexUsd: 400 } }, 'a save without phases keeps the stored per-phase capex')
 
   const missing = await new GlobalDataLib(bee, 'test-site').getGlobalData({ type: GLOBAL_DATA_TYPES.FEATURES })
   t.alike(missing, {}, 'an unwritten singleton type still reads as empty')
@@ -802,4 +813,39 @@ test('GlobalDataLib - override payloads are validated like the base payload', as
   t.is(await set({ year: 2026, month: 8, marginPct: 10 }), true, 'a valid override saves')
 
   t.pass()
+})
+
+test('GlobalDataLib - poolRebates rows are put by ts, removed with remove:true, and validated', async function (t) {
+  const txid = 'a'.repeat(64)
+  const subs = new Map()
+  const bee = {
+    sub: (name) => {
+      if (!subs.has(name)) {
+        const rows = new Map()
+        subs.set(name, {
+          rows,
+          get: async (k) => rows.has(k.toString('hex')) ? { value: rows.get(k.toString('hex')) } : null,
+          put: async (k, v) => rows.set(k.toString('hex'), v),
+          del: async (k) => rows.delete(k.toString('hex')),
+          createReadStream: () => (async function * () {
+            for (const v of rows.values()) yield { value: Buffer.from(v) }
+          })()
+        })
+      }
+      return subs.get(name)
+    }
+  }
+  const globalDataLib = new GlobalDataLib(bee, 'test-site')
+  const set = (data) => globalDataLib.setGlobalData(data, GLOBAL_DATA_TYPES.POOL_REBATES)
+  const rebateRows = () => [...subs.get(GLOBAL_DATA_TYPES.POOL_REBATES).rows.values()].map(JSON.parse)
+
+  await set({ ts: 1700006400000, amountBTC: 0.5, txid })
+  t.alike(rebateRows()[0], { site: 'test-site', ts: 1700006400000, amountBTC: 0.5, txid, source: 'manual' })
+
+  await set({ ts: 1700006400000, remove: true })
+  t.is(rebateRows().length, 0)
+
+  await t.exception(() => set({ ts: 1.5, amountBTC: 1 }), /ERR_INVALID_TS/)
+  await t.exception(() => set({ ts: 1700006400000, amountBTC: 0 }), /ERR_INVALID_AMOUNT/)
+  await t.exception(() => set({ ts: 1700006400000, amountBTC: 1, txid: 'abc' }), /ERR_INVALID_TXID/)
 })

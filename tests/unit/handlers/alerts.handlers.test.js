@@ -8,6 +8,9 @@ const {
   getAlertParams,
   setAlertParams,
   restrictToNotesOnly,
+  getThresholdFields,
+  assertEnabledParamsAreSet,
+  dropUnknownAlertKeys,
   extractAlertsFromThings,
   matchesSearch,
   applySort,
@@ -40,7 +43,7 @@ test('getAlertParams - reads params from globalDataLib by type', async (t) => {
     globalDataLib: {
       getGlobalData: async (req) => {
         capturedReq = req
-        return { 'custom.low_hashrate.warning': { enabled: true, minHashRateMhs: 50 } }
+        return { 'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50 } }
       }
     }
   }
@@ -48,7 +51,7 @@ test('getAlertParams - reads params from globalDataLib by type', async (t) => {
   const result = await getAlertParams(mockCtx)
 
   t.is(capturedReq.type, GLOBAL_DATA_TYPES.ALERT_PARAMETERS, 'should query the alertParameters global data type')
-  t.alike(result, { 'custom.low_hashrate.warning': { enabled: true, minHashRateMhs: 50 } })
+  t.alike(result, { 'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50 } })
 })
 
 test('setAlertParams - persists to globalDataLib and notifies orks grouped by rack type', async (t) => {
@@ -74,8 +77,8 @@ test('setAlertParams - persists to globalDataLib and notifies orks grouped by ra
     _info: { authToken: 'token' },
     body: {
       data: {
-        'custom.low_hashrate.warning': { enabled: true, minHashRateMhs: 50 },
-        'custom.high_supply_temp.critical': { enabled: true, maxTempC: 90 }
+        'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50 },
+        'custom.high_differential_pressure.PT-7501-A.critical': { enabled: true, maxPressureBar: 3 }
       }
     }
   }
@@ -91,8 +94,8 @@ test('setAlertParams - persists to globalDataLib and notifies orks grouped by ra
   t.is(captured[0].method, 'setAlertParams', 'should call setAlertParams on the ork')
   t.alike(captured[0].params, {
     byRackType: {
-      miner: { 'custom.low_hashrate.warning': { enabled: true, minHashRateMhs: 50 } },
-      dcs: { 'custom.high_supply_temp.critical': { enabled: true, maxTempC: 90 } }
+      miner: { 'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50 } },
+      dcs: { 'custom.high_differential_pressure.PT-7501-A.critical': { enabled: true, maxPressureBar: 3 } }
     }
   }, 'should group params by each alert key\'s rackTypes')
 })
@@ -126,6 +129,38 @@ test('setAlertParams - skips unknown alert keys when grouping by rack type', asy
   t.alike(captured[0].params, { byRackType: {} }, 'unknown alert key contributes nothing to byRackType')
 })
 
+test('setAlertParams - does not persist unknown alert keys to globalDataLib', async (t) => {
+  let capturedData
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: { jRequest: async () => ({ ok: true }) },
+    authLib: { tokenHasPerms: async () => true },
+    globalDataLib: {
+      setGlobalData: async (data, type) => {
+        capturedData = data
+        return { data, type }
+      }
+    }
+  })
+
+  const mockReq = {
+    _info: { authToken: 'token' },
+    body: {
+      data: {
+        'custom.totally_made_up.warning': { enabled: true, notes: 'sneaky' },
+        'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50 }
+      }
+    }
+  }
+
+  const result = await setAlertParams(mockCtx, mockReq)
+
+  t.alike(capturedData, {
+    'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50 }
+  }, 'unknown alert key is dropped before reaching globalDataLib.setGlobalData')
+  t.alike(result.data, capturedData, 'returned result reflects the filtered data')
+})
+
 test('setAlertParams - fans a single alert key out to all of its rack types', async (t) => {
   const captured = []
   const mockCtx = withDataProxy({
@@ -146,7 +181,7 @@ test('setAlertParams - fans a single alert key out to all of its rack types', as
   const mockReq = {
     _info: { authToken: 'token' },
     body: {
-      data: { 'custom.tower_vibration.critical': { enabled: true, onError: true } }
+      data: { 'custom.tower_vibration.VS-7581.critical': { enabled: true, onError: true } }
     }
   }
 
@@ -155,9 +190,175 @@ test('setAlertParams - fans a single alert key out to all of its rack types', as
 
   t.alike(captured[0], {
     byRackType: {
-      dcs: { 'custom.tower_vibration.critical': { enabled: true, onError: true } }
+      dcs: { 'custom.tower_vibration.VS-7581.critical': { enabled: true, onError: true } }
     }
   })
+})
+
+test('setAlertParams - fans out a multi-field dcs alert added for configurable sensors', async (t) => {
+  const captured = []
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (pk, method, params) => {
+        captured.push(params)
+        return { ok: true }
+      }
+    },
+    authLib: { tokenHasPerms: async () => true },
+    globalDataLib: {
+      setGlobalData: async (data, type) => ({ data, type })
+    }
+  })
+
+  const mockReq = {
+    _info: { authToken: 'token' },
+    body: {
+      data: { 'custom.pump_current.B-7501.critical': { enabled: true, minCurrentA: 10, maxCurrentA: 60 } }
+    }
+  }
+
+  await setAlertParams(mockCtx, mockReq)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  t.alike(captured[0], {
+    byRackType: {
+      dcs: { 'custom.pump_current.B-7501.critical': { enabled: true, minCurrentA: 10, maxCurrentA: 60 } }
+    }
+  }, 'should group the new dcs sensor alert under dcs')
+})
+
+test('setAlertParams - fans out a miner-only alert with no extra threshold fields', async (t) => {
+  const captured = []
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (pk, method, params) => {
+        captured.push(params)
+        return { ok: true }
+      }
+    },
+    authLib: { tokenHasPerms: async () => true },
+    globalDataLib: {
+      setGlobalData: async (data, type) => ({ data, type })
+    }
+  })
+
+  const mockReq = {
+    _info: { authToken: 'token' },
+    body: {
+      data: { 'custom.wrong_miner_pool.warning': { enabled: true, notes: 'pool mismatch' } }
+    }
+  }
+
+  await setAlertParams(mockCtx, mockReq)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  t.alike(captured[0], {
+    byRackType: {
+      miner: { 'custom.wrong_miner_pool.warning': { enabled: true, notes: 'pool mismatch' } }
+    }
+  }, 'should group the new miner-only alert under miner and nowhere else')
+})
+
+test('setAlertParams - respects the submitted enabled flag', async (t) => {
+  const captured = []
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (pk, method, params) => {
+        captured.push(params)
+        return { ok: true }
+      }
+    },
+    authLib: { tokenHasPerms: async () => true },
+    globalDataLib: {
+      setGlobalData: async (data, type) => ({ data, type })
+    }
+  })
+
+  const mockReq = {
+    _info: { authToken: 'token' },
+    body: {
+      data: {
+        // UI says disabled, threshold is fully configured -> stays disabled
+        'custom.low_hashrate.warning': { enabled: false, lowHashrate: 50 },
+        // UI says disabled, no configurable threshold at all -> stays disabled
+        'custom.wrong_miner_pool.warning': { enabled: false, notes: 'pool mismatch' }
+      }
+    }
+  }
+
+  const result = await setAlertParams(mockCtx, mockReq)
+
+  t.alike(result.data, {
+    'custom.low_hashrate.warning': { enabled: false, lowHashrate: 50 },
+    'custom.wrong_miner_pool.warning': { enabled: false, notes: 'pool mismatch' }
+  }, 'submitted enabled value is kept as-is')
+
+  await new Promise((resolve) => setImmediate(resolve))
+
+  t.alike(captured[0], {
+    byRackType: {
+      miner: {
+        'custom.low_hashrate.warning': { enabled: false, lowHashrate: 50 },
+        'custom.wrong_miner_pool.warning': { enabled: false, notes: 'pool mismatch' }
+      }
+    }
+  }, 'orks are notified with the submitted enabled values')
+})
+
+test('setAlertParams - throws when enabling an alert whose threshold is missing', async (t) => {
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: { jRequest: async () => ({ ok: true }) },
+    authLib: { tokenHasPerms: async () => true },
+    globalDataLib: {
+      setGlobalData: async (data, type) => ({ data, type })
+    }
+  })
+
+  const mockReq = {
+    _info: { authToken: 'token' },
+    body: {
+      data: {
+        'custom.low_hashrate.critical': { enabled: true }
+      }
+    }
+  }
+
+  await t.exception(
+    () => setAlertParams(mockCtx, mockReq),
+    /ERR_ALERT_PARAMS_REQUIRED/,
+    'rejects enabling an alert with no threshold configured'
+  )
+})
+
+test('setAlertParams - throws when enabling a multi-threshold alert with only one threshold set', async (t) => {
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: { jRequest: async () => ({ ok: true }) },
+    authLib: { tokenHasPerms: async () => true },
+    globalDataLib: {
+      setGlobalData: async (data, type) => ({ data, type })
+    }
+  })
+
+  // custom.pump_current.B-7501.critical has two threshold fields: minCurrentA and maxCurrentA
+  const mockReq = {
+    _info: { authToken: 'token' },
+    body: {
+      data: {
+        'custom.pump_current.B-7501.critical': { enabled: true, minCurrentA: 10 } // maxCurrentA missing
+      }
+    }
+  }
+
+  await t.exception(
+    () => setAlertParams(mockCtx, mockReq),
+    /ERR_ALERT_PARAMS_REQUIRED/,
+    'rejects enabling when only one of two thresholds is configured'
+  )
 })
 
 test('setAlertParams - restricts users without alert_config_sensitive:w to updating notes only', async (t) => {
@@ -179,8 +380,8 @@ test('setAlertParams - restricts users without alert_config_sensitive:w to updat
     },
     globalDataLib: {
       getGlobalData: async () => ([{
-        'custom.low_hashrate.warning': { enabled: true, minHashRateMhs: 50, notes: 'old notes' },
-        'custom.high_supply_temp.critical': { enabled: false, maxTempC: 80, notes: 'other' }
+        'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50, notes: 'old notes' },
+        'custom.high_differential_pressure.PT-7501-A.critical': { enabled: false, maxPressureBar: 3, notes: 'other' }
       }]),
       setGlobalData: async (data, type) => ({ data, type })
     }
@@ -190,7 +391,7 @@ test('setAlertParams - restricts users without alert_config_sensitive:w to updat
     _info: { authToken: 'token' },
     body: {
       data: {
-        'custom.low_hashrate.warning': { enabled: false, minHashRateMhs: 999, notes: 'new notes' }
+        'custom.low_hashrate.warning': { enabled: false, lowHashrate: 999, notes: 'new notes' }
       }
     }
   }
@@ -201,32 +402,106 @@ test('setAlertParams - restricts users without alert_config_sensitive:w to updat
   t.alike(capturedPerms.perms, ['alert_config_sensitive:w'], 'should check the sensitive alert config permission')
 
   t.alike(result.data, {
-    'custom.low_hashrate.warning': { enabled: true, minHashRateMhs: 50, notes: 'new notes' }
+    'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50, notes: 'new notes' }
   }, 'should keep existing fields and only apply the submitted notes')
 
   await new Promise((resolve) => setImmediate(resolve))
 
   t.alike(captured[0], {
     byRackType: {
-      miner: { 'custom.low_hashrate.warning': { enabled: true, minHashRateMhs: 50, notes: 'new notes' } }
+      miner: { 'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50, notes: 'new notes' } }
     }
   }, 'should notify orks with the notes-only merged config')
 })
 
+// ==================== getThresholdFields / assertEnabledParamsAreSet Tests ====================
+
+test('getThresholdFields - alert with no configurable threshold has none', (t) => {
+  t.alike(getThresholdFields('custom.wrong_miner_pool.warning'), [], 'only enabled/notes in configSchema -> no threshold fields')
+})
+
+test('getThresholdFields - excludes enabled/notes, keeps the real threshold fields', (t) => {
+  t.alike(getThresholdFields('custom.low_hashrate.warning'), ['lowHashrate'])
+  t.alike(getThresholdFields('custom.pump_current.B-7501.critical'), ['minCurrentA', 'maxCurrentA'])
+})
+
+test('getThresholdFields - unknown alert key has no known thresholds', (t) => {
+  t.alike(getThresholdFields('custom.unknown_alert'), [])
+})
+
+test('assertEnabledParamsAreSet - alert without thresholds can always be enabled', async (t) => {
+  await t.execution(() => assertEnabledParamsAreSet({ 'custom.wrong_miner_pool.warning': { enabled: true } }))
+})
+
+test('assertEnabledParamsAreSet - disabled alerts are never checked, even with missing thresholds', async (t) => {
+  await t.execution(() => assertEnabledParamsAreSet({ 'custom.low_hashrate.warning': { enabled: false } }))
+})
+
+test('assertEnabledParamsAreSet - single-threshold alert requires its threshold to enable', async (t) => {
+  await t.execution(() => assertEnabledParamsAreSet({ 'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50 } }))
+  await t.execution(() => assertEnabledParamsAreSet({ 'custom.low_hashrate.warning': { enabled: true, lowHashrate: 0 } }), 'threshold of 0 still counts as set')
+
+  await t.exception(() => assertEnabledParamsAreSet({ 'custom.low_hashrate.warning': { enabled: true } }), /ERR_ALERT_PARAMS_REQUIRED/)
+  await t.exception(() => assertEnabledParamsAreSet({ 'custom.low_hashrate.warning': { enabled: true, lowHashrate: undefined } }), /ERR_ALERT_PARAMS_REQUIRED/)
+  await t.exception(() => assertEnabledParamsAreSet({ 'custom.low_hashrate.warning': { enabled: true, lowHashrate: null } }), /ERR_ALERT_PARAMS_REQUIRED/)
+})
+
+test('assertEnabledParamsAreSet - multi-threshold alert requires every threshold field to enable', async (t) => {
+  await t.execution(() => assertEnabledParamsAreSet({ 'custom.pump_current.B-7501.critical': { enabled: true, minCurrentA: 10, maxCurrentA: 60 } }))
+  await t.exception(() => assertEnabledParamsAreSet({ 'custom.pump_current.B-7501.critical': { enabled: true, minCurrentA: 10 } }), /ERR_ALERT_PARAMS_REQUIRED/)
+  await t.exception(() => assertEnabledParamsAreSet({ 'custom.pump_current.B-7501.critical': { enabled: true } }), /ERR_ALERT_PARAMS_REQUIRED/)
+})
+
+test('assertEnabledParamsAreSet - notes is never treated as a threshold', async (t) => {
+  await t.exception(() => assertEnabledParamsAreSet({ 'custom.low_hashrate.warning': { enabled: true, notes: 'some notes' } }), /ERR_ALERT_PARAMS_REQUIRED/)
+  await t.execution(() => assertEnabledParamsAreSet({ 'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50, notes: 'some notes' } }))
+})
+
+test('assertEnabledParamsAreSet - unknown alert key has no known thresholds, so it can always be enabled', async (t) => {
+  await t.execution(() => assertEnabledParamsAreSet({ 'custom.unknown_alert': { enabled: true } }))
+})
+
+test('assertEnabledParamsAreSet - only boolean true is gated', async (t) => {
+  await t.execution(
+    () => assertEnabledParamsAreSet({ 'custom.low_hashrate.warning': { enabled: 1 } }),
+    'enabled: 1 is not treated as enabled, so missing thresholds are ignored'
+  )
+  await t.execution(
+    () => assertEnabledParamsAreSet({ 'custom.low_hashrate.warning': { enabled: 1, lowHashrate: 50 } }),
+    'enabled: 1 is fine even with a threshold set'
+  )
+})
+
+test('dropUnknownAlertKeys - keeps only keys present in CUSTOM_ALERT_CONFIG', (t) => {
+  const result = dropUnknownAlertKeys({
+    'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50 },
+    'custom.totally_made_up.warning': { enabled: true },
+    not_even_an_alert_key: 'x'
+  })
+
+  t.alike(result, {
+    'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50 }
+  }, 'unknown keys are dropped, known keys pass through unchanged')
+})
+
+test('dropUnknownAlertKeys - empty input stays empty', (t) => {
+  t.alike(dropUnknownAlertKeys({}), {})
+})
+
 test('restrictToNotesOnly - drops every submitted field except notes', (t) => {
   const submittedData = {
-    'custom.low_hashrate.warning': { enabled: false, minHashRateMhs: 999, notes: 'new notes' },
+    'custom.low_hashrate.warning': { enabled: false, lowHashrate: 999, notes: 'new notes' },
     // no matching entry in existingConfig for this key
     'custom.unknown_alert': { enabled: true, threshold: 123, notes: 'unknown notes' }
   }
   const existingConfig = {
-    'custom.low_hashrate.warning': { enabled: true, minHashRateMhs: 50, notes: 'old notes' }
+    'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50, notes: 'old notes' }
   }
 
   const result = restrictToNotesOnly(submittedData, existingConfig)
 
   t.alike(result, {
-    'custom.low_hashrate.warning': { enabled: true, minHashRateMhs: 50, notes: 'new notes' },
+    'custom.low_hashrate.warning': { enabled: true, lowHashrate: 50, notes: 'new notes' },
     'custom.unknown_alert': { notes: 'unknown notes' }
   }, 'submitted enabled/threshold values are ignored; only notes carries through, existing fields win everywhere else')
 })
@@ -438,6 +713,19 @@ test('buildSeveritySummary - empty alerts', (t) => {
   t.is(result.critical, 0, 'critical should be 0')
 })
 
+test('buildSeveritySummary - counts warning severity', (t) => {
+  const alerts = [
+    { severity: 'critical' },
+    { severity: 'warning' },
+    { severity: 'warning' }
+  ]
+
+  const result = buildSeveritySummary(alerts)
+  t.is(result.warning, 2, 'should count warning')
+  t.is(result.critical, 1, 'should count critical')
+  t.is(result.total, 3, 'should count total')
+})
+
 // ==================== deduplicateAlerts Tests ====================
 
 test('deduplicateAlerts - removes duplicates by uuid', (t) => {
@@ -510,7 +798,7 @@ test('getSiteAlerts - happy path', async (t) => {
   t.is(result.summary.miner.high, 1, 'should count 1 high under miner')
   t.is(result.summary.miner.low, 1, 'should count 1 low under miner')
   t.is(result.summary.miner.total, 3, 'miner total covers all alerts')
-  t.alike(result.summary.operational, { critical: 0, high: 0, medium: 0, low: 0, total: 0 }, 'operational bucket present and empty')
+  t.alike(result.summary.operational, { critical: 0, high: 0, medium: 0, low: 0, warning: 0, total: 0 }, 'operational bucket present and empty')
 })
 
 test('getSiteAlerts - empty results', async (t) => {
@@ -525,8 +813,8 @@ test('getSiteAlerts - empty results', async (t) => {
   t.is(result.total, 0, 'should have 0 total')
   t.is(result.alerts.length, 0, 'should have empty alerts')
   t.alike(result.summary, {
-    operational: { critical: 0, high: 0, medium: 0, low: 0, total: 0 },
-    miner: { critical: 0, high: 0, medium: 0, low: 0, total: 0 }
+    operational: { critical: 0, high: 0, medium: 0, low: 0, warning: 0, total: 0 },
+    miner: { critical: 0, high: 0, medium: 0, low: 0, warning: 0, total: 0 }
   }, 'both summary buckets present and zeroed')
 })
 
@@ -1227,8 +1515,8 @@ test('buildSiteAlertsSummary - splits miner family from operational', (t) => {
   ]
 
   const result = buildSiteAlertsSummary(alerts)
-  t.alike(result.miner, { critical: 1, high: 1, medium: 0, low: 0, total: 2 }, 'miner + subtype counted under miner')
-  t.alike(result.operational, { critical: 1, high: 0, medium: 1, low: 1, total: 3 }, 'non-miner types counted under operational')
+  t.alike(result.miner, { critical: 1, high: 1, medium: 0, low: 0, warning: 0, total: 2 }, 'miner + subtype counted under miner')
+  t.alike(result.operational, { critical: 1, high: 0, medium: 1, low: 1, warning: 0, total: 3 }, 'non-miner types counted under operational')
 })
 
 test('buildSiteAlertsSummary - alert without type falls under operational', (t) => {
@@ -1237,12 +1525,23 @@ test('buildSiteAlertsSummary - alert without type falls under operational', (t) 
   t.is(result.miner.total, 0, 'miner bucket untouched')
 })
 
+test('buildSiteAlertsSummary - counts warning severity per bucket', (t) => {
+  const alerts = [
+    { type: 'site', severity: 'warning' },
+    { type: 'miner', severity: 'warning' }
+  ]
+
+  const result = buildSiteAlertsSummary(alerts)
+  t.is(result.operational.warning, 1, 'warning counted under operational')
+  t.is(result.miner.warning, 1, 'warning counted under miner')
+})
+
 // ==================== summary over the full set (ignores filter/search/type) ====================
 
 test('getSiteAlerts - summary ignores filter, search and type params', async (t) => {
   const fullSummary = {
-    operational: { critical: 1, high: 0, medium: 1, low: 0, total: 2 },
-    miner: { critical: 0, high: 1, medium: 0, low: 1, total: 2 }
+    operational: { critical: 1, high: 0, medium: 1, low: 0, warning: 0, total: 2 },
+    miner: { critical: 0, high: 1, medium: 0, low: 1, warning: 0, total: 2 }
   }
   const queries = [
     {},
@@ -1321,6 +1620,8 @@ test('getSiteAlerts - creates critical and warning alerts when site efficiency e
   t.is(bySeverity.critical.type, 'site', 'site-level alert has no device type')
   t.is(bySeverity.critical.description, 'High Site Efficiency detected', 'description is the short, fixed copy')
   t.is(bySeverity.critical.message, 'Site efficiency 100000.00 W/TH/s (max 50000 W/TH/s)', 'message reports efficiency to 2 decimal places')
+  t.is(result.summary.operational.warning, 1, 'warning tier is counted in the summary')
+  t.is(result.summary.operational.critical, 1, 'critical tier is counted in the summary')
 })
 
 test('getSiteAlerts - formats a fractional efficiency to 2 decimal places in the message', async (t) => {

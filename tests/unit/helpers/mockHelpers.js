@@ -46,10 +46,25 @@ const buildDataProxy = (orks = [], jRequestImpl = async () => ({})) => {
   }
 }
 
+// Defaults featureConfig.lockedTimezone to 'UTC' unless the test sets its own, since
+// resolveTimezone now falls back to it (then LOCKED_TIMEZONE_DEFAULT) whenever a test
+// doesn't pass `timezone` explicitly - without this default, every mock ctx would
+// silently pick up LOCKED_TIMEZONE_DEFAULT ('America/Campo_Grande') and shift response
+// ts / day-bucketed values in tests that were never about timezones at all.
 const withDataProxy = (ctx) => {
   const orks = ctx.conf?.orks || []
   const jRequestImpl = ctx.net_r0?.jRequest || (async () => ({}))
-  return { ...ctx, dataProxy: buildDataProxy(orks, jRequestImpl) }
+  return {
+    ...ctx,
+    conf: {
+      ...ctx.conf,
+      featureConfig: {
+        lockedTimezone: 'UTC',
+        ...ctx.conf?.featureConfig
+      }
+    },
+    dataProxy: buildDataProxy(orks, jRequestImpl)
+  }
 }
 
 const createMockCtxWithOrks = (orks = [{ rpcPublicKey: 'key1' }], jRequestImpl = async () => ({})) => {

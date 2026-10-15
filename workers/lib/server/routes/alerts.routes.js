@@ -12,7 +12,7 @@ const {
   getAlertParams,
   setAlertParams
 } = require('../handlers/alerts.handlers')
-const { createAuthRoute, createCachedAuthRoute } = require('../lib/routeHelpers')
+const { createAuthRoute, createCachedAuthRoute, rejectTimezone } = require('../lib/routeHelpers')
 
 module.exports = (ctx) => {
   const schemas = require('../schemas/alerts.schemas.js')
@@ -79,6 +79,7 @@ module.exports = (ctx) => {
     {
       method: HTTP_METHODS.GET,
       url: ENDPOINTS.ALERTS_HISTORY,
+      preValidation: rejectTimezone(),
       schema: {
         querystring: schemas.query.alertsHistory
       },

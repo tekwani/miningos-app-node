@@ -22,16 +22,21 @@ const {
   processHourlyRevenues,
   calculateRevenueSummary,
   getRevenueSummary,
+  resolveCapex,
   calculateDetailedRevenueSummary,
   getHashRevenue,
   getPowerCost,
   getProductionCosts,
-  getStartOfMonthUtc,
   processDailyRevenueBtc,
   processDailyAvgPrices,
   processNetworkHashrateData,
-  calculateHashRevenueSummary
+  calculateHashRevenueSummary,
+  getDailySeries,
+  sumCostsByMonth,
+  localMonthStart
 } = require('../../../workers/lib/server/handlers/finance.handlers')
+const { getConsumption } = require('../../../workers/lib/server/handlers/metrics.handlers')
+const { priceBucket } = require('../../../workers/lib/server/handlers/finance.utils')
 const { withDataProxy } = require('../helpers/mockHelpers')
 
 // ==================== Energy Balance Tests ====================
@@ -165,67 +170,12 @@ test('getEnergyBalance - empty ork results', async (t) => {
   t.pass()
 })
 
-test('getEnergyBalance - reads a grouped range-string ts on the electricity stats', async (t) => {
-  // Both stats-history queries pass groupRange, so the worker answers with ts as a range
-  // string. Read raw, getStartOfDay turns it into NaN and every energy reading is dropped,
-  // leaving curtailment null on a day that has one.
-  const dayTs = 1700006400000
-  const mockCtx = withDataProxy({
-    conf: {
-      orks: [{ rpcPublicKey: 'key1' }]
-    },
-    net_r0: {
-      jRequest: async (key, method, payload) => {
-        if (method === 'tailLog') {
-          return [{ ts: dayTs, site_power_w: 5000 }]
-        }
-        if (method === 'getWrkExtData') {
-          if (payload.query && payload.query.key === 'transactions') {
-            return [{ ts: dayTs, transactions: [{ ts: dayTs, changed_balance: 0.5 }] }]
-          }
-          if (payload.query && payload.query.key === 'current_price') {
-            return [{ currentPrice: 40000 }]
-          }
-          if (payload.query && payload.query.key === 'stats-history') {
-            return [{
-              data: [{
-                ts: `${dayTs}-${dayTs + 86399999}`,
-                energy_aggr: { active_energy_in_aggr: 1, ute_energy_aggr: 1 }
-              }]
-            }]
-          }
-        }
-        if (method === 'getGlobalConfig') {
-          return { nominalPowerAvailability_MW: 10 }
-        }
-        return {}
-      }
-    },
-    globalDataLib: {
-      getGlobalData: async () => []
-    }
-  })
-
-  const mockReq = {
-    query: { start: 1700000000000, end: 1700100000000, period: 'daily' }
-  }
-
-  const result = await getEnergyBalance(mockCtx, mockReq, {})
-  const day = result.log.find(entry => entry.ts === dayTs)
-
-  t.ok(day, 'should return the day')
-  // consumptionMWh is 5000 W over 24 h = 0.12 MWh, so 1 MWh in leaves 0.88 curtailed
-  t.is(day.curtailmentMWh, 0.88, 'should derive curtailment from the range-string bucket')
-  t.ok(day.operationalIssuesRate !== null, 'should derive the operational issues rate too')
-  t.pass()
-})
-
 test('processPriceData - processes mempool price data', (t) => {
   const results = [
     [{ ts: 1700006400000, priceUSD: 40000 }]
   ]
 
-  const daily = processPriceData(results)
+  const daily = processPriceData(results, 'UTC')
   t.ok(typeof daily === 'object', 'should return object')
   t.ok(Object.keys(daily).length > 0, 'should have entries')
   const key = Object.keys(daily)[0]
@@ -292,13 +242,165 @@ test('calculateSummary - handles empty log', (t) => {
   t.pass()
 })
 
-function makeMockCtx (days) {
+// ==================== getDailySeries Tests ====================
+
+test('getDailySeries - requests the hourly interval and rolls up by the local calendar day', async (t) => {
+  let capturedKey = null
+  // 02:00 UTC on Sep 1 is 22:00 on Aug 31 in America/Campo_Grande (UTC-4) - still the
+  // previous LOCAL day, even though it's the same UTC calendar day as the other sample.
+  const sampleAugUtc = Date.UTC(2026, 8, 1, 2)
+  const sampleSepUtc = Date.UTC(2026, 8, 1, 6)
+
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'tailLog') {
+          capturedKey = payload.key
+          return [
+            { ts: sampleAugUtc, site_power_w: 1000000 },
+            { ts: sampleSepUtc, site_power_w: 3000000 }
+          ]
+        }
+        return []
+      }
+    }
+  })
+
+  const byDay = await getDailySeries(
+    mockCtx,
+    Date.UTC(2026, 7, 31),
+    Date.UTC(2026, 8, 2),
+    getConsumption,
+    'powerW',
+    'America/Campo_Grande'
+  )
+
+  t.is(capturedKey, 'stat-30m', 'requests the 30m-backed hourly source, not the 3h daily one')
+
+  const aug31Local = Date.UTC(2026, 7, 31, 4) // Campo_Grande midnight Aug 31 = 04:00 UTC
+  const sep1Local = Date.UTC(2026, 8, 1, 4) // Campo_Grande midnight Sep 1 = 04:00 UTC
+  t.is(byDay[aug31Local], 1000000, '02:00 UTC sample lands on local Aug 31, not UTC Sep 1')
+  t.is(byDay[sep1Local], 3000000, '06:00 UTC sample lands on local Sep 1')
+  t.pass()
+})
+
+test('getDailySeries - caches a completed month on ctx and does not refetch it', async (t) => {
+  let tailLogCalls = 0
+  const ts = Date.UTC(2024, 0, 15, 12)
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method) => {
+        if (method === 'tailLog') {
+          tailLogCalls++
+          return [{ ts, site_power_w: 2000000 }]
+        }
+        return []
+      }
+    }
+  })
+
+  const start = Date.UTC(2024, 0, 1)
+  const end = Date.UTC(2024, 1, 1)
+  const first = await getDailySeries(mockCtx, start, end, getConsumption, 'powerW', 'UTC')
+  const second = await getDailySeries(mockCtx, start, end, getConsumption, 'powerW', 'UTC')
+
+  t.is(tailLogCalls, 1, 'the second call for the same completed month is served from cache')
+  t.alike(first, second, 'cached result matches the freshly-fetched one')
+  t.pass()
+})
+
+test('getDailySeries - refresh skips the cached month and stores the fresh rollup', async (t) => {
+  let tailLogCalls = 0
+  let powerW = 2000000
+  const ts = Date.UTC(2024, 0, 15, 12)
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method) => {
+        if (method === 'tailLog') {
+          tailLogCalls++
+          return [{ ts, site_power_w: powerW }]
+        }
+        return []
+      }
+    }
+  })
+
+  const start = Date.UTC(2024, 0, 1)
+  const end = Date.UTC(2024, 1, 1)
+  const dayTs = Date.UTC(2024, 0, 15)
+  await getDailySeries(mockCtx, start, end, getConsumption, 'powerW', 'UTC')
+  powerW = 3000000 // a backfill lands after the month was cached
+  const refreshed = await getDailySeries(mockCtx, start, end, getConsumption, 'powerW', 'UTC', true)
+  const after = await getDailySeries(mockCtx, start, end, getConsumption, 'powerW', 'UTC')
+
+  t.is(tailLogCalls, 2, 'refresh refetches; the call after it is served from cache')
+  t.is(refreshed[dayTs], 3000000, 'refresh returns the backfilled value, not the cached one')
+  t.is(after[dayTs], 3000000, 'and the cache now holds the fresh rollup')
+  t.pass()
+})
+
+// Hourly power for every hour of Jan 2024, served from a plain handler so the tests see
+// exactly what getDailySeries asked for.
+function hourlyJanuaryHandler () {
+  const log = []
+  for (let ts = Date.UTC(2024, 0, 1); ts < Date.UTC(2024, 1, 1); ts += 3600000) log.push({ ts, powerW: 1 })
+  return async (ctx, req) => ({ log: log.filter(e => e.ts >= req.query.start && e.ts <= req.query.end) })
+}
+
+test('getDailySeries - a partially covered month is not cached as the whole month', async (t) => {
+  const ctx = {}
+  const handler = hourlyJanuaryHandler()
+  const DAY = 86400000
+  const jan1 = Date.UTC(2024, 0, 1)
+
+  await getDailySeries(ctx, jan1 + 9 * DAY, jan1 + 20 * DAY - 1, handler, 'powerW', 'UTC')
+  const full = await getDailySeries(ctx, jan1, Date.UTC(2024, 1, 1) - 1, handler, 'powerW', 'UTC')
+
+  t.is(Object.keys(full).length, 31, 'the full month is fetched, not answered with the earlier 11-day slice')
+})
+
+test('getDailySeries - a cached whole month is clamped to the requested days', async (t) => {
+  const ctx = {}
+  const handler = hourlyJanuaryHandler()
+  const DAY = 86400000
+  const jan1 = Date.UTC(2024, 0, 1)
+
+  await getDailySeries(ctx, jan1, Date.UTC(2024, 1, 1) - 1, handler, 'powerW', 'UTC')
+  const partial = await getDailySeries(ctx, jan1 + 9 * DAY, jan1 + 20 * DAY - 1, handler, 'powerW', 'UTC')
+
+  t.alike(Object.keys(partial).map(Number), Array.from({ length: 11 }, (_, i) => jan1 + (9 + i) * DAY),
+    'only Jan 10-20, not the rest of the cached month')
+})
+
+test('getDailySeries - a different ctx gets its own cache (no cross-request leakage)', async (t) => {
+  const ts = Date.UTC(2024, 0, 15, 12)
+  const buildCtx = (powerW) => withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: { jRequest: async (key, method) => (method === 'tailLog' ? [{ ts, site_power_w: powerW }] : []) }
+  })
+
+  const start = Date.UTC(2024, 0, 1)
+  const end = Date.UTC(2024, 1, 1)
+  const ctxA = await getDailySeries(buildCtx(1000000), start, end, getConsumption, 'powerW', 'UTC')
+  const ctxB = await getDailySeries(buildCtx(9000000), start, end, getConsumption, 'powerW', 'UTC')
+
+  t.not(Object.values(ctxA)[0], Object.values(ctxB)[0], 'a fresh ctx is not served the other ctx\'s cached data')
+  t.pass()
+})
+
+// `statDays` defaults to `days`, i.e. every day the transactions cover also reported
+// telemetry. Pass a shorter list to model a gap in the stat log: a day the site was paid
+// for but never reported a hashrate sample.
+function makeMockCtx (days, statDays = days) {
   return withDataProxy({
     conf: { orks: [{ rpcPublicKey: 'key1' }] },
     net_r0: {
       jRequest: async (_key, method, payload) => {
         if (method === 'tailLog') {
-          return days.map(d => ({ ts: d.ts, site_power_w: d.powerW, hashrate_mhs_5m_sum_aggr: d.hashrateMhs || 0 }))
+          return statDays.map(d => ({ ts: d.ts, site_power_w: d.powerW, hashrate_mhs_5m_sum_aggr: d.hashrateMhs || 0 }))
         }
         if (method === 'getWrkExtData') {
           if (payload.query && payload.query.key === 'transactions') {
@@ -368,6 +470,238 @@ test('getEnergyBalance monthly - rates use MEAN, totals use SUM, per-MW is RECOM
   t.ok(Math.abs(m.energyRevenueBTC_MW - 0.3) < 1e-9, 'BTC per-MW recomputed')
 })
 
+// A day holding several payouts at different times, with the mempool worker
+// serving a price per 5-minute bucket. `bucketPrices` maps bucket ts -> price;
+// anything absent models a bucket the server-side backfill has not reached yet.
+function makeReceiptPricedCtx (dayTs, payouts, bucketPrices, dailyPrice) {
+  return withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (_key, method, payload) => {
+        if (method === 'tailLog') {
+          return [{ ts: dayTs, site_power_w: 1_000_000, hashrate_mhs_5m_sum_aggr: 100 }]
+        }
+        if (method === 'getWrkExtData') {
+          const key = payload.query && payload.query.key
+          if (key === 'transactions') {
+            return [{ ts: dayTs, transactions: payouts.map(p => ({ ts: p.ts, changed_balance: p.btc })) }]
+          }
+          if (key === 'HISTORICAL_PRICES') return [{ ts: dayTs, priceUSD: dailyPrice }]
+          if (key === 'current_price') return [{ currentPrice: dailyPrice }]
+          if (key === 'PRICE_AT_TIMESTAMPS') {
+            const prices = {}
+            for (const ts of payload.query.timestamps) {
+              if (bucketPrices[ts]) prices[ts] = bucketPrices[ts]
+            }
+            // Array-wrapped, as the ork actually replies: it wraps each rack's
+            // object reply and concatenates across racks.
+            return [{ prices, missing: payload.query.timestamps.filter(ts => !bucketPrices[ts]) }]
+          }
+          if (key === 'stats-history') return []
+        }
+        if (method === 'getGlobalConfig') return { nominalPowerAvailability_MW: 10 }
+        return {}
+      }
+    },
+    globalDataLib: { getGlobalData: async () => [] }
+  })
+}
+
+test('getRevenueSummary values same-day payouts at the price each one arrived at', async (t) => {
+  const day = Date.UTC(2024, 0, 15)
+  const morning = day + 30 * 60 * 1000
+  const evening = day + 22 * 60 * 60 * 1000
+  const payouts = [{ ts: morning, btc: 1 }, { ts: evening, btc: 1 }]
+  const bucketPrices = {
+    [priceBucket(morning)]: 30000,
+    [priceBucket(evening)]: 50000
+  }
+
+  const result = await getRevenueSummary(
+    makeReceiptPricedCtx(day, payouts, bucketPrices, 99999),
+    { query: { start: day - 1000, end: day + 86400000, period: 'daily' } },
+    {}
+  )
+
+  const entry = result.log[0]
+  t.is(entry.revenueUSD, 80000, 'each payout valued at its own moment, not one daily price')
+  t.is(entry.btcPrice, 40000, 'the reported price is the blend actually realised')
+  t.is(entry.unpricedPayouts, 0)
+  t.is(result.summary.pricingComplete, true)
+  t.is(result.summary.missingPriceBuckets, 0)
+})
+
+test('getRevenueSummary flags the range when a payout had no recorded price', async (t) => {
+  const day = Date.UTC(2024, 0, 15)
+  const morning = day + 30 * 60 * 1000
+  const evening = day + 22 * 60 * 60 * 1000
+  const payouts = [{ ts: morning, btc: 1 }, { ts: evening, btc: 1 }]
+  // Only the morning bucket was ever recorded.
+  const bucketPrices = { [priceBucket(morning)]: 30000 }
+
+  const result = await getRevenueSummary(
+    makeReceiptPricedCtx(day, payouts, bucketPrices, 50000),
+    { query: { start: day - 1000, end: day + 86400000, period: 'daily' } },
+    {}
+  )
+
+  const entry = result.log[0]
+  t.is(entry.revenueUSD, 80000, 'the unpriced payout keeps the previous daily-price behaviour')
+  t.is(entry.unpricedPayouts, 1)
+  t.is(result.summary.pricingComplete, false, 'the response says so rather than hiding the fallback')
+  t.is(result.summary.missingPriceBuckets, 1)
+})
+
+test('getRevenueSummary - phase rows divide the phase consumption by the phase nominal', async (t) => {
+  // Unique month so the daily-series month cache cannot leak across tests.
+  const dayTs = Date.UTC(2019, 5, 15)
+  const ctx = withDataProxy({
+    conf: {
+      orks: [{ rpcPublicKey: 'key1' }],
+      featureConfig: {
+        centralDCSSetup: { enabled: true },
+        phases: [{
+          id: 'phase1_5',
+          label: 'Phase 1.5',
+          minerTelemetry: false,
+          consumption: { source: 'manual' },
+          pool: { accounts: [{ poolType: 'ocean', username: 'acme-addr' }] }
+        }]
+      }
+    },
+    net_r0: {
+      jRequest: async (_key, method, payload) => {
+        if (method === 'getHistoricalLogs') {
+          // 0.6 MWh logged for every hour of the day: a steady 0.6 MW
+          return Array.from({ length: 24 }, (_, h) => ({ ts: dayTs + h * 3600000, totalConsumptionMWh: 0.6 }))
+        }
+        if (method === 'tailLog') {
+          return [{ ts: dayTs, site_power_w: 10_000_000, hashrate_mhs_5m_sum_aggr: 1e9 }]
+        }
+        if (method === 'getWrkExtData') {
+          const key = payload.query && payload.query.key
+          if (key === 'transactions') {
+            return [{
+              ts: dayTs,
+              transactions: [
+                { ts: dayTs, satoshis_net_earned: 100000000, username: 'site-addr' },
+                { ts: dayTs, satoshis_net_earned: 50000000, username: 'acme-addr' }
+              ]
+            }]
+          }
+          if (key === 'HISTORICAL_PRICES') return [{ ts: dayTs, priceUSD: 100000 }]
+          if (key === 'current_price') return [{ currentPrice: 100000 }]
+          if (key === 'hashrate-history') {
+            return [{ hashrateHistory: [{ ts: dayTs + 3600000, poolType: 'ocean', username: 'acme-addr', hashrate: 5e13 }] }]
+          }
+          return []
+        }
+        if (method === 'getGlobalConfig') {
+          return {
+            nominalPowerAvailability_MW: 10,
+            phaseNominals: { phase1_5: { nominalPower_MW: 1.2 } }
+          }
+        }
+        return {}
+      }
+    },
+    globalDataLib: { getGlobalData: async () => [] }
+  })
+
+  const query = { start: dayTs - 1000, end: dayTs + 86400000, overwriteCache: true }
+
+  const phased = await getRevenueSummary(ctx, { query: { ...query, phase: 'phase1_5' } }, {})
+  const phaseRow = phased.log.find(e => e.revenueBTC > 0)
+  t.is(phaseRow.revenueBTC, 0.5, 'phase row carries only its account')
+  t.is(phaseRow.powerW, 600000, 'power comes from the manual entries, not the site meter')
+  t.is(phaseRow.powerUtilization, 0.5, 'phase MW over the phase nominal')
+  t.ok(Math.abs(phaseRow.downtimeMWh - (1.2 - 0.6) * 24) < 1e-9, 'downtime against the phase nominal')
+
+  const total = await getRevenueSummary(ctx, { query }, {})
+  const totalRow = total.log.find(e => e.revenueBTC > 0)
+  t.is(totalRow.powerW, 10_000_000, 'the site row is not served the phase series from cache')
+  t.ok(totalRow.powerUtilization > 0, 'site rows keep the ratio')
+  t.ok(Number.isFinite(totalRow.downtimeMWh), 'and the downtime energy')
+})
+
+// A manual-source phase whose ACME entries cover only `hours` of the day.
+function makePhaseCoverageCtx (dayTs, hours) {
+  return withDataProxy({
+    conf: {
+      orks: [{ rpcPublicKey: 'key1' }],
+      featureConfig: {
+        centralDCSSetup: { enabled: true },
+        phases: [{
+          id: 'phase1',
+          label: 'Phase 1',
+          minerTelemetry: false,
+          consumption: { source: 'manual' },
+          pool: { accounts: [{ poolType: 'ocean', username: 'acme-addr' }] }
+        }]
+      }
+    },
+    net_r0: {
+      jRequest: async (_key, method, payload) => {
+        if (method === 'getHistoricalLogs') {
+          return hours.map(h => ({ ts: dayTs + h * 3600000, totalConsumptionMWh: 0.6 }))
+        }
+        if (method === 'tailLog') return [{ ts: dayTs, site_power_w: 10_000_000 }]
+        if (method === 'getWrkExtData') {
+          const key = payload.query && payload.query.key
+          if (key === 'HISTORICAL_PRICES') return [{ ts: dayTs, priceUSD: 100000 }]
+          if (key === 'current_price') return [{ currentPrice: 100000 }]
+          return []
+        }
+        if (method === 'getGlobalConfig') {
+          return { nominalPowerAvailability_MW: 10, phaseNominals: { phase1: { nominalPower_MW: 1.2 } } }
+        }
+        return {}
+      }
+    },
+    globalDataLib: { getGlobalData: async () => [] }
+  })
+}
+
+test('getRevenueSummary - phase days count the hours without an entry', async (t) => {
+  const dayTs = Date.UTC(2019, 6, 15)
+  const covered = Array.from({ length: 24 }, (_, h) => h).filter(h => ![3, 4, 5].includes(h))
+  const ctx = makePhaseCoverageCtx(dayTs, covered)
+  const query = { start: dayTs, end: dayTs + 86400000 - 1, phase: 'phase1' }
+
+  const res = await getRevenueSummary(ctx, { query }, {})
+  const row = res.log.find(e => e.ts === dayTs)
+  t.is(row.missingHours, 3, 'the gap is surfaced on the day')
+  t.is(row.powerW, 600000, 'power still averages the hours present')
+  t.is(res.summary.missingHours, 3)
+
+  const consumption = await getConsumption(ctx, { query: { ...query, interval: '1h' } })
+  t.is(res.summary.missingHours, consumption.summary.missingHours, 'matches /metrics/consumption?phase=')
+})
+
+test('getRevenueSummary - a phase window without entries is unknown, not idle', async (t) => {
+  const dayTs = Date.UTC(2019, 7, 15)
+  const ctx = makePhaseCoverageCtx(dayTs, [])
+  const query = { start: dayTs, end: dayTs + 86400000 - 1, phase: 'phase1' }
+
+  const daily = await getRevenueSummary(ctx, { query }, {})
+  const row = daily.log.find(e => e.ts === dayTs)
+  t.is(row.missingHours, 24)
+  t.is(row.powerUtilization, null, 'no utilization without input')
+  t.is(row.downtimeMWh, null, 'and no downtime')
+  t.is(daily.summary.avgPowerUtilization, null)
+  t.is(daily.summary.totalDowntimeMWh, null, 'the total is not the full nominal')
+  t.is(daily.summary.missingHours, 24)
+
+  const monthly = await getRevenueSummary(ctx, { query: { ...query, period: 'monthly' } }, {})
+  t.is(monthly.log[0].downtimeMWh, null, 'the period sum does not read null as zero downtime')
+  t.is(monthly.log[0].missingHours, 24)
+  t.is(monthly.summary.totalDowntimeMWh, null)
+
+  const site = await getRevenueSummary(ctx, { query: { start: query.start, end: query.end } }, {})
+  t.is(site.summary.missingHours, undefined, 'the site summary shape is unchanged')
+  t.ok(site.log.every(e => !('missingHours' in e)))
+})
+
 test('getRevenueSummary monthly - rates use MEAN, totals use SUM', async (t) => {
   const day1 = Date.UTC(2024, 0, 15)
   const day2 = Date.UTC(2024, 0, 16)
@@ -387,6 +721,98 @@ test('getRevenueSummary monthly - rates use MEAN, totals use SUM', async (t) => 
   t.is(m.btcPrice, 50000, 'btcPrice averaged')
   t.is(m.powerW, 4_000_000, 'powerW averaged')
   t.is(m.hashrateMhs, 200, 'hashrateMhs averaged')
+})
+
+test('getRevenueSummary daily - a day with no hashrate sample is null, not zero', async (t) => {
+  const day1 = Date.UTC(2024, 0, 15)
+  const day2 = Date.UTC(2024, 0, 16)
+  const days = [
+    { ts: day1, powerW: 5_000_000, hashrateMhs: 100, btc: 0.5, price: 40000 },
+    { ts: day2, powerW: 3_000_000, hashrateMhs: 300, btc: 0.3, price: 40000 }
+  ]
+
+  // day2 is paid for but never reported telemetry.
+  const result = await getRevenueSummary(makeMockCtx(days, [days[0]]), {
+    query: { start: day1 - 1000, end: day2 + 86400000, period: 'daily' }
+  }, {})
+
+  t.is(result.log.length, 2, 'the paid-for day still appears in the log')
+  t.is(result.log[0].hashrateMhs, 100, 'the reported day keeps its value')
+  t.is(result.log[1].hashrateMhs, null, 'the unreported day is null, not a zero-filled reading')
+  t.is(result.log[1].hashRevenueUSDPerPHsPerDay, null, 'per-PH/s revenue is unknown too, not Infinity or 0')
+  t.is(result.log[1].netHashRevenueUSDPerPHsPerDay, null, 'net per-PH/s revenue is unknown too, not Infinity or 0')
+})
+
+test('getRevenueSummary monthly - a missing hashrate day does not drag the mean down', async (t) => {
+  const day1 = Date.UTC(2024, 0, 15)
+  const day2 = Date.UTC(2024, 0, 16)
+  const day3 = Date.UTC(2024, 0, 17)
+  const days = [
+    { ts: day1, powerW: 5_000_000, hashrateMhs: 100, btc: 0.5, price: 40000 },
+    { ts: day2, powerW: 3_000_000, hashrateMhs: 300, btc: 0.3, price: 40000 },
+    { ts: day3, powerW: 4_000_000, hashrateMhs: 0, btc: 0.4, price: 40000 }
+  ]
+
+  // day3 has a transaction but no stat entry; zero-filling it would average (100+300+0)/3 = 133.33.
+  const result = await getRevenueSummary(makeMockCtx(days, days.slice(0, 2)), {
+    query: { start: day1 - 1000, end: day3 + 86400000, period: 'monthly' }
+  }, {})
+
+  t.is(result.log.length, 1, 'three days collapse to one monthly bucket')
+  t.is(result.log[0].hashrateMhs, 200, 'mean over the two days that reported: (100+300)/2')
+})
+
+test('getRevenueSummary - miningConsumptionMWh sums only the DCS rack meters, null where unmetered', async (t) => {
+  const day1 = Date.UTC(2024, 0, 15)
+  const day2 = Date.UTC(2024, 0, 16)
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }], featureConfig: { centralDCSSetup: { enabled: true } } },
+    net_r0: {
+      jRequest: async (_key, method, payload) => {
+        if (method === 'listThings') {
+          return [{
+            type: payload.fields.type && 'dcs-siemens',
+            last: {
+              snap: {
+                stats: {
+                  dcs_specific: {
+                    equipment: {
+                      power_meters: [
+                        { equipment: 'Site-PM', role: 'site_main' },
+                        { equipment: 'QGBT-01', role: 'rack' },
+                        { equipment: 'QDFL-1P', role: 'rack' },
+                        { equipment: 'CCM', role: 'ccm_principal' }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }]
+        }
+        if (method === 'tailLog' && payload.aggrFields.by_meter_power_w) {
+          return [
+            { ts: day1, by_meter_power_w: { 'site-pm': 9_000_000, 'qgbt-01': 2_000_000, 'qdfl-1_p': 1_000_000, ccm: 5_000_000 } },
+            { ts: day2, by_meter_power_w: {} }
+          ]
+        }
+        if (method === 'tailLog') return [{ ts: day1, site_power_w: 9_000_000 }, { ts: day2, site_power_w: 9_000_000 }]
+        return []
+      }
+    },
+    globalDataLib: { getGlobalData: async () => [] }
+  })
+  const query = { start: day1, end: day2 + 86400000 - 1 }
+
+  const daily = await getRevenueSummary(ctx, { query: { ...query, period: 'daily' } }, {})
+  t.is(daily.log[0].consumptionMWh, 216, 'site consumption is unchanged')
+  t.is(daily.log[0].miningConsumptionMWh, 72, 'rack meters only: (2 + 1) MW x 24h')
+  t.is(daily.log[1].miningConsumptionMWh, null, 'a day without rack readings is unknown, not 0')
+  t.is(daily.summary.totalMiningConsumptionMWh, 72)
+
+  const unmetered = await getRevenueSummary(ctx, { query: { start: day2, end: query.end, period: 'monthly' } }, {})
+  t.is(unmetered.log[0].miningConsumptionMWh, null, 'a month without rack readings is unknown, not 0')
+  t.is(unmetered.summary.totalMiningConsumptionMWh, null)
 })
 
 test('getCostSummary - central DCS reads site power from the DCS worker', async (t) => {
@@ -506,7 +932,7 @@ test('processEbitdaPrices - processes valid data', (t) => {
   const results = [
     [{ prices: [{ ts: 1700006400000, price: 40000 }] }]
   ]
-  const daily = processEbitdaPrices(results)
+  const daily = processEbitdaPrices(results, 'UTC')
   t.ok(typeof daily === 'object', 'should return object')
   t.pass()
 })
@@ -518,7 +944,7 @@ test('processEbitdaPrices - flat per-ork items with priceUSD (production shape)'
       { ts: 1700092800000, priceUSD: 41500 }
     ]
   ]
-  const daily = processEbitdaPrices(results)
+  const daily = processEbitdaPrices(results, 'UTC')
   t.is(daily[1700006400000], 40000, 'should extract priceUSD for first day')
   t.is(daily[1700092800000], 41500, 'should extract priceUSD for second day')
   t.pass()
@@ -980,7 +1406,8 @@ test('calculateDetailedRevenueSummary - calculates from log entries', (t) => {
       ebitdaHodl: 15000,
       btcPrice: 40000,
       curtailmentRate: 0.1,
-      powerUtilization: 0.8
+      powerUtilization: 0.8,
+      miningNetUSD: 19000
     },
     {
       revenueBTC: 0.3,
@@ -993,7 +1420,8 @@ test('calculateDetailedRevenueSummary - calculates from log entries', (t) => {
       ebitdaHodl: 9600,
       btcPrice: 42000,
       curtailmentRate: 0.15,
-      powerUtilization: 0.85
+      powerUtilization: 0.85,
+      miningNetUSD: 12000
     }
   ]
 
@@ -1004,8 +1432,10 @@ test('calculateDetailedRevenueSummary - calculates from log entries', (t) => {
   t.is(summary.totalCostsUSD, 8000, 'should sum costs')
   t.is(summary.totalConsumptionMWh, 160, 'should sum consumption')
   t.is(summary.totalEbitdaSelling, 24600, 'should sum selling EBITDA')
+  t.is(summary.totalMiningNetUSD, 31000, 'should sum net mining revenue')
   t.ok(summary.avgCostPerMWh !== null, 'should calculate avg cost per MWh')
   t.ok(summary.avgRevenuePerMWh !== null, 'should calculate avg revenue per MWh')
+  t.is(summary.avgNetRevenuePerMWh, 193.75, 'should calculate avg net revenue per MWh')
   t.ok(summary.avgBtcPrice !== null, 'should calculate avg BTC price')
   t.ok(summary.avgCurtailmentRate !== null, 'should calculate avg curtailment rate')
   t.ok(summary.avgPowerUtilization !== null, 'should calculate avg power utilization')
@@ -1019,6 +1449,7 @@ test('calculateDetailedRevenueSummary - handles empty log', (t) => {
   t.is(summary.totalRevenueUSD, 0, 'should be zero')
   t.is(summary.totalFeesBTC, 0, 'should be zero')
   t.is(summary.avgCostPerMWh, null, 'should be null')
+  t.is(summary.avgNetRevenuePerMWh, null, 'should be null')
   t.is(summary.currentBtcPrice, 42000, 'should include current price')
   t.pass()
 })
@@ -1079,6 +1510,53 @@ test('getHashRevenue - happy path', async (t) => {
   t.pass()
 })
 
+test('getHashRevenue - pool-only phase revenue stays out of the fleet metric', async (t) => {
+  // Unique month so the daily-series month cache cannot leak across tests.
+  const dayTs = Date.UTC(2033, 2, 15)
+  const makeCtx = (featureConfig) => withDataProxy({
+    conf: {
+      orks: [{ rpcPublicKey: 'key1' }],
+      ...(featureConfig && { featureConfig })
+    },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'tailLog') {
+          return [{ ts: dayTs, hashrate_mhs_5m_sum_aggr: 1e9 }]
+        }
+        if (method === 'getWrkExtData') {
+          if (payload.query && payload.query.key === 'transactions') {
+            return [{
+              transactions: [
+                { ts: dayTs, satoshis_net_earned: 100000000, username: 'site-addr' },
+                { ts: dayTs, satoshis_net_earned: 50000000, username: 'acme-addr' }
+              ]
+            }]
+          }
+          if (payload.query && payload.query.key === 'current_price') {
+            return [{ currentPrice: 100000 }]
+          }
+        }
+        return {}
+      }
+    }
+  })
+
+  const query = { start: dayTs - 1000, end: dayTs + 86400000, period: 'daily', overwriteCache: true }
+
+  const phased = await getHashRevenue(makeCtx({
+    phases: [
+      { id: 'phase1', minerTelemetry: true, pool: { accounts: [{ poolType: 'ocean', username: 'site-addr' }] } },
+      { id: 'phase1_5', minerTelemetry: false, pool: { accounts: [{ poolType: 'ocean', username: 'acme-addr' }] } }
+    ]
+  }), { query }, {})
+  const phasedDay = phased.log.find(e => e.revenueBTC > 0)
+  t.is(phasedDay.revenueBTC, 1, 'the pool-only account is excluded from the numerator')
+
+  const plain = await getHashRevenue(makeCtx(null), { query }, {})
+  const plainDay = plain.log.find(e => e.revenueBTC > 0)
+  t.is(plainDay.revenueBTC, 1.5, 'without a phases config everything still counts')
+})
+
 test('getHashRevenue - missing start throws', async (t) => {
   const mockCtx = withDataProxy({
     conf: { orks: [] },
@@ -1126,7 +1604,7 @@ test('processNetworkHashrateData - processes array data', (t) => {
     [{ data: [{ ts: 1700006400000, avgHashrateMHs: 500000000000000 }] }]
   ]
 
-  const daily = processNetworkHashrateData(results)
+  const daily = processNetworkHashrateData(results, 'UTC')
   t.ok(typeof daily === 'object', 'should return object')
   t.ok(Object.keys(daily).length > 0, 'should have entries')
   const key = Object.keys(daily)[0]
@@ -1141,7 +1619,7 @@ test('processNetworkHashrateData - flat per-ork items (production shape)', (t) =
       { ts: 1700092800000, avgHashrateMHs: 1029591824888537 }
     ]
   ]
-  const daily = processNetworkHashrateData(results)
+  const daily = processNetworkHashrateData(results, 'UTC')
   t.is(daily[1700006400000], 1019725948656278, 'extracts avgHashrateMHs day 1')
   t.is(daily[1700092800000], 1029591824888537, 'extracts avgHashrateMHs day 2')
   t.pass()
@@ -1152,7 +1630,7 @@ test('processNetworkHashrateData - processes object-keyed data', (t) => {
     [{ data: { 1700006400000: { avgHashrateMHs: 500000000000000 } } }]
   ]
 
-  const daily = processNetworkHashrateData(results)
+  const daily = processNetworkHashrateData(results, 'UTC')
   t.ok(typeof daily === 'object', 'should return object')
   t.ok(Object.keys(daily).length > 0, 'should have entries')
   t.pass()
@@ -1160,7 +1638,7 @@ test('processNetworkHashrateData - processes object-keyed data', (t) => {
 
 test('processNetworkHashrateData - handles error results', (t) => {
   const results = [{ error: 'timeout' }]
-  const daily = processNetworkHashrateData(results)
+  const daily = processNetworkHashrateData(results, 'UTC')
   t.is(Object.keys(daily).length, 0, 'should be empty for errors')
   t.pass()
 })
@@ -1260,6 +1738,25 @@ test('getRevenueHourly - queries the pool with aggrHourly and shapes the log', a
   t.pass()
 })
 
+test('getRevenueHourly - timezone param never reinterprets start/end', async (t) => {
+  let payload = null
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'k' }] },
+    net_r0: { jRequest: async (key, method, p) => { payload = p; return [] } }
+  })
+
+  const start = Date.UTC(2026, 5, 1, 0, 0, 0)
+  const end = Date.UTC(2026, 5, 1, 1, 0, 0)
+
+  await getRevenueHourly(mockCtx, {
+    query: { start, end, timezone: 'America/Campo_Grande' }
+  })
+
+  t.is(payload.query.start, start, 'start is a true UTC instant, same as export')
+  t.is(payload.query.end, end, 'end is a true UTC instant, same as export')
+  t.pass()
+})
+
 test('getRevenueHourly - no pool param falls back to the generic minerpool type', async (t) => {
   let payload = null
   const mockCtx = withDataProxy({
@@ -1321,6 +1818,100 @@ test('resolveLcoeUsdPerMwh - falls back to zero on anything unusable', (t) => {
   t.is(resolveLcoeUsdPerMwh({ lcoe: { effectiveUsdPerMwh: 'cheap' } }), 0, 'non-numeric')
   t.is(resolveLcoeUsdPerMwh({ lcoe: { effectiveUsdPerMwh: -5 } }), 0, 'negative')
   t.pass()
+})
+
+test('getRevenueSummary - phase costs and capex follow the phase build-out', async (t) => {
+  // Unique month so the daily-series month cache cannot leak across tests.
+  const dayTs = Date.UTC(2019, 6, 15)
+  const phases = [
+    {
+      id: 'phase1',
+      minerTelemetry: true,
+      consumption: { source: 'remainder', meterKey: 'ccm' },
+      pool: { accounts: [{ poolType: 'ocean', username: 'site-addr' }] }
+    },
+    {
+      id: 'phase1_5',
+      minerTelemetry: false,
+      consumption: { source: 'manual' },
+      pool: { accounts: [{ poolType: 'ocean', username: 'acme-addr' }] }
+    }
+  ]
+  const costParameters = {
+    capexUsd: 1000,
+    lcoe: { effectiveUsdPerMwh: 50 },
+    phases: { phase1_5: { capexUsd: 400 } }
+  }
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }], featureConfig: { centralDCSSetup: { enabled: true }, phases } },
+    net_r0: {
+      jRequest: async (_key, method, payload) => {
+        if (method === 'getHistoricalLogs') {
+          return Array.from({ length: 24 }, (_, h) => ({ ts: dayTs + h * 3600000, totalConsumptionMWh: 0.6 }))
+        }
+        if (method === 'tailLog') {
+          return [{ ts: dayTs, site_power_w: 10_000_000, by_meter_power_w: { ccm: 10_000_000 }, hashrate_mhs_5m_sum_aggr: 1e9 }]
+        }
+        if (method === 'getWrkExtData') {
+          const key = payload.query && payload.query.key
+          if (key === 'transactions') {
+            return [{ ts: dayTs, transactions: [{ ts: dayTs, satoshis_net_earned: 50000000, username: 'acme-addr' }] }]
+          }
+          if (key === 'HISTORICAL_PRICES') return [{ ts: dayTs, priceUSD: 100000 }]
+          if (key === 'current_price') return [{ currentPrice: 100000 }]
+          return []
+        }
+        if (method === 'getGlobalConfig') return { nominalPowerAvailability_MW: 10, phaseNominals: { phase1: { nominalPower_MW: 8 }, phase1_5: { nominalPower_MW: 1.2 } } }
+        return {}
+      }
+    },
+    globalDataLib: {
+      getGlobalData: async ({ type }) => {
+        if (type === 'costParameters') return costParameters
+        // A legacy month carrying the whole site's energy bill: 31000 / 31 days.
+        if (type === 'productionCosts') return [{ site: 'site1', year: 2019, month: 7, energyCostsUSD: 31000, operationalCostsUSD: 3100 }]
+        return []
+      }
+    }
+  })
+  const query = { start: dayTs - 1000, end: dayTs + 86400000, overwriteCache: true }
+  const dayRow = (res) => res.log.find(e => e.ts === dayTs)
+
+  const phased = await getRevenueSummary(ctx, { query: { ...query, phase: 'phase1_5' } }, {})
+  t.ok(Math.abs(dayRow(phased).energyCostsUSD - 0.6 * 24 * 50) < 1e-9, 'phase energy is its own consumption at LCOE, not the site bill')
+  t.is(dayRow(phased).operationalCostsUSD, 0, 'manual-source phase carries no Cost Input opex')
+  t.is(phased.summary.capexUsd, 400, 'phase 1.5 amortizes its own capex')
+  t.alike(phased.summary.capexMissingPhases, [])
+
+  const phase1 = await getRevenueSummary(ctx, { query: { ...query, phase: 'phase1' } }, {})
+  t.ok(Math.abs(dayRow(phase1).energyCostsUSD - (10 - 0.6) * 24 * 50) < 1e-6, 'phase 1 energy is the meter remainder at LCOE')
+  t.is(dayRow(phase1).operationalCostsUSD, 100, 'phase 1 carries the Cost Input opex')
+  t.is(phase1.summary.capexUsd, 1000, 'phase 1 amortizes the existing capex')
+
+  const total = await getRevenueSummary(ctx, { query }, {})
+  t.is(dayRow(total).energyCostsUSD, 1000, 'the site view keeps the stored bill')
+  t.is(dayRow(total).operationalCostsUSD, 100)
+  t.is(total.summary.capexUsd, 1400, 'site capex sums the build-out and phase 1.5')
+})
+
+test('resolveCapex - splits capex along the phase build-outs', (t) => {
+  const phases = [
+    { id: 'phase1', consumption: { source: 'remainder', meterKey: 'ccm' } },
+    { id: 'phase1_5', consumption: { source: 'manual' } }
+  ]
+  const ctx = { conf: { featureConfig: { phases } } }
+  const params = { capexUsd: 1000, phases: { phase1_5: { capexUsd: 400 } } }
+
+  t.alike(resolveCapex(ctx, null, params), { capexUsd: 1400, capexMissingPhases: [] }, 'site sums both')
+  t.alike(resolveCapex(ctx, phases[0], params), { capexUsd: 1000, capexMissingPhases: [] }, 'phase 1 keeps the existing capex')
+  t.alike(resolveCapex(ctx, phases[1], params), { capexUsd: 400, capexMissingPhases: [] }, 'phase 1.5 has its own')
+
+  const pending = { capexUsd: 1000 }
+  t.alike(resolveCapex(ctx, null, pending), { capexUsd: 1000, capexMissingPhases: ['phase1_5'] }, 'a pending phase is flagged, not zeroed')
+  t.alike(resolveCapex(ctx, phases[1], pending), { capexUsd: null, capexMissingPhases: ['phase1_5'] }, 'phase 1.5 has no capex yet')
+  t.alike(resolveCapex(ctx, phases[0], {}), { capexUsd: null, capexMissingPhases: [] })
+
+  t.alike(resolveCapex({ conf: {} }, null, { capexUsd: 1000 }), { capexUsd: 1000, capexMissingPhases: [] }, 'sites without phases are unchanged')
 })
 
 test('getCostParameters - returns an empty object without globalDataLib', async (t) => {
@@ -1541,6 +2132,43 @@ test('getPowerCost - empty results', async (t) => {
   t.pass()
 })
 
+test('getPowerCost - a local month boundary keeps a UTC-Jan-1 sample in December for a west-of-UTC zone', async (t) => {
+  const sampleUtc = JAN_1 + 2 * 3600000 // Jan 1 02:00 UTC = Dec 31 22:00 in America/Campo_Grande
+  const mockCtx = createPowerCostCtx({
+    power: [{ ts: sampleUtc, site_power_w: 2000000 }],
+    transactions: [{ ts: sampleUtc, transactions: [{ changed_balance: 0.5 }] }],
+    prices: [{ ts: sampleUtc, priceUSD: 40000 }]
+  })
+
+  const result = await getPowerCost(mockCtx, {
+    query: {
+      start: Date.UTC(2025, 10, 1),
+      end: Date.UTC(2026, 1, 15),
+      timezone: 'America/Campo_Grande'
+    }
+  })
+
+  t.is(result.log.length, 1, 'one monthly bucket')
+  const decemberLocalStart = Date.UTC(2025, 11, 1, 4) // Campo_Grande midnight Dec 1 2025 = 04:00 UTC
+  t.is(result.log[0].ts, decemberLocalStart, 'the Dec-31-local sample is attributed to December, not UTC January')
+  t.ok(result.log[0].revenueUSD > 0, 'revenue still computed for that bucket')
+  t.pass()
+})
+
+test('sumCostsByMonth - buckets by local month start, not the UTC label', (t) => {
+  const startMonthTs = localMonthStart(Date.UTC(2025, 11, 1), 'America/Campo_Grande')
+  const endMonthTs = localMonthStart(Date.UTC(2026, 0, 1), 'America/Campo_Grande')
+  const byMonth = sumCostsByMonth(
+    [{ site: 's1', year: 2025, month: 12, energyCost: 1000, operationalCost: 500 }],
+    startMonthTs,
+    endMonthTs,
+    'America/Campo_Grande'
+  )
+  const decemberLocalStart = Date.UTC(2025, 11, 1, 4)
+  t.is(byMonth[decemberLocalStart], 1500, 'costs land on the local December month start')
+  t.pass()
+})
+
 test('getPowerCost - missing start throws', async (t) => {
   const mockCtx = createPowerCostCtx()
   try {
@@ -1564,7 +2192,7 @@ test('processDailyRevenueBtc - prefers changed_balance and falls back to satoshi
         ]
       }
     ]
-  ], JAN_1, JAN_31)
+  ], JAN_1, JAN_31, 'UTC')
   t.is(daily[JAN_10], 1, 'should sum 0.5 BTC + 0.5 BTC')
   t.pass()
 })
@@ -1576,15 +2204,9 @@ test('processDailyAvgPrices - averages price points within a day', (t) => {
       { ts: JAN_10 + 3600000, priceUSD: 110000 },
       { ts: JAN_31 + DAY_MS, priceUSD: 500 }
     ]
-  ], JAN_1, JAN_31)
+  ], JAN_1, JAN_31, 'UTC')
   t.is(daily[JAN_10], 100000, 'should average intra-day prices')
   t.absent(daily[JAN_31 + DAY_MS], 'should drop out-of-range days')
-  t.pass()
-})
-
-test('getStartOfMonthUtc - buckets to UTC month start', (t) => {
-  t.is(getStartOfMonthUtc(JAN_10), JAN_1)
-  t.is(getStartOfMonthUtc(JAN_1), JAN_1)
   t.pass()
 })
 
@@ -1733,4 +2355,155 @@ test('getProductionCosts - keeps every month overlapping the range', async (t) =
   t.alike(await months(AUG_1_UTC + FOUR_HOURS, SEP_1_UTC + FOUR_HOURS - 1), [8, 9], 'a local-midnight start must not drop the requested month')
   t.alike(await months(Date.UTC(2026, 7, 15), Date.UTC(2026, 7, 20)), [8], 'a range inside a month keeps that month')
   t.pass()
+})
+
+test('getEbitda - passes a limit that covers every day in the range to mempool history', async (t) => {
+  const start = 1700000000000
+  const end = start + 400 * 86400000
+  const queries = []
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'getWrkExtData' && payload.query) queries.push(payload.query)
+        return []
+      }
+    },
+    globalDataLib: { getGlobalData: async () => [] }
+  })
+
+  await getEbitda(mockCtx, { query: { start, end, period: 'monthly' } }, {})
+
+  const prices = queries.find(q => q.key === 'HISTORICAL_PRICES')
+  t.ok(prices.limit > 400, 'limit exceeds the number of daily rows in the range')
+})
+
+test('getRevenueSummary - reads the documented nominal power key and emits nominal and downtime energy', async (t) => {
+  const dayTs = 1700006400000
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'tailLog') return [{ ts: dayTs, site_power_w: 5000000 }]
+        if (method === 'getGlobalConfig') return { nominalAvailablePowerMWh: 10 }
+        return []
+      }
+    },
+    globalDataLib: { getGlobalData: async () => [] }
+  })
+
+  const { log: [entry] } = await getRevenueSummary(mockCtx, { query: { start: dayTs, end: dayTs + 1, period: 'daily' } }, {})
+
+  t.is(entry.powerUtilization, 0.5)
+  t.is(entry.nominalConsumptionMWh, 240)
+  t.is(entry.availableEnergyMWh, 0)
+  t.is(entry.downtimeMWh, 120)
+  t.is(entry.curtailmentMWh, 0)
+  t.is(entry.curtailmentRate, 0)
+  t.is(entry.operationalIssuesRate, 0)
+})
+
+test('getRevenueSummary - monthly btcProductionCost is total cost over total BTC, not a mean of daily ratios', async (t) => {
+  const day1 = 1700006400000
+  const day2 = day1 + 86400000
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'getWrkExtData' && payload.query.key === 'transactions') {
+          return [{ transactions: [{ ts: day1, changed_balance: 1 }, { ts: day2, changed_balance: 0.001 }] }]
+        }
+        return []
+      }
+    },
+    globalDataLib: {
+      getGlobalData: async ({ type }) => type === 'productionCosts' ? [{ year: 2023, month: 11, energyCost: 3000 }] : []
+    }
+  })
+
+  const { log: [month] } = await getRevenueSummary(mockCtx, { query: { start: day1, end: day2 + 1, period: 'monthly' } }, {})
+
+  t.is(Math.round(month.btcProductionCost), 200)
+})
+
+test('getRevenueSummary - folds forecast energy sales, pool rebates and net-of-tax into the daily row', async (t) => {
+  const dayTs = 1700006400000
+  const hour = 3600000
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'tailLog') return [{ ts: dayTs, site_power_w: 5000000, hashrate_mhs_5m_sum_aggr: 1000000000 }]
+        if (method !== 'getWrkExtData') return []
+        switch (payload.query.key) {
+          case 'transactions': return [{ transactions: [{ ts: dayTs, changed_balance: 1 }] }]
+          case 'HISTORICAL_PRICES': return [{ data: [{ ts: dayTs, priceUSD: 40000 }] }]
+          case 'forecastSettings': return [{ miningRevenueTaxFees: { percent: 4, fixed: 2 } }]
+          case 'forecastHistory': return [{
+            hourlyForecast: [
+              { start: dayTs, isEnergySelected: true, energySellPrice: 100, energySalesRevenue: 100, energySalesRevenueSelected: 100, energySalesRevenuePerMwh: 10, energySalesTaxesAndFees: 2, miningRevenue: 50, taxesAndFees: 1 },
+              { start: dayTs + hour, isEnergySelected: false, energySalesRevenue: 100, energySalesRevenueSelected: 100, energySalesRevenuePerMwh: 10, energySalesTaxesAndFees: 2, miningRevenue: 500, taxesAndFees: 20 }
+            ]
+          }]
+          default: return []
+        }
+      }
+    },
+    globalDataLib: {
+      getGlobalData: async ({ type }) => type === 'poolRebates' ? [{ ts: dayTs + hour, amountBTC: 0.5 }] : []
+    }
+  })
+
+  const { log: [row], summary } = await getRevenueSummary(mockCtx, { query: { start: dayTs, end: dayTs + 86400000, period: 'daily' } }, {})
+
+  t.is(row.revenueBTC, 1.5)
+  t.is(row.payoutBTC, 1)
+  t.is(row.rebateBTC, 0.5)
+  t.is(row.soldMWh, 10)
+  t.is(row.availableMWh, 20)
+  t.is(row.energySalesNetUSD, 98)
+  t.is(row.allMineNetUSD, 550, 'forecast miningRevenue is already net')
+  t.is(row.allSellNetUSD, 200, 'forecast energySalesRevenue is already net')
+  t.is(row.optimalNetUSD, 600)
+  t.is(row.curtailmentMWh, 0)
+  t.is(row.availableEnergyMWh, 0)
+  t.is(row.miningNetUSD, 57360)
+  t.is(row.netCashUSD, 57458)
+  t.is(row.energyRevenuePerMWh, 500, 'gross mining revenue per MWh ignores tax fees')
+  t.is(row.netEnergyRevenuePerMWh, 478, 'net mining revenue per MWh is net of tax fees')
+  t.is(row.hashRevenueUSDPerPHsPerDay, 60000, 'gross hash revenue per PH/s ignores tax fees')
+  t.is(row.netHashRevenueUSDPerPHsPerDay, 57360, 'net hash revenue per PH/s is net of tax fees')
+  t.is(summary.totalRebateBTC, 0.5)
+  t.is(summary.totalNetCashUSD, 57458)
+  t.is(summary.avgRevenuePerMWh, 500, 'gross avg revenue per MWh')
+  t.is(summary.avgNetRevenuePerMWh, 478, 'net avg revenue per MWh')
+})
+
+test('getRevenueSummary - an energy-selected hour the forecast decided to mine is not sold', async (t) => {
+  const dayTs = 1700006400000
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'tailLog') return [{ ts: dayTs, site_power_w: 5000000 }]
+        if (method !== 'getWrkExtData') return []
+        if (payload.query.key === 'forecastHistory') {
+          return [{
+            hourlyForecast: [
+              { start: dayTs, decision: 'mine', isEnergySelected: true, energySellPrice: 100, energySalesRevenue: 100, energySalesRevenuePerMwh: 10, energySalesTaxesAndFees: 2, miningRevenue: 500 }
+            ]
+          }]
+        }
+        return []
+      }
+    },
+    globalDataLib: { getGlobalData: async () => [] }
+  })
+
+  const { log: [row] } = await getRevenueSummary(mockCtx, { query: { start: dayTs, end: dayTs + 86400000, period: 'daily' } }, {})
+
+  t.is(row.soldMWh, 0)
+  t.is(row.energySalesNetUSD, 0)
+  t.is(row.availableMWh, 10, 'the hour still counts as available energy')
+  t.is(row.optimalNetUSD, 500)
 })

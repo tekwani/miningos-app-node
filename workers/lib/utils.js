@@ -3,7 +3,7 @@
 const async = require('async')
 const mingo = require('mingo')
 const { RPC_TIMEOUT } = require('./constants')
-const { getStartOfDay } = require('./period.utils')
+const { getStartOfDay, localDayStart, localWeekStart } = require('./period.utils')
 
 const dateNowSec = () => Math.floor(Date.now() / 1000)
 
@@ -71,6 +71,19 @@ const parseJsonQueryParam = (jsonString, errorCode = 'ERR_INVALID_JSON') => {
   } catch {
     throw new Error(errorCode)
   }
+}
+
+// Restricts a parsed `fields` projection to the `{ key: 1 }` inclusion shape the
+// worker's openrpc contract declares. Dropping every other value blocks mingo
+// field-path renames (`"$opts.password"`) that move credentials past the rack's
+// post-projection redaction, and `__proto__`-path writes that pollute the process.
+const sanitizeIncludeFields = (fields) => {
+  if (!fields || typeof fields !== 'object') return null
+  const clean = {}
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === 1) clean[key] = 1
+  }
+  return Object.keys(clean).length ? clean : null
 }
 
 const runParallel = (tasks) =>
@@ -238,7 +251,10 @@ module.exports = {
   getRpcTimeout,
   getAuthTokenFromHeaders,
   parseJsonQueryParam,
+  sanitizeIncludeFields,
   getStartOfDay,
+  localDayStart,
+  localWeekStart,
   flattenRpcResults,
   safeDiv,
   runParallel,

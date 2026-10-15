@@ -3,9 +3,10 @@
 const test = require('brittle')
 const {
   getHashrate,
+  monthlyHashesCache,
   calculateHashrateSummary,
   getConsumption,
-  rollupMonthly,
+  rollupLocalConsumption,
   calculateConsumptionSummary,
   calculateByMeterConsumptionSummary,
   calculateGroupedConsumptionSummary,
@@ -43,9 +44,17 @@ const {
   getMinersByType,
   processMinersByType,
   getInventoryMinerDistribution,
-  computeInstalledCapacity
+  computeInstalledCapacity,
+  getDowntime,
+  indexForecastDecisionsByHour,
+  buildHourlyDowntime,
+  aggregateDowntimeDaily,
+  calculateDowntimeSummary,
+  getPoolHashrate,
+  bucketPoolHashrate
 } = require('../../../workers/lib/server/handlers/metrics.handlers')
 const { withDataProxy } = require('../helpers/mockHelpers')
+const { METRICS_TIME } = require('../../../workers/lib/constants')
 
 // ==================== Hashrate Tests ====================
 
@@ -466,8 +475,10 @@ test('getHashrate - interval selects the bucket range', async (t) => {
 
   t.is(captured[0].groupRange, '1H', '1h should bucket hourly')
   t.is(captured[0].key, 'stat-30m', '1h should sample the stat-30m log')
-  t.is(captured[1].groupRange, '1D', '1d should bucket daily')
-  t.is(captured[2].groupRange, '1W', '1w should bucket weekly')
+  // Days and weeks are cut in the site's zone from hourly buckets, not the store's UTC grid.
+  t.is(captured[1].groupRange, '1H', '1d should be rolled up from hourly buckets')
+  t.is(captured[1].key, 'stat-30m', '1d should sample the stat-30m log')
+  t.is(captured[2].groupRange, '1H', '1w should be rolled up from hourly buckets')
   t.pass()
 })
 
@@ -479,12 +490,15 @@ test('getHashrate - pool=true merges pool hashrate per bucket, in MH/s', async (
       jRequest: async (key, method, payload) => {
         if (method === 'getWrkExtData') {
           capturedExtData = payload
-          return [
-            // First bucket: account a averages (100e6 + 200e6) / 2, account b adds 50e6
-            { ts: 1700006460000, stats: [{ poolType: 'f2pool', username: 'a', hashrate: 100e6 }] },
-            { ts: 1700006760000, stats: [{ poolType: 'f2pool', username: 'a', hashrate: 200e6 }, { poolType: 'ocean', username: 'b', hashrate: 50e6 }] }
-            // Second bucket: no samples
-          ]
+          return [{
+            hashrateHistory: [
+              // First bucket: account a averages (100e6 + 200e6) / 2, account b adds 50e6
+              { poolType: 'f2pool', ts: 1700006460000, username: 'a', hashrate: 100e6 },
+              { poolType: 'f2pool', ts: 1700006760000, username: 'a', hashrate: 200e6 },
+              { poolType: 'ocean', ts: 1700006760000, username: 'b', hashrate: 50e6 }
+              // Second bucket: no samples
+            ]
+          }]
         }
         return [
           { ts: 1700006400000, hashrate_mhs_5m_sum_aggr: 100000 },
@@ -499,10 +513,9 @@ test('getHashrate - pool=true merges pool hashrate per bucket, in MH/s', async (
   })
 
   t.is(capturedExtData.type, 'minerpool', 'should query the minerpool workers')
-  t.is(capturedExtData.query.key, 'stats-history', 'should read the raw stats snapshots')
+  t.is(capturedExtData.query.key, 'hashrate-history', 'should read hashrate history samples')
   t.is(capturedExtData.query.start, 1700000000000, 'should cover the requested range')
   t.is(capturedExtData.query.end, 1700100000000, 'should cover the requested range')
-  t.ok(capturedExtData.query.fields, 'should ship a rack-side projection to bound the payload')
   t.is(result.log[0].poolHashrateMhs, 200, 'per-account averages summed, H/s converted to MH/s')
   t.is(result.log[1].poolHashrateMhs, null, 'bucket without pool samples is null')
   t.is(result.summary.avgPoolHashrateMhs, 200, 'summary averages only buckets with pool data')
@@ -515,10 +528,12 @@ test('getHashrate - pool samples outside the bucket window are excluded', async 
     net_r0: {
       jRequest: async (key, method) => {
         if (method === 'getWrkExtData') {
-          return [
-            { ts: 1700006400000, stats: [{ poolType: 'f2pool', username: 'a', hashrate: 100e6 }] },
-            { ts: 1700006400000 + 3600000, stats: [{ poolType: 'f2pool', username: 'a', hashrate: 900e6 }] }
-          ]
+          return [{
+            hashrateHistory: [
+              { poolType: 'f2pool', ts: 1700006400000, username: 'a', hashrate: 100e6 },
+              { poolType: 'f2pool', ts: 1700006400000 + 3600000, username: 'a', hashrate: 900e6 }
+            ]
+          }]
         }
         return [{ ts: '1700006400000-1700009999999', hashrate_mhs_5m_sum_aggr: 100000 }]
       }
@@ -601,6 +616,54 @@ test('getConsumption - happy path', async (t) => {
   t.is(result.log[0].consumptionMWh, (5000000 * 1) / 1000000, 'should convert to MWh over the bucket span')
   t.ok(result.summary.avgPowerW !== null, 'should have avg power')
   t.ok(result.summary.totalConsumptionMWh > 0, 'should have total consumption')
+  t.pass()
+})
+
+test('getConsumption - timezone param never reinterprets start/end', async (t) => {
+  let capturedPayload
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        capturedPayload = payload
+        return [{ ts: 1700006400000, site_power_w: 5000000 }]
+      }
+    }
+  })
+
+  const start = Date.UTC(2026, 5, 1, 0, 0, 0)
+  const end = Date.UTC(2026, 5, 2, 0, 0, 0)
+
+  await getConsumption(mockCtx, {
+    query: { start, end, timezone: 'America/Campo_Grande' }
+  })
+
+  t.is(capturedPayload.start, start, 'start is a true UTC instant, same as export')
+  t.is(capturedPayload.end, end, 'end is a true UTC instant, same as export')
+  t.pass()
+})
+
+test('getConsumption - start/end pass through unconverted on the grouped delegation path too', async (t) => {
+  let capturedPayload
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        capturedPayload = payload
+        return [{ ts: 1700006400000, power_w_type_group_sum_aggr: { 'S19-Pro': 1000 } }]
+      }
+    }
+  })
+
+  const start = Date.UTC(2026, 5, 1, 0, 0, 0)
+  const end = Date.UTC(2026, 5, 2, 0, 0, 0)
+
+  await getConsumption(mockCtx, {
+    query: { start, end, timezone: 'America/Campo_Grande', groupBy: 'miner' }
+  })
+
+  t.is(capturedPayload.start, start, 'grouped RPC call should see the unconverted start')
+  t.is(capturedPayload.end, end, 'grouped RPC call should see the unconverted end')
   t.pass()
 })
 
@@ -901,240 +964,241 @@ test('getConsumption - byMeter honours an explicit 1h interval', async (t) => {
   t.pass()
 })
 
-test('getConsumption - byMeter applies the 1d interval to the ork query and MWh scaling', async (t) => {
-  let capturedPayload
-  const mockCtx = withDataProxy({
-    conf: {
-      orks: [{ rpcPublicKey: 'key1' }],
-      featureConfig: { centralDCSSetup: { enabled: true, tag: 't-dcs-custom' } }
-    },
-    net_r0: {
-      jRequest: async (key, method, payload) => {
-        capturedPayload = payload
-        return [
-          { ts: 1700006400000, by_meter_power_w: { 'PM-1': 3000000, 'PM-2': 2000000 } },
-          { ts: 1700092800000, by_meter_power_w: { 'PM-1': 1000000, 'PM-2': 2000000 } }
-        ]
-      }
+// A site west of UTC, so a local day (04:00Z-03:59Z) straddles two UTC days: the store's own
+// '1D'/'1W' buckets would start before `start` and spill past `end`.
+const LOCAL_TZ = 'America/Campo_Grande' // UTC-4, no DST
+const L_HOUR = 3600000
+const L_DAY = 24 * L_HOUR
+const L_OCT1 = Date.UTC(2026, 9, 1, 4) // Thu 2026-10-01 00:00 local
+const L_MON_OCT5 = Date.UTC(2026, 9, 5, 4) // Mon 2026-10-05 00:00 local
+const L_NOV1 = Date.UTC(2026, 10, 1, 4) // 2026-11-01 00:00 local
+const L_DEC1 = Date.UTC(2026, 11, 1, 4) // 2026-12-01 00:00 local
+
+const localSiteCtx = (rows, { dcs = false, onRequest = () => {} } = {}) => withDataProxy({
+  conf: {
+    orks: [{ rpcPublicKey: 'key1' }],
+    featureConfig: {
+      lockedTimezone: LOCAL_TZ,
+      ...(dcs && { centralDCSSetup: { enabled: true, tag: 't-dcs-custom' } })
     }
-  })
-
-  const result = await getConsumption(mockCtx, {
-    query: { start: 1700000000000, end: 1700100000000, byMeter: true, interval: '1d' }
-  })
-
-  t.is(capturedPayload.key, 'stat-3h', 'daily interval tails the 3h stat log')
-  t.is(capturedPayload.groupRange, '1D', 'and buckets into 1-day windows')
-  t.is(result.log.length, 2, 'one log entry per daily bucket')
-  t.alike(result.log[0].consumptionMWh, { 'PM-1': 72, 'PM-2': 48 }, 'first bucket per-meter MWh over the 24h span')
-  t.alike(result.log[1].consumptionMWh, { 'PM-1': 24, 'PM-2': 48 }, 'second bucket per-meter MWh over the 24h span')
-  t.is(result.summary.groupedBy['PM-1'].avgPowerW, 2000000, 'PM-1 avg power across both days')
-  t.is(result.summary.groupedBy['PM-1'].totalConsumptionMWh, 96, 'PM-1 consumption sums both days')
-  t.is(result.summary.totalConsumptionMWh, 192, 'site total over both days')
-  t.is(result.summary.avgPowerW, 4000000, 'site avg power is total meter power over bucket count')
-  t.pass()
+  },
+  net_r0: {
+    jRequest: async (key, method, payload) => {
+      onRequest(payload)
+      return typeof rows === 'function' ? rows(payload) : rows
+    }
+  }
 })
 
-test('getConsumption - byMeter applies the 1w interval to the ork query and MWh scaling', async (t) => {
-  let capturedPayload
-  const mockCtx = withDataProxy({
-    conf: {
-      orks: [{ rpcPublicKey: 'key1' }],
-      featureConfig: { centralDCSSetup: { enabled: true, tag: 't-dcs-custom' } }
-    },
-    net_r0: {
-      jRequest: async (key, method, payload) => {
-        capturedPayload = payload
-        return [
-          { ts: 1700006400000, by_meter_power_w: { 'PM-1': 1000000 } },
-          { ts: 1700611200000, by_meter_power_w: { 'PM-1': 2000000 } }
-        ]
-      }
-    }
-  })
+test('getConsumption - 1d, 1w and 1M are rolled up from hourly buckets', async (t) => {
+  const captured = []
+  const ctx = localSiteCtx([], { onRequest: (payload) => captured.push(payload) })
+  const dcsCtx = localSiteCtx([], { dcs: true, onRequest: (payload) => captured.push(payload) })
 
-  const result = await getConsumption(mockCtx, {
-    query: { start: 1700000000000, end: 1700100000000, byMeter: true, interval: '1w' }
-  })
+  for (const interval of ['1d', '1w', '1M']) {
+    await getConsumption(ctx, { query: { start: L_OCT1, end: L_DEC1 - 1, interval } })
+    await getConsumption(dcsCtx, { query: { start: L_OCT1, end: L_DEC1 - 1, interval, byMeter: true } })
+  }
 
-  t.is(capturedPayload.key, 'stat-3h', 'weekly interval tails the 3h stat log')
-  t.is(capturedPayload.groupRange, '1W', 'and buckets into 1-week windows')
-  t.is(result.log.length, 2, 'one log entry per weekly bucket')
-  t.alike(result.log[0].consumptionMWh, { 'PM-1': 168 }, '1 MW over a 168h bucket is 168 MWh')
-  t.alike(result.log[1].consumptionMWh, { 'PM-1': 336 }, '2 MW over a 168h bucket is 336 MWh')
-  t.is(result.summary.groupedBy['PM-1'].totalConsumptionMWh, 504, 'PM-1 consumption sums both weekly buckets')
-  t.pass()
+  t.is(captured.length, 6)
+  for (const payload of captured) {
+    t.is(payload.key, 'stat-30m', 'samples the stat-30m log')
+    t.is(payload.groupRange, '1H', 'asks the store for hourly buckets only')
+  }
 })
 
-test('getConsumption - byMeter applies the 1M interval to the ork query and MWh scaling', async (t) => {
-  let capturedPayload
-  const mockCtx = withDataProxy({
-    conf: {
-      orks: [{ rpcPublicKey: 'key1' }],
-      featureConfig: { centralDCSSetup: { enabled: true, tag: 't-dcs-custom' } }
-    },
-    net_r0: {
-      jRequest: async (key, method, payload) => {
-        capturedPayload = payload
-        return [
-          { ts: 1700006400000, by_meter_power_w: { 'PM-1': 1000000 } },
-          { ts: 1702684800000, by_meter_power_w: { 'PM-1': 2000000 } }
-        ]
-      }
-    }
-  })
+test('getConsumption - daily buckets are the site local days, bounded by start/end', async (t) => {
+  const ctx = localSiteCtx([
+    { ts: L_OCT1, site_power_w: 2000000 },
+    // 03:00Z on Oct 2 is still Oct 1 local - the UTC grid put it on the next day
+    { ts: L_OCT1 + 23 * L_HOUR, site_power_w: 4000000 },
+    { ts: L_OCT1 + L_DAY, site_power_w: 1000000 }
+  ])
+  const start = L_OCT1
+  const end = L_OCT1 + 2 * L_DAY - 1
 
-  const result = await getConsumption(mockCtx, {
-    query: { start: 1700000000000, end: 1705276800000, byMeter: true, interval: '1M' }
-  })
+  const result = await getConsumption(ctx, { query: { start, end, interval: '1d' } })
 
-  t.is(capturedPayload.key, 'stat-3h', 'monthly interval tails the 3h stat log')
-  t.is(capturedPayload.groupRange, '1D', 'via daily buckets, rolled up per calendar month')
-  t.is(result.log.length, 2, 'one log entry per calendar month')
-  t.alike(result.log[0].consumptionMWh, { 'PM-1': 24 }, 'November holds its single covered day, not a full 720h')
-  t.alike(result.log[1].consumptionMWh, { 'PM-1': 48 }, 'December likewise')
-  t.is(result.summary.groupedBy['PM-1'].totalConsumptionMWh, 72, 'PM-1 consumption sums both monthly buckets')
-  t.pass()
+  t.is(result.log.length, 2, 'one entry per local day')
+  t.is(result.log[0].ts, start, 'the first entry starts at the requested start')
+  t.alike(result.log[0].timeRange, { startTs: start, endTs: L_OCT1 + L_DAY - 1 }, 'first local day')
+  t.alike(result.log[1].timeRange, { startTs: L_OCT1 + L_DAY, endTs: end }, 'the last entry ends at the requested end')
+  t.is(result.log[0].consumptionMWh, 6, 'a day sums the MWh of its hours')
+  t.is(result.log[0].powerW, 3000000, 'and averages power over the hours that reported')
+  t.is(result.log[1].consumptionMWh, 1)
+  t.is(result.summary.totalConsumptionMWh, 7)
 })
 
-test('getConsumption - site power applies the 1M interval to the ork query and MWh scaling', async (t) => {
-  let capturedPayload
-  const mockCtx = withDataProxy({
-    conf: { orks: [{ rpcPublicKey: 'key1' }] },
-    net_r0: {
-      jRequest: async (key, method, payload) => {
-        capturedPayload = payload
-        return [
-          { ts: 1700006400000, site_power_w: 2000000 },
-          { ts: 1702684800000, site_power_w: 1000000 }
-        ]
-      }
-    }
-  })
+test('getConsumption - edge buckets are clamped to a start/end inside a day', async (t) => {
+  const start = L_OCT1 + 6 * L_HOUR
+  const end = L_OCT1 + L_DAY + 6 * L_HOUR - 1
+  const ctx = localSiteCtx([
+    { ts: start, site_power_w: 1000000 },
+    { ts: L_OCT1 + L_DAY, site_power_w: 1000000 }
+  ])
 
-  const result = await getConsumption(mockCtx, {
-    query: { start: 1700000000000, end: 1705276800000, interval: '1M' }
-  })
+  const result = await getConsumption(ctx, { query: { start, end, interval: '1d' } })
 
-  t.is(capturedPayload.key, 'stat-3h', 'monthly interval tails the 3h stat log')
-  t.is(capturedPayload.groupRange, '1D', 'via daily buckets, rolled up per calendar month')
-  t.is(result.log.length, 2, 'one entry per calendar month')
-  t.is(result.log[0].consumptionMWh, 48, 'November holds its single covered day, not a full 720h')
-  t.is(result.log[1].consumptionMWh, 24, 'December likewise')
-  t.is(result.summary.avgPowerW, 1500000, 'summary averages power across both monthly buckets')
-  t.is(result.summary.totalConsumptionMWh, 72, 'summary sums consumption across both buckets')
-  t.pass()
+  t.is(result.log[0].ts, start, 'ts never precedes start')
+  t.alike(result.log[0].timeRange, { startTs: start, endTs: L_OCT1 + L_DAY - 1 })
+  t.alike(result.log[1].timeRange, { startTs: L_OCT1 + L_DAY, endTs: end }, 'endTs never passes end')
 })
 
-test('getConsumption - site power applies the 1w interval to the ork query and MWh scaling', async (t) => {
-  let capturedPayload
-  const mockCtx = withDataProxy({
-    conf: { orks: [{ rpcPublicKey: 'key1' }] },
-    net_r0: {
-      jRequest: async (key, method, payload) => {
-        capturedPayload = payload
-        return [
-          { ts: 1700006400000, site_power_w: 2000000 },
-          { ts: 1700611200000, site_power_w: 1000000 }
-        ]
-      }
-    }
-  })
+test('getConsumption - weekly buckets are local Monday weeks', async (t) => {
+  const ctx = localSiteCtx([
+    { ts: Date.UTC(2026, 9, 4, 12), site_power_w: 2000000 }, // Sun Oct 4 local
+    { ts: L_MON_OCT5, site_power_w: 1000000 }, // Mon Oct 5 00:00 local
+    { ts: Date.UTC(2026, 9, 12, 3), site_power_w: 1000000 } // Sun Oct 11 23:00 local
+  ])
+  const start = L_OCT1
+  const end = Date.UTC(2026, 9, 12, 4) - 1
 
-  const result = await getConsumption(mockCtx, {
-    query: { start: 1700000000000, end: 1700100000000, interval: '1w' }
-  })
+  const result = await getConsumption(ctx, { query: { start, end, interval: '1w' } })
 
-  t.is(capturedPayload.key, 'stat-3h', 'weekly interval tails the 3h stat log')
-  t.is(capturedPayload.groupRange, '1W', 'and buckets into 1-week windows')
-  t.is(result.log.length, 2, 'one entry per weekly bucket')
-  t.is(result.log[0].consumptionMWh, 336, '2 MW over a 168h bucket is 336 MWh')
-  t.is(result.log[1].consumptionMWh, 168, '1 MW over a 168h bucket is 168 MWh')
-  t.is(result.summary.avgPowerW, 1500000, 'summary averages power across both weekly buckets')
-  t.is(result.summary.totalConsumptionMWh, 504, 'summary sums consumption across both buckets')
-  t.pass()
+  t.is(result.log.length, 2, 'one entry per local week')
+  t.alike(result.log[0].timeRange, { startTs: start, endTs: L_MON_OCT5 - 1 }, 'partial first week starts at start')
+  t.alike(result.log[1].timeRange, { startTs: L_MON_OCT5, endTs: end }, 'second week runs Monday to the requested end')
+  t.is(result.log[0].consumptionMWh, 2)
+  t.is(result.log[1].consumptionMWh, 2)
 })
 
-// A requested interval makes the ork group raw samples into interval-aligned
-// buckets, each returned with a "<start>-<end>" range-string ts. These consts
-// model two consecutive grouped buckets returned from a single ork.
-const DAY1_TS = '1770854400000-1770940799999'
-const DAY1_START = 1770854400000
-const DAY1_END = 1770940799999
-const DAY2_TS = '1770940800000-1771027199999'
-const DAY2_START = 1770940800000
-const DAY2_END = 1771027199999
+test('getConsumption - monthly buckets are local calendar months', async (t) => {
+  const ctx = localSiteCtx([
+    { ts: L_NOV1 - L_HOUR, site_power_w: 2000000 }, // Oct 31 23:00 local
+    { ts: L_NOV1, site_power_w: 1000000 }
+  ])
+  const start = L_OCT1
+  const end = L_DEC1 - 1
 
-const WEEK1_TS = '1770854400000-1771459199999'
-const WEEK1_START = 1770854400000
-const WEEK1_END = 1771459199999
-const WEEK2_TS = '1771459200000-1772063999999'
-const WEEK2_START = 1771459200000
-const WEEK2_END = 1772063999999
+  const result = await getConsumption(ctx, { query: { start, end, interval: '1M' } })
 
-test('getConsumption - byMeter groups ork entries into interval-aligned buckets', async (t) => {
-  let capturedPayload
-  const mockCtx = withDataProxy({
-    conf: {
-      orks: [{ rpcPublicKey: 'key1' }],
-      featureConfig: { centralDCSSetup: { enabled: true, tag: 't-dcs-custom' } }
-    },
-    net_r0: {
-      jRequest: async (key, method, payload) => {
-        capturedPayload = payload
-        return [
-          { ts: DAY1_TS, by_meter_power_w: { 'PM-1': 3000000, 'PM-2': 2000000 } },
-          { ts: DAY2_TS, by_meter_power_w: { 'PM-1': 1000000, 'PM-2': 2000000 } }
-        ]
-      }
-    }
-  })
-
-  const result = await getConsumption(mockCtx, {
-    query: { start: DAY1_START, end: DAY2_END, byMeter: true, interval: '1d' }
-  })
-
-  t.is(capturedPayload.groupRange, '1D', 'ork is asked to group into 1-day buckets')
-  t.is(result.log.length, 2, 'one log entry per grouped bucket')
-  t.is(result.log[0].ts, DAY1_START, 'bucket ts is normalized to its range start')
-  t.is(typeof result.log[0].ts, 'number', 'ts is a number, not the range string')
-  t.alike(result.log[0].timeRange, { startTs: DAY1_START, endTs: DAY1_END }, 'first bucket exposes its aggregation window')
-  t.alike(result.log[1].timeRange, { startTs: DAY2_START, endTs: DAY2_END }, 'second bucket exposes its aggregation window')
-  t.alike(result.log[0].consumptionMWh, { 'PM-1': 72, 'PM-2': 48 }, 'first bucket per-meter MWh over its 24h window')
-  t.alike(result.log[1].consumptionMWh, { 'PM-1': 24, 'PM-2': 48 }, 'second bucket per-meter MWh over its 24h window')
-  t.is(result.summary.groupedBy['PM-1'].totalConsumptionMWh, 96, 'PM-1 consumption sums both buckets')
-  t.is(result.summary.totalConsumptionMWh, 192, 'site total sums both buckets')
-  t.pass()
+  t.is(result.log.length, 2, 'one entry per local month')
+  t.alike(result.log[0].timeRange, { startTs: start, endTs: L_NOV1 - 1 }, 'October local')
+  t.alike(result.log[1].timeRange, { startTs: L_NOV1, endTs: end }, 'November local')
+  t.is(result.log[0].consumptionMWh, 2, 'the last local hour of October stays in October')
+  t.is(result.log[1].consumptionMWh, 1)
 })
 
-test('getConsumption - site power groups ork entries into interval-aligned buckets', async (t) => {
-  let capturedPayload
-  const mockCtx = withDataProxy({
-    conf: { orks: [{ rpcPublicKey: 'key1' }] },
-    net_r0: {
-      jRequest: async (key, method, payload) => {
-        capturedPayload = payload
-        return [
-          { ts: WEEK1_TS, site_power_w: 2000000 },
-          { ts: WEEK2_TS, site_power_w: 1000000 }
-        ]
-      }
-    }
-  })
+test('getConsumption - byMeter daily buckets roll up per meter over local days', async (t) => {
+  const ctx = localSiteCtx([
+    { ts: L_OCT1, by_meter_power_w: { 'PM-1': 3000000, 'PM-2': 2000000 } },
+    { ts: L_OCT1 + L_HOUR, by_meter_power_w: { 'PM-1': 1000000 } }
+  ], { dcs: true })
+  const start = L_OCT1
+  const end = L_OCT1 + L_DAY - 1
 
-  const result = await getConsumption(mockCtx, {
-    query: { start: WEEK1_START, end: WEEK2_END, interval: '1w' }
-  })
+  const result = await getConsumption(ctx, { query: { start, end, interval: '1d', byMeter: true } })
 
-  t.is(capturedPayload.groupRange, '1W', 'ork is asked to group into 1-week buckets')
-  t.is(result.log.length, 2, 'one entry per grouped bucket')
-  t.is(result.log[0].ts, WEEK1_START, 'bucket ts is normalized to its range start')
-  t.alike(result.log[0].timeRange, { startTs: WEEK1_START, endTs: WEEK1_END }, 'first bucket exposes its aggregation window')
-  t.alike(result.log[1].timeRange, { startTs: WEEK2_START, endTs: WEEK2_END }, 'second bucket exposes its aggregation window')
-  t.is(result.log[0].consumptionMWh, 336, '2 MW over a 168h bucket is 336 MWh')
-  t.is(result.log[1].consumptionMWh, 168, '1 MW over a 168h bucket is 168 MWh')
-  t.is(result.summary.totalConsumptionMWh, 504, 'total sums both weekly buckets')
-  t.pass()
+  t.is(result.log.length, 1)
+  t.alike(result.log[0].timeRange, { startTs: start, endTs: end })
+  t.alike(result.log[0].powerW, { 'PM-1': 2000000, 'PM-2': 2000000 }, 'each meter averages its own reported hours')
+  t.alike(result.log[0].consumptionMWh, { 'PM-1': 4, 'PM-2': 2 }, 'each meter sums its hourly MWh')
+  t.is(result.summary.groupedBy['PM-1'].totalConsumptionMWh, 4)
+})
+
+test('getHashrate - daily buckets are the site local days, bounded by start/end', async (t) => {
+  const captured = []
+  const ctx = localSiteCtx([
+    { ts: L_OCT1, hashrate_mhs_5m_sum_aggr: 100, nominal_hashrate_mhs_sum_aggr: 200 },
+    // 03:00Z on Oct 2 is still Oct 1 local
+    { ts: L_OCT1 + 23 * L_HOUR, hashrate_mhs_5m_sum_aggr: 300, nominal_hashrate_mhs_sum_aggr: 200 },
+    { ts: L_OCT1 + L_DAY, hashrate_mhs_5m_sum_aggr: 50, nominal_hashrate_mhs_sum_aggr: 100 }
+  ], { onRequest: (payload) => captured.push(payload) })
+  const start = L_OCT1
+  const end = L_OCT1 + 2 * L_DAY - 1
+
+  const result = await getHashrate(ctx, { query: { start, end, interval: '1d', nominal: true } })
+
+  t.is(captured[0].groupRange, '1H', 'rolled up from hourly buckets')
+  t.is(result.log.length, 2, 'one entry per local day')
+  t.is(result.log[0].ts, start, 'the first entry starts at the requested start')
+  t.alike(result.log[0].timeRange, { startTs: start, endTs: L_OCT1 + L_DAY - 1 })
+  t.alike(result.log[1].timeRange, { startTs: L_OCT1 + L_DAY, endTs: end }, 'the last entry ends at the requested end')
+  t.is(result.log[0].hashrateMhs, 200, 'a day averages its hours')
+  t.is(result.log[0].nominalHashrateMhs, 200)
+  t.is(result.log[0].pctOfNominal, 100)
+  t.is(result.log[1].pctOfNominal, 50)
+  t.is(result.summary.avgHashrateMhs, 125)
+})
+
+test('getHashrate - in a +05:30 zone the first local day starts at start, like consumption', async (t) => {
+  // Local midnight in Asia/Kolkata is 18:30Z, so the store's first hourly bucket is
+  // labelled 18:00Z - half an hour before `start`, in the previous local day.
+  const start = Date.UTC(2026, 9, 10, 18, 30)
+  const end = start + 2 * L_DAY - 1
+  const rows = []
+  for (let ts = start - L_HOUR / 2; ts <= end; ts += L_HOUR) rows.push({ ts, hashrate_mhs_5m_sum_aggr: 100 })
+  const ctx = localSiteCtx(rows)
+
+  const daily = await getHashrate(ctx, { query: { start, end, interval: '1d', timezone: 'Asia/Kolkata' } })
+
+  t.alike(daily.log.map(({ ts, timeRange }) => ({ ts, timeRange })), [
+    { ts: start, timeRange: { startTs: start, endTs: start + L_DAY - 1 } },
+    { ts: start + L_DAY, timeRange: { startTs: start + L_DAY, endTs: end } }
+  ], 'no empty bucket before the first local day')
+
+  const hourly = await getHashrate(ctx, { query: { start, end, interval: '1h', timezone: 'Asia/Kolkata' } })
+  t.is(hourly.log[0].ts, start, 'the straddling hour is clamped to start')
+})
+
+test('getHashrate - groupBy days are the site local days, bounded by start/end', async (t) => {
+  const captured = []
+  // 2026-10-06 00:00 local to 2026-10-12 23:59:59.999 local
+  const start = 1791259200000
+  const end = 1791863999999
+  const rows = []
+  for (let ts = start; ts <= end; ts += L_HOUR) {
+    // the first local day's hours alternate 100/300, so it averages 200
+    const first = ts < start + L_DAY
+    rows.push({ ts, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-a': first ? (ts / L_HOUR % 2 ? 300 : 100) : 50 } })
+  }
+  // an hour with no group map is skipped, not counted as zero
+  rows.push({ ts: start + L_DAY / 2 + 1, hashrate_mhs_5m_type_group_sum_aggr: null })
+  const ctx = localSiteCtx(rows, { onRequest: (payload) => captured.push(payload) })
+
+  const result = await getHashrate(ctx, { query: { start, end, groupBy: 'miner' } })
+
+  t.is(captured[0].key, 'stat-30m')
+  t.is(captured[0].groupRange, '1H', 'rolled up from hourly buckets')
+  t.is(result.log.length, 7, 'one entry per local day')
+  t.is(result.log[0].ts, start, 'the first entry starts at the requested start')
+  t.alike(result.log[0].timeRange, { startTs: start, endTs: start + L_DAY - 1 })
+  t.alike(result.log[6].timeRange, { startTs: start + 6 * L_DAY, endTs: end }, 'the last entry ends at the requested end')
+  t.alike(result.log[0].hashrateMhs, { 'miner-a': 200 }, 'a group averages its hours')
+  t.alike(result.log[1].hashrateMhs, { 'miner-a': 50 })
+})
+
+test('getEfficiency - daily buckets are the site local days, bounded by start/end', async (t) => {
+  const start = L_OCT1
+  const end = L_OCT1 + 2 * L_DAY - 1
+  const ctx = localSiteCtx([
+    { ts: L_OCT1, efficiency_w_ths_avg_aggr: 20 },
+    { ts: L_OCT1 + 23 * L_HOUR, efficiency_w_ths_avg_aggr: 30 },
+    { ts: L_OCT1 + L_DAY, efficiency_w_ths_avg_aggr: 40 }
+  ])
+
+  const result = await getEfficiency(ctx, { query: { start, end, interval: '1d' } })
+
+  t.is(result.log.length, 2, 'one entry per local day')
+  t.alike(result.log[0].timeRange, { startTs: start, endTs: L_OCT1 + L_DAY - 1 })
+  t.alike(result.log[1].timeRange, { startTs: L_OCT1 + L_DAY, endTs: end })
+  t.is(result.log[0].efficiencyWThs, 25, 'a day averages its hours')
+  t.is(result.log[1].efficiencyWThs, 40)
+})
+
+test('getEfficiency - central DCS divides the local day mean power by its mean hashrate', async (t) => {
+  const start = L_OCT1
+  const end = L_OCT1 + L_DAY - 1
+  const ctx = localSiteCtx((payload) => payload.type === 'dcs-siemens'
+    ? [{ ts: L_OCT1, site_power_w: 4000 }, { ts: L_OCT1 + 23 * L_HOUR, site_power_w: 2000 }]
+    : [{ ts: L_OCT1, hashrate_mhs_5m_sum_aggr: 100000000 }, { ts: L_OCT1 + 23 * L_HOUR, hashrate_mhs_5m_sum_aggr: 20000000 }],
+  { dcs: true })
+
+  const result = await getEfficiency(ctx, { query: { start, end, interval: '1d' } })
+
+  t.is(result.log.length, 1)
+  t.alike(result.log[0].timeRange, { startTs: start, endTs: end })
+  t.is(result.log[0].efficiencyWThs, 50, '3000 W over 60 TH/s')
 })
 
 test('getConsumption - missing start throws', async (t) => {
@@ -1181,7 +1245,7 @@ test('getConsumption - empty ork results', async (t) => {
   t.pass()
 })
 
-test('getConsumption - MWh scales with the bucket span', async (t) => {
+test('getConsumption - daily MWh is the sum of its hourly MWh', async (t) => {
   const mockCtx = withDataProxy({
     conf: { orks: [{ rpcPublicKey: 'key1' }] },
     net_r0: {
@@ -1194,7 +1258,7 @@ test('getConsumption - MWh scales with the bucket span', async (t) => {
   const daily = await getConsumption(mockCtx, { query: { ...query, interval: '1d' } })
 
   t.is(hourly.log[0].consumptionMWh, 5, '1h bucket at 5 MW is 5 MWh')
-  t.is(daily.log[0].consumptionMWh, 120, '24h bucket at 5 MW is 120 MWh')
+  t.is(daily.log[0].consumptionMWh, 5, 'a day sums the MWh of the hours it holds')
   t.is(hourly.log[0].powerW, daily.log[0].powerW, 'average power is unaffected by bucket span')
   t.pass()
 })
@@ -1399,6 +1463,197 @@ test('calculateGroupedConsumptionSummary - handles empty log', (t) => {
   t.pass()
 })
 
+// ==================== Energy Rollup Consumption Tests ====================
+
+const R_HOUR = 3600000
+const ROLLUP_SINCE = 1700006400000 // UTC midnight
+
+// Central-DCS ctx with the energy rollup enabled; jRequest answers per log key
+// and records every payload so the chosen path can be asserted.
+const rollupCtx = (rowsByKey, { sinceTs = ROLLUP_SINCE, dcs = true } = {}) => {
+  const calls = []
+  const ctx = withDataProxy({
+    conf: {
+      orks: [{ rpcPublicKey: 'key1' }],
+      featureConfig: {
+        ...(dcs && { centralDCSSetup: { enabled: true, tag: 't-dcs-custom' } }),
+        energyRollup: { sinceTs }
+      }
+    },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        calls.push(payload)
+        return rowsByKey[payload.key] || []
+      }
+    }
+  })
+  return { ctx, calls }
+}
+
+const rollupHours = (startTs, count, powerW, byMeter) => {
+  const rows = []
+  for (let i = 0; i < count; i++) {
+    rows.push({
+      ts: startTs + i * R_HOUR,
+      site_power_w: powerW,
+      ...(byMeter && { by_meter_power_w: byMeter }),
+      rollup_count: 12,
+      rollup_window_ms: R_HOUR
+    })
+  }
+  return rows
+}
+
+test('getConsumption - hourly entries come from the energy-1h rollup when covered', async (t) => {
+  const { ctx, calls } = rollupCtx({
+    'energy-1h': [
+      { ts: ROLLUP_SINCE, site_power_w: 12000000 },
+      { ts: ROLLUP_SINCE + R_HOUR, site_power_w: 10000000 }
+    ]
+  })
+
+  const result = await getConsumption(ctx, {
+    query: { start: ROLLUP_SINCE, end: ROLLUP_SINCE + 2 * R_HOUR - 1 }
+  })
+
+  t.is(calls.length, 1, 'a covered range needs a single RPC')
+  t.is(calls[0].key, 'energy-1h', 'reads the rollup log, not stat-30m')
+  t.is(calls[0].type, 'dcs-siemens', 'reads the DCS worker')
+  t.ok(calls[0].limit >= 2, 'passes an explicit limit (non-stat keys default to 100)')
+  t.absent(calls[0].groupRange, 'no worker-side re-aggregation of stored hourly averages')
+  t.is(result.log.length, 2, 'one entry per stored hour')
+  t.is(result.log[0].powerW, 12000000, 'hourly power is the stored average')
+  t.is(result.log[0].consumptionMWh, 12, 'hourly MWh derives from the stored average')
+  t.alike(result.log[0].timeRange, { startTs: ROLLUP_SINCE, endTs: ROLLUP_SINCE + R_HOUR - 1 }, 'entries carry the hour bounds')
+  t.is(result.summary.totalConsumptionMWh, 22, 'summary sums the hourly integrals')
+  t.pass()
+})
+
+test('getConsumption - daily buckets sum stored hourly consumption', async (t) => {
+  const DAY = 24 * R_HOUR
+  const { ctx } = rollupCtx({
+    'energy-1h': [
+      ...rollupHours(ROLLUP_SINCE, 24, 10000000),
+      ...rollupHours(ROLLUP_SINCE + DAY, 12, 12000000)
+    ]
+  })
+
+  const result = await getConsumption(ctx, {
+    query: { start: ROLLUP_SINCE, end: ROLLUP_SINCE + 2 * DAY - 1, interval: '1d' }
+  })
+
+  t.is(result.log.length, 2, 'one entry per day')
+  t.is(result.log[0].consumptionMWh, 240, 'full day sums its 24 hourly MWh')
+  t.is(result.log[0].powerW, 10000000, 'full-day power is the mean over its hours')
+  t.is(result.log[1].consumptionMWh, 144, 'gappy day sums only the hours that exist')
+  t.is(result.log[1].powerW, 12000000, 'gappy-day power averages only reported hours')
+  t.alike(result.log[1].timeRange, { startTs: ROLLUP_SINCE + DAY, endTs: ROLLUP_SINCE + 2 * DAY - 1 }, 'daily entries carry day bounds')
+  t.is(result.summary.totalConsumptionMWh, 384, 'summary total is the exact sum')
+  t.pass()
+})
+
+test('getConsumption - monthly rollup sums days built from hourly integrals', async (t) => {
+  const DAY = 24 * R_HOUR
+  const { ctx } = rollupCtx({
+    'energy-1h': [
+      ...rollupHours(ROLLUP_SINCE, 24, 10000000),
+      ...rollupHours(ROLLUP_SINCE + DAY, 24, 20000000)
+    ]
+  })
+
+  const result = await getConsumption(ctx, {
+    query: { start: ROLLUP_SINCE, end: ROLLUP_SINCE + 2 * DAY - 1, interval: '1M' }
+  })
+
+  t.is(result.log.length, 1, 'both days land in one month')
+  t.is(result.log[0].ts, ROLLUP_SINCE, 'a month starting before the range is clamped to start')
+  t.alike(result.log[0].timeRange, { startTs: ROLLUP_SINCE, endTs: ROLLUP_SINCE + 2 * DAY - 1 }, 'and ends at end')
+  t.is(result.log[0].consumptionMWh, 720, 'month sums the daily sums')
+  t.is(result.log[0].powerW, 15000000, 'month power averages its hours')
+  t.pass()
+})
+
+test('getConsumption - byMeter served from the rollup averages per meter over present hours', async (t) => {
+  const { ctx, calls } = rollupCtx({
+    'energy-1h': [
+      { ts: ROLLUP_SINCE, by_meter_power_w: { 'qgbt-01': 3000000, 'ccm-01': 1000000 } },
+      { ts: ROLLUP_SINCE + R_HOUR, by_meter_power_w: { 'qgbt-01': 1000000 } }
+    ]
+  })
+
+  const result = await getConsumption(ctx, {
+    query: { start: ROLLUP_SINCE, end: ROLLUP_SINCE + 2 * R_HOUR - 1, byMeter: true, interval: '1d' }
+  })
+
+  t.is(calls[0].key, 'energy-1h', 'byMeter reads the rollup log')
+  t.is(result.log.length, 1, 'both hours land in one day bucket')
+  t.alike(result.log[0].powerW, { 'qgbt-01': 2000000, 'ccm-01': 1000000 }, 'per-meter power averages only the hours a meter reported')
+  t.alike(result.log[0].consumptionMWh, { 'qgbt-01': 4, 'ccm-01': 1 }, 'per-meter MWh sums the hourly integrals')
+  t.is(result.summary.groupedBy['qgbt-01'].totalConsumptionMWh, 4, 'summary keeps the per-meter split')
+  t.pass()
+})
+
+test('getConsumption - ranges starting before the rollup cutover use the legacy stat path', async (t) => {
+  const { ctx, calls } = rollupCtx({
+    'energy-1h': [{ ts: ROLLUP_SINCE, site_power_w: 12000000 }],
+    'stat-30m': [{ ts: ROLLUP_SINCE - R_HOUR, site_power_w: 5000000 }]
+  })
+
+  const result = await getConsumption(ctx, {
+    query: { start: ROLLUP_SINCE - 2 * R_HOUR, end: ROLLUP_SINCE + R_HOUR }
+  })
+
+  t.is(calls.length, 1, 'no rollup probe for uncovered ranges')
+  t.is(calls[0].key, 'stat-30m', 'legacy hourly path is used')
+  t.is(result.log[0].powerW, 5000000, 'result comes from the stat log')
+  t.pass()
+})
+
+test('getConsumption - falls back to the stat path when the rollup returns nothing', async (t) => {
+  const { ctx, calls } = rollupCtx({
+    'energy-1h': [],
+    'stat-30m': [{ ts: ROLLUP_SINCE, site_power_w: 5000000 }]
+  })
+
+  const result = await getConsumption(ctx, {
+    query: { start: ROLLUP_SINCE, end: ROLLUP_SINCE + 2 * R_HOUR - 1 }
+  })
+
+  t.is(calls.length, 2, 'tries the rollup first, then the stat log')
+  t.is(calls[0].key, 'energy-1h', 'rollup is probed first')
+  t.is(calls[1].key, 'stat-30m', 'stat log answers when the rollup is empty')
+  t.is(result.log[0].powerW, 5000000, 'result comes from the fallback')
+  t.pass()
+})
+
+test('getConsumption - rollup is ignored without central DCS or without a cutover ts', async (t) => {
+  const statRow = [{ ts: ROLLUP_SINCE, site_power_w: 5000000 }]
+  const query = { start: ROLLUP_SINCE, end: ROLLUP_SINCE + 2 * R_HOUR - 1 }
+
+  const nonDcs = rollupCtx({ 'stat-30m': statRow }, { dcs: false })
+  await getConsumption(nonDcs.ctx, { query })
+  t.is(nonDcs.calls[0].key, 'stat-30m', 'non-DCS sites never read the rollup')
+  t.is(nonDcs.calls[0].type, 'powermeter', 'non-DCS sites keep the powermeter source')
+
+  const noCutover = rollupCtx({ 'stat-30m': statRow }, { sinceTs: null })
+  await getConsumption(noCutover.ctx, { query })
+  t.is(noCutover.calls[0].key, 'stat-30m', 'feature stays off until sinceTs is configured')
+  t.pass()
+})
+
+test('getConsumption - rollup ignores unsupported interval values', async (t) => {
+  const { ctx, calls } = rollupCtx({
+    'stat-3h': [{ ts: ROLLUP_SINCE, site_power_w: 5000000 }]
+  })
+
+  await getConsumption(ctx, {
+    query: { start: ROLLUP_SINCE, end: ROLLUP_SINCE + 2 * R_HOUR - 1, interval: '3h' }
+  })
+
+  t.is(calls[0].key, 'stat-3h', 'unknown intervals keep the legacy config resolution')
+  t.pass()
+})
+
 // ==================== Efficiency Tests ====================
 
 test('getEfficiency - happy path', async (t) => {
@@ -1425,6 +1680,30 @@ test('getEfficiency - happy path', async (t) => {
   t.ok(result.log.length > 0, 'log should have entries')
   t.is(result.log[0].efficiencyWThs, 25.5, 'should have efficiency value')
   t.ok(result.summary.avgEfficiencyWThs !== null, 'should have avg efficiency')
+  t.pass()
+})
+
+test('getEfficiency - timezone param never reinterprets start/end', async (t) => {
+  let capturedPayload
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        capturedPayload = payload
+        return [{ ts: 1700006400000, efficiency_w_ths_avg_aggr: 25.5 }]
+      }
+    }
+  })
+
+  const start = Date.UTC(2026, 5, 1, 0, 0, 0)
+  const end = Date.UTC(2026, 5, 2, 0, 0, 0)
+
+  await getEfficiency(mockCtx, {
+    query: { start, end, timezone: 'America/Campo_Grande' }
+  })
+
+  t.is(capturedPayload.start, start, 'start is a true UTC instant, same as export')
+  t.is(capturedPayload.end, end, 'end is a true UTC instant, same as export')
   t.pass()
 })
 
@@ -1851,6 +2130,30 @@ test('getMinerStatus - happy path', async (t) => {
   t.pass()
 })
 
+test('getMinerStatus - timezone param never reinterprets start/end', async (t) => {
+  let capturedPayload
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        capturedPayload = payload
+        return [{ ts: 1700006400000, type_cnt: { 'miner-am-s19xp': 100 } }]
+      }
+    }
+  })
+
+  const start = Date.UTC(2026, 5, 1, 0, 0, 0)
+  const end = Date.UTC(2026, 5, 2, 0, 0, 0)
+
+  await getMinerStatus(mockCtx, {
+    query: { start, end, timezone: 'America/Campo_Grande' }
+  })
+
+  t.is(capturedPayload.start, start, 'start is a true UTC instant, same as export')
+  t.is(capturedPayload.end, end, 'end is a true UTC instant, same as export')
+  t.pass()
+})
+
 test('getMinerStatus - emits error and excludes it from online', async (t) => {
   let payload = null
   const mockCtx = withDataProxy({
@@ -1904,7 +2207,7 @@ test('getMinerStatus - groupBy=type returns per-type status counts', async (t) =
   t.is(payload.aggrFields.offline_type_cnt, 1, 'should request per-type offline')
   t.is(payload.aggrFields.error_type_cnt, 1, 'should request per-type error')
   t.alike(result.log[0].total, { 'am-s19': 800, 'wm-m50': 481 }, 'should key total by type')
-  t.is(result.log[0].online['am-s19'], 796, 'per-type online = 800 - 3 maintenance - 1 error')
+  t.is(result.log[0].online['am-s19'], 799, 'per-type online = 800 - 1 error, maintenance is not part of the total')
   t.is(result.log[0].online['wm-m50'], 476, 'per-type online = 481 - 5 offline')
   t.is(result.log[0].error['am-s19'], 1, 'should key error by type')
   t.pass()
@@ -1954,6 +2257,10 @@ test('getMinerStatus - empty ork results', async (t) => {
   t.pass()
 })
 
+// Unbounded UTC days, so these tests see whole-day buckets keyed by their start.
+const UTC_DAYS = { interval: '1d', timezone: 'UTC', start: 0, end: Infinity }
+const byTs = (log) => Object.fromEntries(log.map((entry) => [entry.ts, entry]))
+
 test('processMinerStatusData - processes daily entries', (t) => {
   const results = [[
     {
@@ -1965,7 +2272,7 @@ test('processMinerStatusData - processes daily entries', (t) => {
     }
   ]]
 
-  const daily = processMinerStatusData(results)
+  const daily = byTs(processMinerStatusData(results, UTC_DAYS))
   t.ok(typeof daily === 'object', 'should return object')
   const key = Object.keys(daily)[0]
   t.is(daily[key].offline, 5, 'should extract offline count')
@@ -1977,7 +2284,7 @@ test('processMinerStatusData - processes daily entries', (t) => {
 
 test('processMinerStatusData - handles error results', (t) => {
   const results = [{ error: 'timeout' }]
-  const daily = processMinerStatusData(results)
+  const daily = byTs(processMinerStatusData(results, UTC_DAYS))
   t.ok(typeof daily === 'object', 'should return object')
   t.is(Object.keys(daily).length, 0, 'should be empty for error results')
   t.pass()
@@ -2001,7 +2308,7 @@ test('processMinerStatusData - aggregates multiple orks same day', (t) => {
     }]
   ]
 
-  const daily = processMinerStatusData(results)
+  const daily = byTs(processMinerStatusData(results, UTC_DAYS))
   const key = Object.keys(daily)[0]
   t.is(daily[key].offline, 5, 'should sum offline across orks (3+2)')
   t.is(daily[key].sleep, 5, 'should sum sleep across orks')
@@ -2023,11 +2330,32 @@ test('processMinerStatusData - handles entries with aggrFields wrapper', (t) => 
     }
   ]]
 
-  const daily = processMinerStatusData(results)
+  const daily = byTs(processMinerStatusData(results, UTC_DAYS))
   const key = Object.keys(daily)[0]
   t.is(daily[key].offline, 10, 'should extract from aggrFields wrapper')
   t.is(daily[key].sleep, 5, 'should extract sleep from aggrFields')
   t.is(daily[key].maintenance, 3, 'should extract maintenance from aggrFields')
+  t.pass()
+})
+
+test('processMinerStatusData - online comes from the mining count when the worker provides it', (t) => {
+  const dayStart = 1700006400000
+  const threeHours = 3 * 60 * 60 * 1000
+  // type_cnt excludes the 49 maintenance miners here, so deriving online from it
+  // would double-subtract maintenance; the mining count reports it directly
+  const snapshot = (ts, mining) => ({
+    ts,
+    type_cnt: { m63: 1256 },
+    online_or_minor_error_miners_amount_aggr: mining,
+    offline_cnt: { 'group-1': 13 },
+    maintenance_type_cnt: { m63: 49 }
+  })
+  const results = [[snapshot(dayStart, 1243), snapshot(dayStart + threeHours, 1243)]]
+
+  const daily = byTs(processMinerStatusData(results, UTC_DAYS))
+  t.is(daily[dayStart].online, 1243, 'online should be the averaged mining count, not total minus maintenance')
+  t.is(daily[dayStart].offline, 13, 'offline should stay the averaged offline count')
+  t.is(daily[dayStart].maintenance, 49, 'maintenance should stay its own bucket')
   t.pass()
 })
 
@@ -2042,7 +2370,7 @@ test('processMinerStatusData - averages the day snapshots, absent statuses count
     { ts: dayStart + 3 * threeHours, type_cnt: { m50: 100 }, offline_cnt: { 'container-1a': 8 } }
   ]]
 
-  const daily = processMinerStatusData(results)
+  const daily = byTs(processMinerStatusData(results, UTC_DAYS))
   t.is(daily[dayStart].offline, 2, 'offline should average over all snapshots (8/4), not only where present')
   t.is(daily[dayStart].online, 98, 'online should reflect the averaged offline count')
   t.pass()
@@ -2063,7 +2391,7 @@ test('processMinerStatusData - averages snapshots per day across multiple orks',
     ]
   ]
 
-  const daily = processMinerStatusData(results)
+  const daily = byTs(processMinerStatusData(results, UTC_DAYS))
   t.is(daily[dayStart].offline, 3, 'offline should be the fleet sum per tick averaged over ticks ((4+2)/2)')
   t.is(daily[dayStart].online, 97, 'online should derive from the averaged totals (100-3)')
   t.pass()
@@ -2077,7 +2405,7 @@ test('processGroupedMinerStatusData - averages the day snapshots per type', (t) 
     { ts: dayStart + threeHours, type_cnt: { m50: 100, s19: 50 }, offline_type_cnt: { m50: 10 } }
   ]]
 
-  const daily = processGroupedMinerStatusData(results)
+  const daily = byTs(processGroupedMinerStatusData(results, UTC_DAYS))
   t.is(daily[dayStart].offline.m50, 5, 'per-type offline should average over all snapshots (10/2)')
   t.is(daily[dayStart].online.m50, 95, 'per-type online should reflect the averaged offline')
   t.is(daily[dayStart].online.s19, 50, 'types without offline snapshots stay fully online')
@@ -2414,6 +2742,30 @@ test('getPowerMode - happy path', async (t) => {
   t.pass()
 })
 
+test('getPowerMode - timezone param never reinterprets start/end', async (t) => {
+  let capturedPayload
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        capturedPayload = payload
+        return [{ ts: 1700006400000, power_mode_group_aggr: {}, status_group_aggr: {} }]
+      }
+    }
+  })
+
+  const start = Date.UTC(2026, 5, 1, 0, 0, 0)
+  const end = Date.UTC(2026, 5, 2, 0, 0, 0)
+
+  await getPowerMode(mockCtx, {
+    query: { start, end, timezone: 'America/Campo_Grande' }
+  })
+
+  t.is(capturedPayload.start, start, 'start is a true UTC instant, same as export')
+  t.is(capturedPayload.end, end, 'end is a true UTC instant, same as export')
+  t.pass()
+})
+
 test('getPowerMode - missing start/end throws', async (t) => {
   const mockCtx = withDataProxy({
     conf: { orks: [] },
@@ -2609,6 +2961,52 @@ test('getPowerModeTimeline - default start/end', async (t) => {
   const result = await getPowerModeTimeline(mockCtx, { query: {} })
   t.ok(result.log, 'should return log with defaults')
   t.ok(Array.isArray(result.log), 'should be array')
+  t.pass()
+})
+
+test('getPowerModeTimeline - timezone param never reinterprets an explicit start/end', async (t) => {
+  let capturedPayload
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        capturedPayload = payload
+        return []
+      }
+    }
+  })
+
+  const start = Date.UTC(2026, 5, 1, 0, 0, 0)
+  const end = Date.UTC(2026, 5, 1, 1, 0, 0)
+
+  await getPowerModeTimeline(mockCtx, {
+    query: { start, end, timezone: 'America/Campo_Grande' }
+  })
+
+  t.is(capturedPayload.start, start, 'the explicit start is a true UTC instant, same as export')
+  t.pass()
+})
+
+test('getPowerModeTimeline - timezone param does not shift the computed default range', async (t) => {
+  const before = Date.now()
+  let firstPayload
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (!firstPayload) firstPayload = payload
+        return []
+      }
+    }
+  })
+
+  await getPowerModeTimeline(mockCtx, { query: { timezone: 'America/Campo_Grande' } })
+  const after = Date.now()
+
+  // The default window is "now - 1 month"; a timezone offset (America/Campo_Grande
+  // is UTC-4) must not leak into it the way it does for an explicit start/end.
+  t.ok(firstPayload.start >= before - METRICS_TIME.ONE_MONTH_MS - 1000, 'default start should not be shifted earlier by the zone offset')
+  t.ok(firstPayload.start <= after - METRICS_TIME.ONE_MONTH_MS + 1000, 'default start should not be shifted later by the zone offset')
   t.pass()
 })
 
@@ -2817,7 +3215,7 @@ test('getPowerModeTimeline - fetches a 7d range as bounded 1m windows', async (t
 
   const start = 1700000000000
   const end = start + 7 * 24 * 60 * 60 * 1000
-  const result = await getPowerModeTimeline(mockCtx, { query: { start, end } })
+  const result = await getPowerModeTimeline(mockCtx, { query: { start, end, timezone: 'UTC' } })
 
   t.is(capturedPayloads.length, 14, 'should split 7d of 1m samples into 720-sample windows')
   t.is(capturedPayloads[0].key, 'stat-1m', 'should request the 1m stat log')
@@ -3358,6 +3756,31 @@ test('getContainerHistory - uses defaults when no start/end', async (t) => {
   t.pass()
 })
 
+test('getContainerHistory - timezone param never reinterprets an explicit start/end', async (t) => {
+  let capturedPayload
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        capturedPayload = payload
+        return []
+      }
+    }
+  })
+
+  const start = Date.UTC(2026, 5, 1, 0, 0, 0)
+  const end = Date.UTC(2026, 5, 1, 1, 0, 0)
+
+  await getContainerHistory(mockCtx, {
+    params: { id: 'bitdeer-9a' },
+    query: { start, end, timezone: 'America/Campo_Grande' }
+  })
+
+  t.is(capturedPayload.start, start, 'the explicit start is a true UTC instant, same as export')
+  t.is(capturedPayload.end, end, 'the explicit end is a true UTC instant, same as export')
+  t.pass()
+})
+
 test('getContainerHistory - empty results', async (t) => {
   const mockCtx = withDataProxy({
     conf: { orks: [{ rpcPublicKey: 'key1' }] },
@@ -3633,6 +4056,8 @@ test('parseEntryTimeRange - parses a range string into startTs/endTs', (t) => {
   t.is(parseEntryTimeRange(null), null, 'null ts has no range')
 })
 
+// The store's own window is passed through on the hourly path; days/weeks/months are
+// re-cut in the site's zone (see the local-bucket tests).
 test('getHashrate - exposes the aggregation window as timeRange', async (t) => {
   const mockCtx = withDataProxy({
     conf: { orks: [{ rpcPublicKey: 'key1' }] },
@@ -3642,7 +4067,7 @@ test('getHashrate - exposes the aggregation window as timeRange', async (t) => {
   })
 
   const result = await getHashrate(mockCtx, {
-    query: { start: 1770854400000, end: 1771459199999 }
+    query: { start: 1770854400000, end: 1771459199999, interval: '1h' }
   })
 
   t.alike(result.log[0].timeRange, { startTs: RANGE_START, endTs: RANGE_END }, 'timeRange should cover the full window')
@@ -3673,7 +4098,7 @@ test('getConsumption - exposes the aggregation window as timeRange', async (t) =
   })
 
   const result = await getConsumption(mockCtx, {
-    query: { start: 1770854400000, end: 1771459199999 }
+    query: { start: 1770854400000, end: 1771459199999, interval: '1h' }
   })
 
   t.alike(result.log[0].timeRange, { startTs: RANGE_START, endTs: RANGE_END }, 'timeRange should cover the full window')
@@ -3689,7 +4114,7 @@ test('getEfficiency - exposes the aggregation window as timeRange', async (t) =>
   })
 
   const result = await getEfficiency(mockCtx, {
-    query: { start: 1770854400000, end: 1771459199999 }
+    query: { start: 1770854400000, end: 1771459199999, interval: '1h' }
   })
 
   t.alike(result.log[0].timeRange, { startTs: RANGE_START, endTs: RANGE_END }, 'timeRange should cover the full window')
@@ -3710,7 +4135,7 @@ test('getEfficiency - central DCS path normalizes range ts and exposes timeRange
   })
 
   const result = await getEfficiency(mockCtx, {
-    query: { start: 1770854400000, end: 1771459199999 }
+    query: { start: 1770854400000, end: 1771459199999, interval: '1h' }
   })
 
   t.is(result.log[0].ts, RANGE_START, 'ts should be the numeric range start')
@@ -3735,8 +4160,31 @@ test('getMinerStatus - exposes the day window as timeRange', async (t) => {
   t.is(result.log[0].online, 8, 'counts should be preserved')
 })
 
+test('getMinerStatus - days are the site local days, bounded by start/end', async (t) => {
+  const start = L_OCT1
+  const end = L_OCT1 + 2 * L_DAY - 1
+  const ctx = localSiteCtx([
+    { ts: L_OCT1 + 2 * L_HOUR, type_cnt: { m50: 10 }, offline_cnt: { c1: 2 } },
+    // 03:00Z on Oct 2 is still Oct 1 local
+    { ts: L_OCT1 + 23 * L_HOUR, type_cnt: { m50: 10 }, offline_cnt: { c1: 4 } },
+    { ts: L_OCT1 + L_DAY + 2 * L_HOUR, type_cnt: { m50: 10 } }
+  ])
+
+  const plain = await getMinerStatus(ctx, { query: { start, end } })
+  const grouped = await getMinerStatus(ctx, { query: { start, end, groupBy: 'type' } })
+
+  for (const { log } of [plain, grouped]) {
+    t.is(log.length, 2, 'one entry per local day')
+    t.is(log[0].ts, start, 'the first entry starts at the requested start')
+    t.alike(log[0].timeRange, { startTs: start, endTs: L_OCT1 + L_DAY - 1 })
+    t.alike(log[1].timeRange, { startTs: L_OCT1 + L_DAY, endTs: end }, 'the last entry ends at the requested end')
+  }
+  t.is(plain.log[0].offline, 3, 'both Oct 1 local snapshots average into Oct 1')
+  t.is(plain.log[1].offline, 0)
+})
+
 test('processGroupedMinerStatusData - exposes the day window as timeRange', (t) => {
-  const daily = processGroupedMinerStatusData([[{ ts: RANGE_START, type_cnt: { m50: 10 }, offline_type_cnt: { m50: 2 } }]])
+  const daily = byTs(processGroupedMinerStatusData([[{ ts: RANGE_START, type_cnt: { m50: 10 }, offline_type_cnt: { m50: 2 } }]], UTC_DAYS))
 
   const bucket = daily[RANGE_START]
   t.alike(bucket.timeRange, { startTs: RANGE_START, endTs: RANGE_START + DAY_MS - 1 }, 'timeRange should cover the day')
@@ -3832,6 +4280,92 @@ test('getHashrate - nominal adds per-bucket nominal and pct', async (t) => {
   t.is(Math.round(result.log[1].pctOfNominal * 10) / 10, 71.2, 'second bucket pct matches the design')
   t.is(result.summary.nominalHashrateMhs, 78275000000, 'summary carries nominal')
   t.is(Math.round(result.summary.avgPctOfNominal * 10) / 10, 83.7, 'summary averages the pct')
+  t.pass()
+})
+
+test('getHashrate - siteNominal replaces the installed nominal with the configured site nominal', async (t) => {
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method) => {
+        if (method === 'getGlobalConfig') return { nominalSiteHashrate_MHS: 7.5e11 }
+        return [
+          { ts: 1700006400000, hashrate_mhs_5m_sum_aggr: 3e11, nominal_hashrate_mhs_sum_aggr: 2.6112e11 },
+          { ts: 1700010000000, hashrate_mhs_5m_sum_aggr: 6e11, nominal_hashrate_mhs_sum_aggr: 0 }
+        ]
+      }
+    }
+  })
+  const query = { start: 1700000000000, end: 1700100000000, nominal: true }
+
+  const site = await getHashrate(mockCtx, { query: { ...query, siteNominal: 'true' } })
+  t.alike(site.log.map((entry) => entry.nominalHashrateMhs), [7.5e11, 7.5e11], 'every bucket carries the site nominal')
+  t.alike(site.log.map((entry) => entry.pctOfNominal), [40, 80])
+  t.is(site.summary.nominalHashrateMhs, 7.5e11)
+
+  const installed = await getHashrate(mockCtx, { query })
+  t.is(installed.log[0].nominalHashrateMhs, 2.6112e11, 'without siteNominal the installed nominal is unchanged')
+
+  const noNominal = await getHashrate(mockCtx, { query: { ...query, nominal: false, siteNominal: true } })
+  t.absent('nominalHashrateMhs' in noNominal.log[0], 'siteNominal alone does not opt into the nominal series')
+  t.pass()
+})
+
+test('getHashrate - siteNominal prefers the invoice nominal over the site nominal', async (t) => {
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method) => {
+        if (method === 'getGlobalConfig') {
+          return { invoiceNominalHashrate_MHS: 7.5e11, nominalSiteHashrate_MHS: 7.09032e11 }
+        }
+        return [{ ts: 1700006400000, hashrate_mhs_5m_sum_aggr: 3e11, nominal_hashrate_mhs_sum_aggr: 2.6112e11 }]
+      }
+    }
+  })
+
+  const result = await getHashrate(mockCtx, {
+    query: { start: 1700000000000, end: 1700100000000, nominal: true, siteNominal: true }
+  })
+  t.is(result.log[0].nominalHashrateMhs, 7.5e11, 'the contracted invoice nominal wins')
+  t.is(result.log[0].pctOfNominal, 40)
+  t.pass()
+})
+
+test('getHashrate - siteNominal uses the site nominal when no invoice nominal is configured', async (t) => {
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method) => {
+        if (method === 'getGlobalConfig') return { nominalSiteHashrate_MHS: 7.09032e11 }
+        return [{ ts: 1700006400000, hashrate_mhs_5m_sum_aggr: 3e11, nominal_hashrate_mhs_sum_aggr: 2.6112e11 }]
+      }
+    }
+  })
+
+  const result = await getHashrate(mockCtx, {
+    query: { start: 1700000000000, end: 1700100000000, nominal: true, siteNominal: true }
+  })
+  t.is(result.log[0].nominalHashrateMhs, 7.09032e11, 'existing sites keep the site nominal')
+  t.pass()
+})
+
+test('getHashrate - siteNominal falls back to the installed nominal when the site nominal is unset', async (t) => {
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method) => {
+        if (method === 'getGlobalConfig') return { nominalSiteHashrate_MHS: 0 }
+        return [{ ts: 1700006400000, hashrate_mhs_5m_sum_aggr: 1e11, nominal_hashrate_mhs_sum_aggr: 2e11 }]
+      }
+    }
+  })
+
+  const result = await getHashrate(mockCtx, {
+    query: { start: 1700000000000, end: 1700100000000, nominal: true, siteNominal: true }
+  })
+  t.is(result.log[0].nominalHashrateMhs, 2e11)
+  t.is(result.log[0].pctOfNominal, 50)
   t.pass()
 })
 
@@ -4126,32 +4660,1520 @@ test('getHashrate - grouped results are paged the same way', async (t) => {
   t.pass()
 })
 
-test('rollupMonthly - one bucket per calendar month, energy is the daily sum', (t) => {
+const UTC_MONTHS = { interval: '1M', timezone: 'UTC', start: Date.UTC(2026, 6, 1), end: Date.UTC(2026, 8, 1) - 1 }
+
+test('rollupLocalConsumption - one bucket per calendar month, energy is the hourly sum', (t) => {
   const day = 86400000
   const jul31 = Date.UTC(2026, 6, 31)
-  const daily = [
+  const hourly = [
     { ts: Date.UTC(2026, 6, 1), powerW: 10, consumptionMWh: 0.24 },
     { ts: jul31, powerW: 20, consumptionMWh: 0.48 },
     { ts: jul31 + day, powerW: 30, consumptionMWh: 0.72 }
   ]
 
-  const log = rollupMonthly(daily)
+  const log = rollupLocalConsumption(hourly, UTC_MONTHS)
 
   t.is(log.length, 2, 'July and August, no epoch straddle')
   t.is(log[0].ts, Date.UTC(2026, 6, 1), 'first bucket starts at the calendar month')
   t.is(log[0].timeRange.endTs, Date.UTC(2026, 7, 1) - 1, 'ends at the last ms of the month')
-  t.is(log[0].consumptionMWh, 0.72, 'July energy is the sum of its 2 covered days, not 31 extrapolated')
-  t.is(log[0].powerW, 15, 'power averages over the covered days only')
+  t.is(log[0].consumptionMWh, 0.72, 'July energy is the sum of what it holds, not extrapolated')
+  t.is(log[0].powerW, 15, 'power averages over the reported entries only')
   t.is(log[1].consumptionMWh, 0.72, 'August energy')
+  t.is(log[1].timeRange.endTs, UTC_MONTHS.end, 'the last bucket ends at the requested end')
 })
 
-test('rollupMonthly - per-meter maps roll up meter by meter', (t) => {
-  const log = rollupMonthly([
+test('rollupLocalConsumption - per-meter maps roll up meter by meter', (t) => {
+  const log = rollupLocalConsumption([
     { ts: Date.UTC(2026, 6, 1), powerW: { a: 10, b: 4 }, consumptionMWh: { a: 0.24, b: 0.096 } },
     { ts: Date.UTC(2026, 6, 2), powerW: { a: 20 }, consumptionMWh: { a: 0.48 } }
-  ])
+  ], UTC_MONTHS)
 
   t.is(log.length, 1, 'single month')
   t.alike(log[0].consumptionMWh, { a: 0.72, b: 0.096 }, 'energy summed per meter')
-  t.alike(log[0].powerW, { a: 15, b: 2 }, 'power averaged over the month days')
+  t.alike(log[0].powerW, { a: 15, b: 4 }, 'power averaged over the hours each meter reported')
+})
+
+// ==================== Downtime Tests ====================
+
+const DOWNTIME_HOUR_MS = 60 * 60 * 1000
+const DOWNTIME_DAY_TS = 1700006400000
+
+function downtimeHourRow (hourTs, powerW) {
+  return { ts: `${hourTs}-${hourTs + DOWNTIME_HOUR_MS - 1}`, site_power_w: powerW }
+}
+
+function downtimeCtx ({ powerRows = [], forecast = [], globalConfig, featureConfig, onTailLog } = {}) {
+  return withDataProxy({
+    conf: {
+      orks: [{ rpcPublicKey: 'key1' }],
+      ...(featureConfig && { featureConfig })
+    },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'getGlobalConfig') {
+          return globalConfig ?? { nominalPowerAvailability_MW: 10 }
+        }
+        if (method === 'getWrkExtData') {
+          if (forecast instanceof Error) throw forecast
+          return forecast
+        }
+        if (onTailLog) onTailLog(payload)
+        return powerRows
+      }
+    }
+  })
+}
+
+test('getDowntime - central DCS tails hourly site power from the DCS worker even for interval=1d', async (t) => {
+  let capturedPayload
+  const mockCtx = downtimeCtx({
+    featureConfig: { centralDCSSetup: { enabled: true, tag: 't-dcs-custom' } },
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 5000000)],
+    onTailLog: (payload) => { capturedPayload = payload }
+  })
+
+  await getDowntime(mockCtx, {
+    query: { start: 1700000000000, end: 1700100000000, interval: '1d' }
+  })
+
+  t.is(capturedPayload.type, 'dcs-siemens', 'should tail the DCS worker type')
+  t.is(capturedPayload.tag, 't-dcs-custom', 'should use the configured DCS tag')
+  t.is(capturedPayload.key, 'stat-30m', 'should read the fine-grained stat log')
+  t.is(capturedPayload.groupRange, '1H', 'should bucket hourly regardless of the response interval')
+  t.ok('site_power_w' in capturedPayload.fields, 'should project site_power_w')
+  t.ok('site_power_w' in capturedPayload.aggrFields, 'should aggregate site_power_w')
+  t.pass()
+})
+
+test('getDowntime - non-DCS falls back to the powermeter worker', async (t) => {
+  let capturedPayload
+  const mockCtx = downtimeCtx({
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 5000000)],
+    onTailLog: (payload) => { capturedPayload = payload }
+  })
+
+  await getDowntime(mockCtx, {
+    query: { start: 1700000000000, end: 1700100000000 }
+  })
+
+  t.is(capturedPayload.type, 'powermeter', 'should tail the powermeter worker type')
+  t.is(capturedPayload.tag, 't-powermeter', 'should use the powermeter tag')
+  t.pass()
+})
+
+test('getDowntime - shortfall on a mine hour is an operational issue', async (t) => {
+  const mockCtx = downtimeCtx({
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 6000000)],
+    forecast: [{
+      hourlyForecast: [{ start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, decision: 'mine' }]
+    }]
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  t.is(result.log.length, 1, 'one hourly bucket')
+  t.is(result.log[0].ts, DOWNTIME_DAY_TS, 'bucket start ts')
+  t.alike(result.log[0].timeRange,
+    { startTs: DOWNTIME_DAY_TS, endTs: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS - 1 },
+    'bucket time range')
+  t.is(result.log[0].powerW, 6000000, 'actual power')
+  t.is(result.log[0].nominalPowerW, 10000000, 'nominal power from global config')
+  t.is(result.log[0].downtimeRate, 0.4, '4 MW short of 10 MW nominal')
+  t.is(result.log[0].curtailmentRate, 0, 'no curtailment on a mine hour')
+  t.is(result.log[0].energySoldRate, 0, 'nothing sold on a mine hour')
+  t.is(result.log[0].operationalIssuesRate, 0.4, 'shortfall attributed to op issues')
+  t.is(result.summary.avgDowntimeRate, 0.4, 'summary averages the buckets')
+  t.is(result.summary.hasForecastData, true, 'forecast data was present')
+  t.pass()
+})
+
+test('getDowntime - shortfall on a not_mine hour with available energy is energy sold', async (t) => {
+  const mockCtx = downtimeCtx({
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 6000000)],
+    forecast: [{
+      hourlyForecast: [{ start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, decision: 'not_mine' }]
+    }]
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  t.is(result.log[0].downtimeRate, 0.4, 'same shortfall')
+  t.is(result.log[0].curtailmentRate, 0, 'energy was fully available, so no curtailment')
+  t.is(result.log[0].energySoldRate, 0.4, 'available energy on a not-mining hour is sold')
+  t.is(result.log[0].operationalIssuesRate, 0, 'not an op issue')
+  t.is(result.summary.avgEnergySoldRate, 0.4, 'summary reflects energy sold')
+  t.is(result.summary.avgCurtailmentRate, 0, 'summary reflects no curtailment')
+  t.is(result.summary.avgOperationalIssuesRate, 0, 'summary reflects no op issues')
+  t.pass()
+})
+
+test('getDowntime - power production input drives the curtailment / energy sold split', async (t) => {
+  const hour2 = DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS
+  const hour3 = DOWNTIME_DAY_TS + 2 * DOWNTIME_HOUR_MS
+  const mockCtx = downtimeCtx({
+    powerRows: [
+      downtimeHourRow(DOWNTIME_DAY_TS, 0), // not mining, selling 5 MW
+      downtimeHourRow(hour2, 5000000), // mining on the 5 MW produced
+      downtimeHourRow(hour3, 3000000) // mining on 5 MW available but only 3 MW drawn
+    ],
+    forecast: [{
+      hourlyForecast: [
+        { start: DOWNTIME_DAY_TS, end: hour2, decision: 'not_mine', availableMw: 5, availableEnergy: 1 },
+        { start: hour2, end: hour3, decision: 'mine', availableMw: 5, availableEnergy: 1 },
+        { start: hour3, end: hour3 + DOWNTIME_HOUR_MS, decision: 'mine', availableMw: 5, availableEnergy: 1 }
+      ]
+    }]
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: hour3 + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  const [selling, miningFull, miningShort] = result.log
+
+  t.is(selling.downtimeRate, 1, 'site idle while selling')
+  t.is(selling.curtailmentRate, 0.5, '5 of 10 MW never available')
+  t.is(selling.energySoldRate, 0.5, 'the 5 MW produced went to the grid')
+  t.is(selling.operationalIssuesRate, 0, 'fully explained')
+
+  t.is(miningFull.downtimeRate, 0.5, 'half of nominal drawn')
+  t.is(miningFull.curtailmentRate, 0.5, 'shortfall explained by limited production')
+  t.is(miningFull.energySoldRate, 0, 'nothing sold while mining')
+  t.is(miningFull.operationalIssuesRate, 0, 'no operational gap')
+
+  t.is(miningShort.downtimeRate, 0.7, '7 MW short of nominal')
+  t.is(miningShort.curtailmentRate, 0.5, 'availability explains 5 MW of it')
+  t.ok(Math.abs(miningShort.operationalIssuesRate - 0.4) < 1e-9,
+    '2 of the 5 available MW went unused, as a share of the available energy')
+  t.pass()
+})
+
+test('getDowntime - mine-hour op issues are measured against the available energy, not nominal', async (t) => {
+  const mockCtx = downtimeCtx({
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 10000000)],
+    forecast: [{
+      hourlyForecast: [{
+        start: DOWNTIME_DAY_TS,
+        end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS,
+        decision: 'mine',
+        availableMw: 48,
+        availableEnergy: 1
+      }]
+    }]
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  t.is(result.log[0].downtimeRate, 0, 'site at full nominal draw')
+  t.is(result.log[0].curtailmentRate, 0, 'nothing withheld when more than nominal was available')
+  t.is(result.log[0].energySoldRate, 0, 'nothing sold while mining')
+  t.ok(Math.abs(result.log[0].operationalIssuesRate - 38 / 48) < 1e-9,
+    '38 of the 48 available MWh went unmined')
+  t.pass()
+})
+
+test('getDowntime - zero power production makes the whole shortfall curtailment', async (t) => {
+  const mockCtx = downtimeCtx({
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 0)],
+    forecast: [{
+      hourlyForecast: [{
+        start: DOWNTIME_DAY_TS,
+        end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS,
+        decision: 'not_mine',
+        availableMw: 0,
+        availableEnergy: 0
+      }]
+    }]
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  t.is(result.log[0].downtimeRate, 1, 'site idle')
+  t.is(result.log[0].curtailmentRate, 1, 'no energy available at all')
+  t.is(result.log[0].energySoldRate, 0, 'nothing to sell')
+  t.is(result.log[0].operationalIssuesRate, 0, 'fully explained')
+  t.pass()
+})
+
+test('getDowntime - hour missing from the forecast counts as op issues', async (t) => {
+  const mockCtx = downtimeCtx({
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 6000000)],
+    forecast: [{ hourlyForecast: [] }]
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  t.is(result.log[0].curtailmentRate, 0, 'no forecast entry, so not curtailment')
+  t.is(result.log[0].operationalIssuesRate, 0.4, 'shortfall surfaces as op issues')
+  t.pass()
+})
+
+test('getDowntime - actual above nominal clamps all rates to zero', async (t) => {
+  const mockCtx = downtimeCtx({
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 12000000)]
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  t.is(result.log[0].downtimeRate, 0, 'no downtime when over nominal')
+  t.is(result.log[0].curtailmentRate, 0, 'no curtailment')
+  t.is(result.log[0].operationalIssuesRate, 0, 'no op issues')
+  t.pass()
+})
+
+test('getDowntime - missing nominal power yields null rates but keeps the power series', async (t) => {
+  const mockCtx = downtimeCtx({
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 6000000)],
+    globalConfig: {}
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  t.is(result.log[0].powerW, 6000000, 'power series still served')
+  t.is(result.log[0].nominalPowerW, null, 'nominal unconfigured')
+  t.is(result.log[0].downtimeRate, null, 'rate not computable')
+  t.is(result.log[0].curtailmentRate, null, 'rate not computable')
+  t.is(result.log[0].operationalIssuesRate, null, 'rate not computable')
+  t.is(result.summary.avgDowntimeRate, null, 'summary rate null')
+  t.is(result.summary.nominalPowerW, null, 'summary nominal null')
+  t.pass()
+})
+
+test('getDowntime - falls back to nominalAvailablePowerMWh when the MW key is absent', async (t) => {
+  const mockCtx = downtimeCtx({
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 18000000)],
+    globalConfig: { nominalAvailablePowerMWh: 22.5 }
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  t.is(result.log[0].nominalPowerW, 22500000, 'MWh-per-hour capacity treated as MW')
+  t.is(result.log[0].downtimeRate, 0.2, 'rates computed against the fallback nominal')
+  t.pass()
+})
+
+test('getDowntime - electricity worker failure degrades to op-issues-only attribution', async (t) => {
+  const mockCtx = downtimeCtx({
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 6000000)],
+    forecast: new Error('ERR_NO_ELECTRICITY_WORKER')
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  t.is(result.log[0].curtailmentRate, 0, 'nothing attributed to curtailment')
+  t.is(result.log[0].operationalIssuesRate, 0.4, 'shortfall kept visible as op issues')
+  t.is(result.summary.hasForecastData, false, 'flags that no forecast data was available')
+  t.pass()
+})
+
+test('getDowntime - empty power log returns an empty log and null summary values', async (t) => {
+  const mockCtx = downtimeCtx({ powerRows: [] })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  t.alike(result.log, [], 'no buckets')
+  t.is(result.summary.avgDowntimeRate, null, 'null avg downtime')
+  t.is(result.summary.avgPowerW, null, 'null avg power')
+  t.is(result.summary.minPowerW, null, 'null min power')
+  t.is(result.summary.maxPowerW, null, 'null max power')
+  t.is(result.summary.nominalPowerW, 10000000, 'nominal still reported when configured')
+  t.pass()
+})
+
+test('getDowntime - interval=1d attributes hourly then aggregates per UTC day', async (t) => {
+  const day2 = DOWNTIME_DAY_TS + 24 * DOWNTIME_HOUR_MS
+  const mockCtx = downtimeCtx({
+    powerRows: [
+      downtimeHourRow(DOWNTIME_DAY_TS, 5000000),
+      downtimeHourRow(DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, 10000000),
+      downtimeHourRow(day2, 5000000)
+    ],
+    forecast: [{
+      hourlyForecast: [
+        { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, decision: 'not_mine' },
+        { start: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, end: DOWNTIME_DAY_TS + 2 * DOWNTIME_HOUR_MS, decision: 'mine' },
+        { start: day2, end: day2 + DOWNTIME_HOUR_MS, decision: 'mine' }
+      ]
+    }]
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: day2 + DOWNTIME_HOUR_MS, interval: '1d' }
+  })
+
+  t.is(result.log.length, 2, 'two daily buckets')
+  t.is(result.log[0].ts, DOWNTIME_DAY_TS, 'first day ts')
+  t.alike(result.log[0].timeRange,
+    { startTs: DOWNTIME_DAY_TS, endTs: day2 - 1 },
+    'day-spanning time range')
+  t.is(result.log[0].powerW, 7500000, 'daily power is the mean of the hourly power')
+  t.is(result.log[0].downtimeRate, 0.25, 'mean of 0.5 and 0 hourly downtime')
+  t.is(result.log[0].curtailmentRate, 0, 'energy was available, so nothing curtailed')
+  t.is(result.log[0].energySoldRate, 0.25, 'not-mining-hour shortfall averaged over covered hours')
+  t.is(result.log[0].operationalIssuesRate, 0, 'no op issues on day one')
+  t.is(result.log[1].downtimeRate, 0.5, 'second day from its single covered hour')
+  t.is(result.log[1].operationalIssuesRate, 0.5, 'mine-hour shortfall is op issues')
+  t.is(result.summary.avgDowntimeRate, 0.375, 'summary averages the daily buckets')
+  t.pass()
+})
+
+test('indexForecastDecisionsByHour - availability maps to available power', (t) => {
+  const cases = [
+    { start: DOWNTIME_DAY_TS, decision: 'mine', available: 0 },
+    { start: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, decision: 'mine', available: '0' },
+    { start: DOWNTIME_DAY_TS + 2 * DOWNTIME_HOUR_MS, decision: 'mine', availableEnergy: false },
+    { start: DOWNTIME_DAY_TS + 3 * DOWNTIME_HOUR_MS, decision: 'mine', availableMw: 5.5, availableEnergy: 1 },
+    { start: DOWNTIME_DAY_TS + 4 * DOWNTIME_HOUR_MS, decision: 'mine', available: 1 },
+    { start: DOWNTIME_DAY_TS + 5 * DOWNTIME_HOUR_MS, decision: 'mine', availableMw: 0, availableEnergy: 1 },
+    { start: DOWNTIME_DAY_TS + 6 * DOWNTIME_HOUR_MS, decision: 'not_mine', availableMw: null, availableEnergy: 1 },
+    { start: DOWNTIME_DAY_TS + 7 * DOWNTIME_HOUR_MS, decision: 'wait_prod', availableMw: null },
+    { start: DOWNTIME_DAY_TS + 8 * DOWNTIME_HOUR_MS, decision: 'mine', availableMw: null, availableEnergy: 0 }
+  ]
+  const byHour = indexForecastDecisionsByHour([[{ hourlyForecast: cases }]])
+
+  t.alike(byHour.get(DOWNTIME_DAY_TS), { notMining: false, availableW: 0 }, 'numeric 0 availability means no power')
+  t.alike(byHour.get(DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS), { notMining: false, availableW: 0 }, 'string "0" availability means no power')
+  t.alike(byHour.get(DOWNTIME_DAY_TS + 2 * DOWNTIME_HOUR_MS), { notMining: false, availableW: 0 }, 'availableEnergy false means no power')
+  t.alike(byHour.get(DOWNTIME_DAY_TS + 3 * DOWNTIME_HOUR_MS), { notMining: false, availableW: 5500000 }, 'availableMw carries the exact power')
+  t.alike(byHour.get(DOWNTIME_DAY_TS + 4 * DOWNTIME_HOUR_MS), { notMining: false, availableW: null }, 'legacy yes means full capacity')
+  t.alike(byHour.get(DOWNTIME_DAY_TS + 5 * DOWNTIME_HOUR_MS), { notMining: false, availableW: 0 }, 'an explicit 0 MW input beats the legacy yes')
+  t.alike(byHour.get(DOWNTIME_DAY_TS + 6 * DOWNTIME_HOUR_MS), { notMining: true, availableW: null }, 'availableMw null is no input, the legacy yes stands')
+  t.alike(byHour.get(DOWNTIME_DAY_TS + 7 * DOWNTIME_HOUR_MS), { notMining: true, availableW: null }, 'availableMw null with no legacy flag means full capacity')
+  t.alike(byHour.get(DOWNTIME_DAY_TS + 8 * DOWNTIME_HOUR_MS), { notMining: false, availableW: 0 }, 'availableMw null falls back to a legacy no')
+  t.pass()
+})
+
+test('indexForecastDecisionsByHour - manual mine override wins over a not_mine decision', (t) => {
+  const byHour = indexForecastDecisionsByHour([[{
+    hourlyForecast: [
+      { start: DOWNTIME_DAY_TS, decision: 'not_mine', manualOverrideMine: true },
+      { start: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, decision: 'not_mine', available: 1 }
+    ]
+  }]])
+
+  t.is(byHour.get(DOWNTIME_DAY_TS).notMining, false, 'override forces the hour to count as mining')
+  t.is(byHour.get(DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS).notMining, true, 'without override not_mine stands')
+  t.pass()
+})
+
+test('indexForecastDecisionsByHour - wait statuses count as not mining', (t) => {
+  const byHour = indexForecastDecisionsByHour([[{
+    hourlyForecast: [
+      { start: DOWNTIME_DAY_TS, decision: 'wait_prod' },
+      { start: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, decision: 'wait_spot' },
+      { start: DOWNTIME_DAY_TS + 2 * DOWNTIME_HOUR_MS, decision: 'wait_prod', manualOverrideMine: true }
+    ]
+  }]])
+
+  t.is(byHour.get(DOWNTIME_DAY_TS).notMining, true, 'wait_prod is not a mining hour')
+  t.is(byHour.get(DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS).notMining, true, 'wait_spot is not a mining hour')
+  t.is(byHour.get(DOWNTIME_DAY_TS + 2 * DOWNTIME_HOUR_MS).notMining, false, 'unless overridden to mine')
+  t.pass()
+})
+
+test('getDowntime - available energy on a wait hour counts as energy sold', async (t) => {
+  const mockCtx = downtimeCtx({
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 0)],
+    forecast: [{
+      hourlyForecast: [{
+        start: DOWNTIME_DAY_TS,
+        end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS,
+        decision: 'wait_spot',
+        availableMw: 5,
+        availableEnergy: 1
+      }]
+    }]
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  t.is(result.log[0].curtailmentRate, 0.5, 'unavailable half is curtailment')
+  t.is(result.log[0].energySoldRate, 0.5, 'produced energy on a non-mining hour is sold')
+  t.is(result.log[0].operationalIssuesRate, 0, 'fully explained')
+  t.pass()
+})
+
+test('indexForecastDecisionsByHour - ignores malformed payloads and entries', (t) => {
+  const byHour = indexForecastDecisionsByHour([
+    null,
+    'bogus',
+    [null, { hourlyForecast: 'nope' }, { hourlyForecast: [{ decision: 'mine' }, { start: 'NaN', decision: 'mine' }] }]
+  ])
+
+  t.is(byHour.size, 0, 'nothing indexed from malformed input')
+  t.pass()
+})
+
+test('calculateDowntimeSummary - averages skip null-rate entries', (t) => {
+  const summary = calculateDowntimeSummary([
+    { powerW: 6000000, downtimeRate: 0.4, curtailmentRate: 0.4, energySoldRate: 0.2, operationalIssuesRate: 0 },
+    { powerW: 8000000, downtimeRate: null, curtailmentRate: null, energySoldRate: null, operationalIssuesRate: null }
+  ], 10000000, true)
+
+  t.is(summary.avgDowntimeRate, 0.4, 'null rates excluded from the mean')
+  t.is(summary.avgCurtailmentRate, 0.4, 'null rates excluded from the mean')
+  t.is(summary.avgEnergySoldRate, 0.2, 'null rates excluded from the mean')
+  t.is(summary.avgPowerW, 7000000, 'power averaged over all entries')
+  t.is(summary.minPowerW, 6000000, 'min power')
+  t.is(summary.maxPowerW, 8000000, 'max power')
+  t.is(summary.nominalPowerW, 10000000, 'nominal passed through')
+  t.is(summary.hasForecastData, true, 'forecast flag passed through')
+  t.pass()
+})
+
+test('buildHourlyDowntime + aggregateDowntimeDaily - numeric ts entries fall back to no timeRange', (t) => {
+  const hourly = buildHourlyDowntime(
+    [{ ts: DOWNTIME_DAY_TS, site_power_w: 5000000 }],
+    10000000,
+    new Map()
+  )
+
+  t.is(hourly[0].ts, DOWNTIME_DAY_TS, 'numeric ts parsed')
+  t.absent('timeRange' in hourly[0], 'no timeRange for a numeric source ts')
+  t.is(hourly[0].downtimeRate, 0.5, 'rate still computed')
+
+  const daily = aggregateDowntimeDaily(hourly, 'UTC')
+  t.is(daily.length, 1, 'single day')
+  t.alike(daily[0].timeRange,
+    { startTs: DOWNTIME_DAY_TS, endTs: DOWNTIME_DAY_TS + 24 * DOWNTIME_HOUR_MS - 1 },
+    'daily bucket always carries a timeRange')
+  t.pass()
+})
+
+test('aggregateDowntimeDaily - buckets on local days in the given zone', (t) => {
+  // America/Campo_Grande is UTC-04:00 year-round, so local midnight is 04:00Z.
+  const sep1 = Date.UTC(2026, 8, 1, 4)
+  const hours = [sep1, sep1 + 19 * DOWNTIME_HOUR_MS, sep1 + 20 * DOWNTIME_HOUR_MS, sep1 + 24 * DOWNTIME_HOUR_MS]
+  const hourly = buildHourlyDowntime(hours.map(ts => ({ ts, site_power_w: 5000000 })), 10000000, new Map())
+
+  const daily = aggregateDowntimeDaily(hourly, 'America/Campo_Grande')
+  t.alike(daily.map(d => d.ts), [sep1, sep1 + 24 * DOWNTIME_HOUR_MS],
+    'hours either side of 00:00Z stay in the same local day; 04:00Z starts the next')
+  t.alike(daily[0].timeRange, { startTs: sep1, endTs: sep1 + 24 * DOWNTIME_HOUR_MS - 1 }, 'local day range')
+  t.pass()
+})
+
+// --- interval=1M: calendar-month rollup -------------------------------------
+
+// A fixed -03:00 zone (Etc/GMT+3 is UTC-03:00 - POSIX inverts the sign): whole-hour
+// offset and no DST, so the expected instants below hold whatever the runner's zone is.
+const MONTHLY_TZ = 'Etc/GMT+3'
+const AUG_1_LOCAL = Date.UTC(2026, 7, 1, 3) // 00:00 on Aug 1 locally
+const SEP_1_LOCAL = Date.UTC(2026, 8, 1, 3)
+const HOUR = 3600000
+
+// One hourly bucket per hour of the requested span, so a month's rollup is predictable.
+function monthlyCtx (onRequest = () => {}) {
+  return withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        onRequest(payload)
+        if (method === 'getWrkExtData') return [{ hashrateHistory: [] }]
+        const out = []
+        for (let ts = payload.start; ts < payload.end; ts += HOUR) {
+          out.push({ ts, hashrate_mhs_5m_sum_aggr: 1000, nominal_hashrate_mhs_sum_aggr: 2000 })
+        }
+        return out
+      }
+    }
+  })
+}
+
+test('getHashrate 1M - one row per calendar month in the requested timezone', async (t) => {
+  const result = await getHashrate(monthlyCtx(), {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ, nominal: true }
+  })
+
+  t.is(result.log.length, 1, 'a single local month')
+  t.is(result.log[0].ts, AUG_1_LOCAL, 'stamped at the first bucket of that local month')
+  t.is(result.log[0].hashrateMhs, 1000, 'mean over the month, not a sum')
+  t.is(result.log[0].reportedHours, 744, 'every hour of August reported')
+  t.is(result.totalCount, result.log.length, 'totalCount counts months, not buckets')
+  t.pass()
+})
+
+test('getHashrate 1M - months are cut in the requested zone, not UTC', async (t) => {
+  // 00:00-03:00 UTC on Sep 1 is still August locally, so a UTC-month range spans two.
+  const result = await getHashrate(monthlyCtx(), {
+    query: { start: Date.UTC(2026, 7, 1), end: Date.UTC(2026, 8, 1) - 1, interval: '1M', timezone: MONTHLY_TZ }
+  })
+
+  t.is(result.log.length, 2, 'a UTC August touches two local months')
+  t.pass()
+})
+
+test('getHashrate 1M - without timezone, months are cut in the site lockedTimezone', async (t) => {
+  const ctx = monthlyCtx()
+  ctx.conf.featureConfig.lockedTimezone = MONTHLY_TZ
+  const result = await getHashrate(ctx, {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M' }
+  })
+
+  t.is(result.log.length, 1, 'no stray UTC-month bucket at the edge')
+  t.is(result.log[0].ts, AUG_1_LOCAL, 'stamped at the start of the local month')
+  t.is(result.log[0].reportedHours, 744, 'every hour of local August in the one row')
+  t.pass()
+})
+
+test('getHashrate 1M - a completed month is served from cache on the next request', async (t) => {
+  const spans = []
+  const ctx = monthlyCtx((payload) => { if (payload.start) spans.push([payload.start, payload.end]) })
+  const query = { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ }
+
+  monthlyHashesCache.clear()
+  const first = await getHashrate(ctx, { query })
+  const firstSpans = spans.length
+  const second = await getHashrate(ctx, { query })
+
+  t.ok(firstSpans > 0, 'the first request queries the store')
+  t.is(spans.length, firstSpans, 'the second asks the store for nothing at all')
+  t.alike(second.log, first.log, 'and returns the same rows')
+  t.pass()
+})
+
+test('getHashrate 1M - overwriteCache skips the cached month and stores the fresh rollup', async (t) => {
+  const spans = []
+  const ctx = monthlyCtx((payload) => { if (payload.start) spans.push([payload.start, payload.end]) })
+  const query = { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ }
+
+  monthlyHashesCache.clear()
+  await getHashrate(ctx, { query })
+  const afterFirst = spans.length
+  await getHashrate(ctx, { query: { ...query, overwriteCache: true } })
+  const afterRefresh = spans.length
+  await getHashrate(ctx, { query })
+
+  t.ok(afterRefresh > afterFirst, 'overwriteCache queries the store again')
+  t.is(spans.length, afterRefresh, 'the request after it is served from the refreshed cache')
+  t.pass()
+})
+
+test('getHashrate 1M - the running month is never cached', async (t) => {
+  const spans = []
+  const now = Date.now()
+  const monthStart = new Date(now)
+  monthStart.setUTCDate(1)
+  monthStart.setUTCHours(0, 0, 0, 0)
+  const ctx = monthlyCtx((payload) => { if (payload.start) spans.push(payload.start) })
+  const query = { start: monthStart.getTime(), end: now, interval: '1M', timezone: 'UTC' }
+
+  monthlyHashesCache.clear()
+  await getHashrate(ctx, { query })
+  const afterFirst = spans.length
+  await getHashrate(ctx, { query })
+
+  t.ok(spans.length > afterFirst, 'the month still gaining hours is recomputed every time')
+  t.is(monthlyHashesCache.size, 0, 'and nothing about it is retained')
+  t.pass()
+})
+
+test('getHashrate 1M - a month the site reported nothing for is absent, not zero-filled', async (t) => {
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: { jRequest: async (key, method) => method === 'getWrkExtData' ? [{ hashrateHistory: [] }] : [] }
+  })
+
+  monthlyHashesCache.clear()
+  const result = await getHashrate(ctx, {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ }
+  })
+
+  t.alike(result.log, [], 'no buckets means no month row - the caller knows its own window')
+  t.pass()
+})
+
+test('getHashrate 1M - a completed month with no data stops widening the query span', async (t) => {
+  const spans = []
+  // Data exists only from August; July is silent but completed.
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'getWrkExtData') return [{ hashrateHistory: [] }]
+        spans.push([payload.start, payload.end])
+        const out = []
+        for (let ts = Math.max(payload.start, AUG_1_LOCAL); ts < payload.end; ts += HOUR) {
+          out.push({ ts, hashrate_mhs_5m_sum_aggr: 1000, nominal_hashrate_mhs_sum_aggr: 2000 })
+        }
+        return out
+      }
+    }
+  })
+  const query = {
+    start: Date.UTC(2026, 6, 1, 3), // July 1 locally
+    end: SEP_1_LOCAL - 1,
+    interval: '1M',
+    timezone: MONTHLY_TZ
+  }
+
+  monthlyHashesCache.clear()
+  await getHashrate(ctx, { query })
+  await getHashrate(ctx, { query })
+
+  t.is(spans.length, 1, 'the second request queries nothing: both months are settled')
+  // A silent month produces no row to cache, so without a tombstone it stays missing
+  // and every later request stretches the span back over it.
+  t.is(monthlyHashesCache.size, 2, 'the silent month is remembered as empty, alongside the one with data')
+  t.pass()
+})
+
+test('getHashrate 1M - a cached empty month is not rendered as a row', async (t) => {
+  const ctx = monthlyCtx()
+  const query = { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ }
+
+  monthlyHashesCache.clear()
+  monthlyHashesCache.set(monthlyHashesCache.key('2026-08', MONTHLY_TZ, { nominal: false, pool: false }), null)
+  const result = await getHashrate(ctx, { query })
+
+  t.alike(result.log, [], 'a tombstone reads as "nothing here", not as an empty object')
+  t.pass()
+})
+
+// The generic per-bucket pctOfNominal is miner-based (hashrateMhs / nominalHashrateMhs).
+// Financial reports are pool-only, so the 1M rollup must NOT inherit that: the UI reads
+// this field straight through, and a miner-based month would read far higher than the
+// delivered hashes beside it whenever the pool under-reports.
+test('getHashrate 1M - pctOfNominal follows the pool series, not miner telemetry', async (t) => {
+  const POOL_MHS = 500
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'getWrkExtData') {
+          const samples = []
+          for (let ts = AUG_1_LOCAL; ts < SEP_1_LOCAL; ts += HOUR) {
+            samples.push({ poolType: 'f2pool', username: 'account-a', ts: ts + 60000, hashrate: POOL_MHS * 1e6 })
+          }
+          return [{ hashrateHistory: samples }]
+        }
+        const out = []
+        for (let ts = payload.start; ts < payload.end; ts += HOUR) {
+          // Miner telemetry claims 1000 of 2000 nominal - 50% on the miner basis.
+          out.push({ ts, hashrate_mhs_5m_sum_aggr: 1000, nominal_hashrate_mhs_sum_aggr: 2000 })
+        }
+        return out
+      }
+    }
+  })
+
+  monthlyHashesCache.clear()
+  const result = await getHashrate(ctx, {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ, nominal: true, pool: true }
+  })
+
+  t.is(result.log[0].pctOfNominal, 25, 'pool 500 over nominal 2000, not miner 1000 over 2000')
+  t.is(result.log[0].poolHashrateMhs, POOL_MHS)
+  t.is(result.log[0].nominalHashrateMhs, 2000, 'the month still carries the installed capacity it was measured against')
+  t.is(result.summary.avgPoolHashrateMhs, POOL_MHS, 'and the pool average the other intervals report')
+  t.pass()
+})
+
+// A cache keyed on the month alone would hand a scoped request the site-wide numbers,
+// and keep doing it for the whole TTL - the scope has to be part of the key.
+test('getHashrate 1M - a container-scoped month is not answered with another scope', async (t) => {
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'getWrkExtData') return [{ hashrateHistory: [] }]
+        const out = []
+        for (let ts = payload.start; ts < payload.end; ts += HOUR) {
+          out.push({
+            ts,
+            hashrate_mhs_5m_sum_aggr: 1000,
+            hashrate_mhs_5m_container_group_sum_aggr: { 'container-A': 100, 'container-B': 200 }
+          })
+        }
+        return out
+      }
+    }
+  })
+  const query = { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ }
+
+  monthlyHashesCache.clear()
+  const siteWide = await getHashrate(ctx, { query })
+  const containerA = await getHashrate(ctx, { query: { ...query, container: 'container-A' } })
+  const containerB = await getHashrate(ctx, { query: { ...query, container: 'container-B' } })
+
+  t.is(siteWide.log[0].hashrateMhs, 1000, 'the site-wide month')
+  t.is(containerA.log[0].hashrateMhs, 100, 'a container gets its own numbers, not the cached site-wide ones')
+  t.is(containerB.log[0].hashrateMhs, 200, 'and so does the next one')
+  t.pass()
+})
+
+// A grouped series comes off the daily grouped log, where hashrateMhs is a map and
+// there is no per-hour pool pairing: rolling it into months would produce nulls and
+// an "hours reported" count that is really a day count.
+test('getHashrate 1M - a grouped or rack-scoped request keeps the grouped series', async (t) => {
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async () => [
+        { ts: AUG_1_LOCAL, hashrate_mhs_5m_container_group_sum_aggr: { 'container-A': 100 } }
+      ]
+    }
+  })
+
+  monthlyHashesCache.clear()
+  const grouped = await getHashrate(ctx, {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ, groupBy: 'container' }
+  })
+
+  t.alike(grouped.log[0].hashrateMhs, { 'container-A': 100 }, 'still the grouped map, not a month mean of it')
+
+  const rackCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async () => [
+        { ts: AUG_1_LOCAL, hashrate_mhs_5m_pdu_rack_group_sum_aggr: { 'group-1_1-1': 1000, 'group-2_2-1': 3000 } }
+      ]
+    }
+  })
+  const rackScoped = await getHashrate(rackCtx, {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ, racks: 'group-1_rack-1' }
+  })
+
+  t.is(rackScoped.log[0].hashrateMhs, 1000, 'a rack filter still collapses the rack series to a scalar per bucket')
+  t.is(monthlyHashesCache.size, 0, 'and neither shape reaches the monthly cache')
+  t.pass()
+})
+
+// The first and last month of a range are usually partial. A slice of August is not
+// August: storing one under August's key, or answering an August request with one,
+// silently bills the caller for the hours the slice happened to cover.
+test('getHashrate 1M - a partially covered month is neither cached nor served from cache', async (t) => {
+  const spans = []
+  const ctx = monthlyCtx((payload) => { if (payload.start) spans.push([payload.start, payload.end]) })
+  const halfAugust = { start: AUG_1_LOCAL + 14 * 24 * HOUR, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ }
+
+  monthlyHashesCache.clear()
+  const partial = await getHashrate(ctx, { query: halfAugust })
+
+  t.is(partial.log[0].reportedHours, 17 * 24, 'the slice reports only its own hours')
+  t.is(monthlyHashesCache.size, 0, 'and is not stored as the month')
+
+  const whole = await getHashrate(ctx, { query: { ...halfAugust, start: AUG_1_LOCAL } })
+  t.is(whole.log[0].reportedHours, 744, 'the whole month is computed, not served from the slice')
+  t.is(monthlyHashesCache.size, 1, 'and it is the whole month that gets cached')
+
+  const secondPartial = await getHashrate(ctx, { query: halfAugust })
+  t.is(secondPartial.log[0].reportedHours, 17 * 24, 'a later slice is not answered with the cached whole month')
+  t.is(spans.length, 3, 'each slice is recomputed')
+  t.pass()
+})
+
+test('getHashrate 1M - summary carries the nominal and pool figures the other intervals do', async (t) => {
+  monthlyHashesCache.clear()
+  const result = await getHashrate(monthlyCtx(), {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ, nominal: true }
+  })
+
+  t.is(result.summary.avgHashrateMhs, 1000)
+  t.is(result.summary.nominalHashrateMhs, 2000, 'the installed capacity, not 0')
+  t.is(result.summary.avgPctOfNominal, 50, 'and a percentage, not null')
+  t.pass()
+})
+
+test('getHashrate 1M - an unknown timezone is a named bad request, not a raw Intl throw', async (t) => {
+  monthlyHashesCache.clear()
+  await t.exception(
+    getHashrate(monthlyCtx(), {
+      query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: 'Mars/Olympus_Mons' }
+    }),
+    /ERR_EXPORT_TIMEZONE_INVALID/,
+    'the same error the exports raise for the same input'
+  )
+  t.pass()
+})
+
+// ==================== Pool Hashrate Tests ====================
+
+const FIVE_MIN_MS = 5 * 60 * 1000
+
+test('bucketPoolHashrate - floor-buckets rows and averages per pool', (t) => {
+  const base = 1700000000000 - (1700000000000 % METRICS_TIME.THREE_HOURS_MS)
+  const row = (ts, oceanHs, f2poolHs) => ({
+    ts: String(ts),
+    stats: [
+      { poolType: 'ocean', hashrate: oceanHs },
+      { poolType: 'f2pool', hashrate: f2poolHs }
+    ]
+  })
+
+  const log = bucketPoolHashrate(
+    [[[row(base, 100, 10), row(base + FIVE_MIN_MS, 300, 30), row(base + METRICS_TIME.THREE_HOURS_MS, 500, 50)]]],
+    METRICS_TIME.THREE_HOURS_MS
+  )
+
+  t.is(log.length, 2, 'two buckets')
+  t.is(log[0].ts, base, 'bucket ts is floor-aligned')
+  t.is(log[0].stats.find(s => s.poolType === 'ocean').hashrate, 200, 'ocean averaged within the bucket')
+  t.is(log[0].stats.find(s => s.poolType === 'f2pool').hashrate, 20, 'f2pool averaged within the bucket')
+  t.is(log[1].ts, base + METRICS_TIME.THREE_HOURS_MS)
+  t.is(log[1].stats.find(s => s.poolType === 'ocean').hashrate, 500)
+  t.pass()
+})
+
+test('bucketPoolHashrate - merges rows across orks and windows, sorts ascending', (t) => {
+  const t0 = 1700000000000 - (1700000000000 % FIVE_MIN_MS)
+  const t1 = t0 + FIVE_MIN_MS
+  const windowA = [[{ ts: t1, stats: [{ poolType: 'ocean', hashrate: 400 }] }]]
+  const windowB = [
+    [{ ts: t0, stats: [{ poolType: 'ocean', hashrate: 100 }] }],
+    [{ ts: t0, stats: [{ poolType: 'ocean', hashrate: 300 }] }]
+  ]
+
+  const log = bucketPoolHashrate([windowA, windowB], FIVE_MIN_MS)
+
+  t.is(log.length, 2)
+  t.is(log[0].ts, t0, 'earlier bucket first even though fetched later')
+  t.is(log[0].stats[0].hashrate, 200, 'both orks contribute to the average')
+  t.is(log[1].stats[0].hashrate, 400)
+  t.pass()
+})
+
+test('bucketPoolHashrate - tolerates malformed rows and null hashrates', (t) => {
+  const t0 = 1700000000000 - (1700000000000 % FIVE_MIN_MS)
+  const log = bucketPoolHashrate(
+    [[
+      'not-an-array',
+      [
+        { ts: 'garbage', stats: [{ poolType: 'ocean', hashrate: 100 }] },
+        { ts: t0 },
+        { ts: t0, stats: [{ poolType: 'ocean', hashrate: null }, { hashrate: 5 }] }
+      ]
+    ]],
+    FIVE_MIN_MS
+  )
+
+  t.is(log.length, 1, 'only the parsable row lands')
+  t.alike(log[0].stats, [{ poolType: 'ocean', hashrate: 0 }], 'null hashrate counts as zero, typeless entry dropped')
+  t.pass()
+})
+
+test('bucketPoolHashrate - sums per-account averages within a pool', (t) => {
+  const t0 = 1700000000000 - (1700000000000 % FIVE_MIN_MS)
+  const row = (ts, aHs, bHs) => ({
+    ts: String(ts),
+    stats: [
+      { poolType: 'ocean', username: 'acct-a', hashrate: aHs },
+      { poolType: 'ocean', username: 'acct-b', hashrate: bHs }
+    ]
+  })
+
+  // acct-a avg = 100e12, acct-b avg = 50e12 -> the site hashes 150e12, not the
+  // 75e12 a cross-account average would report.
+  const log = bucketPoolHashrate(
+    [[[row(t0, 100e12, 50e12), row(t0 + 1000, 100e12, 50e12)]]],
+    FIVE_MIN_MS
+  )
+
+  t.is(log.length, 1)
+  t.alike(log[0].stats, [{ poolType: 'ocean', hashrate: 150e12 }])
+  t.pass()
+})
+
+test('bucketPoolHashrate - uneven sample counts still sum account averages', (t) => {
+  const t0 = 1700000000000 - (1700000000000 % FIVE_MIN_MS)
+  const log = bucketPoolHashrate(
+    [[[
+      { ts: t0, stats: [{ poolType: 'ocean', username: 'a', hashrate: 90 }, { poolType: 'ocean', username: 'b', hashrate: 40 }] },
+      { ts: t0 + 1000, stats: [{ poolType: 'ocean', username: 'a', hashrate: 110 }] }
+    ]]],
+    FIVE_MIN_MS
+  )
+
+  t.is(log[0].stats[0].hashrate, 140, 'avg(90,110) + avg(40)')
+  t.pass()
+})
+
+test('getPoolHashrate - queries week-sized stats-history windows with a trimmed projection', async (t) => {
+  const captured = []
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        captured.push(payload)
+        return []
+      }
+    }
+  })
+
+  const result = await getPoolHashrate(mockCtx, { query: { interval: '3h', lookbackDays: 30 } })
+
+  t.alike(result, { log: [] })
+  t.is(captured.length, 5, '30 days split into 5 windows')
+  const spanMs = 30 * METRICS_TIME.ONE_DAY_MS
+  t.ok(captured[0].query.start >= Date.now() - spanMs - 1000, 'window walk starts at the lookback horizon')
+  for (const payload of captured) {
+    t.is(payload.type, 'minerpool')
+    t.is(payload.query.key, 'stats-history')
+    t.ok(payload.query.end - payload.query.start < METRICS_TIME.SEVEN_DAYS_MS, 'window fits in a week')
+    t.alike(payload.query.fields, { ts: 1, 'stats.poolType': 1, 'stats.hashrate': 1, 'stats.username': 1 }, 'only charted fields requested')
+  }
+  for (let i = 1; i < captured.length; i++) {
+    t.is(captured[i].query.start, captured[i - 1].query.end + 1, 'windows do not overlap or leave gaps')
+  }
+  t.pass()
+})
+
+test('getPoolHashrate - returns the bucketed per-pool log', async (t) => {
+  const t0 = Date.now() - (Date.now() % METRICS_TIME.THREE_HOURS_MS) - METRICS_TIME.THREE_HOURS_MS
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (payload.query.start <= t0 && t0 <= payload.query.end) {
+          return [
+            { ts: String(t0), stats: [{ poolType: 'ocean', hashrate: 100 }] },
+            { ts: String(t0 + FIVE_MIN_MS), stats: [{ poolType: 'ocean', hashrate: 300 }] }
+          ]
+        }
+        return []
+      }
+    }
+  })
+
+  const result = await getPoolHashrate(mockCtx, { query: { interval: '3h', lookbackDays: 1 } })
+
+  t.is(result.log.length, 1)
+  t.is(result.log[0].ts, t0)
+  t.alike(result.log[0].stats, [{ poolType: 'ocean', hashrate: 200 }])
+  t.pass()
+})
+
+const PHASE_HOUR_MS = 60 * 60 * 1000
+const PHASE_START = Date.UTC(2026, 9, 1)
+const PHASES_FEATURE = {
+  phases: [
+    { id: 'total', label: 'Total Site' },
+    {
+      id: 'phase1',
+      label: 'Phase 1',
+      pool: { accounts: [{ poolType: 'ocean', username: 'addr1' }] },
+      consumption: { source: 'remainder' },
+      minerTelemetry: true
+    },
+    {
+      id: 'phase1_5',
+      label: 'Phase 1.5',
+      pool: { accounts: [{ poolType: 'ocean', username: 'addr2' }] },
+      consumption: { source: 'manual' },
+      minerTelemetry: false,
+      groups: { minerType: 'HBM', container: 'acme-container' }
+    }
+  ]
+}
+
+function phaseCtx (jRequest, featureConfig = PHASES_FEATURE) {
+  return withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }], ...(featureConfig && { featureConfig }) },
+    net_r0: { jRequest }
+  })
+}
+
+function phaseHistorySamples () {
+  const samples = []
+  for (const username of ['addr1', 'addr2']) {
+    for (let i = 0; i < 4; i++) {
+      samples.push({
+        ts: PHASE_START + i * 15 * 60 * 1000,
+        poolType: 'ocean',
+        username,
+        hashrate: username === 'addr2' ? 5e13 : 6e14
+      })
+    }
+  }
+  return samples
+}
+
+test('getHashrate - rejects unknown or unconfigured phases', async (t) => {
+  const ctx = phaseCtx(async () => [])
+  const query = { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, interval: '1h' }
+
+  await t.exception(() => getHashrate(ctx, { query: { ...query, phase: 'nope' } }), /ERR_PHASE_INVALID/)
+
+  const bare = phaseCtx(async () => [], null)
+  await t.exception(() => getHashrate(bare, { query: { ...query, phase: 'phase1' } }), /ERR_PHASE_INVALID/)
+})
+
+test('getHashrate - pool-only phase serves its accounts from hashrate-history', async (t) => {
+  const calls = []
+  const ctx = phaseCtx(async (key, method, payload) => {
+    calls.push({ method, payload })
+    if (method === 'getWrkExtData') return [{ hashrateHistory: phaseHistorySamples() }]
+    if (method === 'getGlobalConfig') return { phaseNominals: { phase1_5: { nominalHashrate_MHS: 5e7, nominalPower_MW: 0.87, nominalEfficiency_WTHS: 17.2 } } }
+    return []
+  })
+
+  const res = await getHashrate(ctx, {
+    query: {
+      start: PHASE_START,
+      end: PHASE_START + PHASE_HOUR_MS - 1,
+      interval: '1h',
+      phase: 'phase1_5',
+      pool: true,
+      nominal: true
+    }
+  })
+
+  t.is(calls.filter((c) => c.method === 'tailLog').length, 0, 'no miner telemetry query for a pool-only phase')
+  t.is(res.log.length, 1)
+  t.is(res.log[0].hashrateMhs, 5e13 / 1e6, 'only the phase account, averaged, in MH/s')
+  t.is(res.log[0].poolHashrateMhs, res.log[0].hashrateMhs)
+  t.is(res.log[0].nominalHashrateMhs, 5e7)
+  t.is(res.summary.avgPoolHashrateMhs, 5e13 / 1e6)
+})
+
+test('getHashrate - pool-only phase buckets match the requested range, like consumption and efficiency', async (t) => {
+  // Local midnight in a +05:30 zone: on the UTC grid the first day started 5.5h before
+  // `start` and the last one ran 18.5h past `end`.
+  const start = Date.UTC(2026, 8, 30, 18, 30)
+  const end = start + 2 * 24 * PHASE_HOUR_MS - 1
+  const samples = [start + PHASE_HOUR_MS, start + 30 * PHASE_HOUR_MS].map((ts) => ({
+    ts, poolType: 'ocean', username: 'addr2', hashrate: 5e13
+  }))
+  const ctx = phaseCtx(async (key, method) => {
+    if (method === 'getWrkExtData') return [{ hashrateHistory: samples }]
+    return []
+  })
+
+  const daily = await getHashrate(ctx, {
+    query: { start, end, interval: '1d', timezone: 'Asia/Kolkata', phase: 'phase1_5' }
+  })
+
+  t.alike(daily.log.map(({ ts, timeRange }) => ({ ts, timeRange })), [
+    { ts: start, timeRange: { startTs: start, endTs: start + 24 * PHASE_HOUR_MS - 1 } },
+    { ts: start + 24 * PHASE_HOUR_MS, timeRange: { startTs: start + 24 * PHASE_HOUR_MS, endTs: end } }
+  ])
+
+  const hourly = await getHashrate(ctx, {
+    query: { start, end: start + 2 * PHASE_HOUR_MS - 1, interval: '1h', phase: 'phase1_5' }
+  })
+
+  t.alike(hourly.log.map(({ ts, timeRange }) => ({ ts, timeRange })), [
+    { ts: start + PHASE_HOUR_MS / 2, timeRange: { startTs: start + PHASE_HOUR_MS / 2, endTs: start + 1.5 * PHASE_HOUR_MS - 1 } }
+  ], 'whole hours inside the range, each carrying its timeRange')
+})
+
+test('getHashrate - pool overlay on a telemetry phase filters to its accounts', async (t) => {
+  const ctx = phaseCtx(async (key, method, payload) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, hashrate_mhs_5m_sum_aggr: 1e11 }]
+    }
+    if (method === 'getWrkExtData') return [{ hashrateHistory: phaseHistorySamples() }]
+    return []
+  })
+
+  const res = await getHashrate(ctx, {
+    query: {
+      start: PHASE_START,
+      end: PHASE_START + PHASE_HOUR_MS - 1,
+      interval: '1h',
+      phase: 'phase1',
+      pool: true
+    }
+  })
+
+  t.is(res.log[0].hashrateMhs, 1e11, 'telemetry series untouched')
+  t.is(res.log[0].poolHashrateMhs, 6e14 / 1e6, 'pool overlay only counts the phase account')
+})
+
+test('getHashrate - groupBy injects the synthetic pool-only group', async (t) => {
+  const extCalls = []
+  const ctx = phaseCtx(async (key, method, payload) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 2e11 } }]
+    }
+    if (method === 'getWrkExtData') {
+      extCalls.push(payload)
+      return [{ hashrateHistory: phaseHistorySamples() }]
+    }
+    return []
+  })
+
+  const res = await getHashrate(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, interval: '1d', groupBy: 'miner' }
+  })
+
+  t.is(res.log[0].hashrateMhs['miner-wm-m63'], 2e11, 'telemetry groups untouched')
+  t.is(res.log[0].hashrateMhs.HBM, 5e13 / 1e6, 'synthetic group carries the phase pool hashrate')
+  t.ok(res.summary.groupedBy.HBM)
+  t.is(extCalls.length, 1, 'one history read per pool-only phase')
+})
+
+// A site day off UTC: the FE's 1D asks for one local day, which resolves to '1h'.
+const SITE_DAY_START = PHASE_START + 4 * PHASE_HOUR_MS
+const SITE_DAY_END = SITE_DAY_START + 24 * PHASE_HOUR_MS - 1
+const hourTs = (i) => `${SITE_DAY_START + i * PHASE_HOUR_MS}-${SITE_DAY_START + (i + 1) * PHASE_HOUR_MS - 1}`
+
+test('getHashrate - a one-day groupBy reads the hourly buckets of the requested day', async (t) => {
+  let tailPayload = null
+  const ctx = phaseCtx(async (key, method, payload) => {
+    if (method === 'tailLog') {
+      tailPayload = payload
+      return [
+        { ts: hourTs(0), hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 2e11 } },
+        { ts: hourTs(1), hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 4e11 } }
+      ]
+    }
+    return []
+  }, null)
+
+  const res = await getHashrate(ctx, { query: { start: SITE_DAY_START, end: SITE_DAY_END, groupBy: 'miner' } })
+
+  t.is(tailPayload.key, 'stat-30m', 'hourly source, not the UTC daily row')
+  t.is(tailPayload.groupRange, '1H')
+  t.ok(tailPayload.shouldCalculateAvg)
+  t.alike(res.log.map(({ ts }) => ts), [SITE_DAY_START, SITE_DAY_START + PHASE_HOUR_MS])
+  t.alike(res.log[1].timeRange, { startTs: SITE_DAY_START + PHASE_HOUR_MS, endTs: SITE_DAY_START + 2 * PHASE_HOUR_MS - 1 })
+  t.is(res.summary.groupedBy['miner-wm-m63'].avgHashrateMhs, 3e11, 'average over the day\'s hours')
+})
+
+test('getHashrate - a one-day groupBy clamps an hour straddling start into the range', async (t) => {
+  const half = PHASE_HOUR_MS / 2
+  const ctx = phaseCtx(async (key, method) => method === 'tailLog'
+    ? [{ ts: `${SITE_DAY_START - half}-${SITE_DAY_START + half - 1}`, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 2e11 } }]
+    : [], null)
+
+  const res = await getHashrate(ctx, { query: { start: SITE_DAY_START, end: SITE_DAY_END, groupBy: 'miner' } })
+
+  t.is(res.log[0].ts, SITE_DAY_START)
+  t.alike(res.log[0].timeRange, { startTs: SITE_DAY_START, endTs: SITE_DAY_START + half - 1 })
+})
+
+test('getHashrate - a one-day groupBy adds the pool-only group hour by hour', async (t) => {
+  const samples = [
+    { ts: SITE_DAY_START + 10 * 60 * 1000, poolType: 'ocean', username: 'addr2', hashrate: 4e13 },
+    { ts: SITE_DAY_START + PHASE_HOUR_MS + 10 * 60 * 1000, poolType: 'ocean', username: 'addr2', hashrate: 6e13 },
+    { ts: SITE_DAY_START + 10 * 60 * 1000, poolType: 'ocean', username: 'addr1', hashrate: 6e14 }
+  ]
+  for (const [groupBy, aggr, key] of [
+    ['miner', 'hashrate_mhs_5m_type_group_sum_aggr', 'HBM'],
+    ['container', 'hashrate_mhs_5m_container_group_sum_aggr', 'acme-container']
+  ]) {
+    const ctx = phaseCtx(async (k, method, payload) => {
+      if (method === 'tailLog') {
+        // The store as it answers: stat-1D is the UTC day's row, the hourly key the site's hours
+        if (payload.key === 'stat-1D') return [{ ts: PHASE_START + 24 * PHASE_HOUR_MS, [aggr]: { 'group-1': 2e11 } }]
+        return [0, 1, 2].map((i) => ({ ts: hourTs(i), [aggr]: { 'group-1': 2e11 } }))
+      }
+      if (method === 'getWrkExtData') return [{ hashrateHistory: samples }]
+      return []
+    })
+
+    const res = await getHashrate(ctx, { query: { start: SITE_DAY_START, end: SITE_DAY_END, groupBy } })
+
+    t.is(res.log[0].hashrateMhs[key], 4e13 / 1e6, `${key} in the first hour`)
+    t.is(res.log[1].hashrateMhs[key], 6e13 / 1e6, `${key} in the second hour`)
+    t.absent(key in res.log[2].hashrateMhs, `no ${key} for an hour the pool did not report`)
+    t.is(res.summary.groupedBy[key].avgHashrateMhs, 5e13 / 1e6, `${key} averaged over its reported hours`)
+  }
+})
+
+test('getHashrate - groupBy with phase=total injects like a phase-less request', async (t) => {
+  const ctx = phaseCtx(async (key, method) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 2e11 } }]
+    }
+    if (method === 'getWrkExtData') {
+      return [{ hashrateHistory: phaseHistorySamples() }]
+    }
+    return []
+  })
+
+  const res = await getHashrate(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, interval: '1d', groupBy: 'miner', phase: 'total' }
+  })
+
+  t.is(res.log[0].hashrateMhs['miner-wm-m63'], 2e11)
+  t.is(res.log[0].hashrateMhs.HBM, 5e13 / 1e6, 'Total tab lists the phase group too')
+})
+
+test('getHashrate - groupBy with a concrete phase keeps the synthetic group out', async (t) => {
+  const ctx = phaseCtx(async (key, method) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 2e11 } }]
+    }
+    if (method === 'getWrkExtData') {
+      return [{ hashrateHistory: phaseHistorySamples() }]
+    }
+    return []
+  })
+
+  const res = await getHashrate(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, interval: '1d', groupBy: 'miner', phase: 'phase1' }
+  })
+
+  t.alike(Object.keys(res.log[0].hashrateMhs), ['miner-wm-m63'], 'phase-scoped grouped view holds only telemetry keys')
+})
+
+test('getHashrate - groupBy stays untouched without a phases config', async (t) => {
+  let extCalls = 0
+  const ctx = phaseCtx(async (key, method) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 2e11 } }]
+    }
+    extCalls++
+    return []
+  }, null)
+
+  const res = await getHashrate(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, interval: '1d', groupBy: 'miner' }
+  })
+
+  t.alike(Object.keys(res.log[0].hashrateMhs), ['miner-wm-m63'])
+  t.is(extCalls, 0, 'no pool reads when phases are not configured')
+})
+
+test('getPoolHashrate - phase filters stats to the phase accounts', async (t) => {
+  const ctx = phaseCtx(async (key, method, payload) => {
+    if (method === 'getWrkExtData') {
+      return [{
+        ts: Date.now() - 60 * 60 * 1000,
+        stats: [
+          { poolType: 'ocean', username: 'addr1', hashrate: 6e14 },
+          { poolType: 'ocean', username: 'addr2', hashrate: 5e13 }
+        ]
+      }]
+    }
+    return []
+  })
+
+  const scoped = await getPoolHashrate(ctx, { query: { interval: '3h', lookbackDays: 1, phase: 'phase1_5' } })
+  t.is(scoped.log.length, 1)
+  t.alike(scoped.log[0].stats, [{ poolType: 'ocean', hashrate: 5e13 }], 'only the phase account is averaged')
+
+  const site = await getPoolHashrate(ctx, { query: { interval: '3h', lookbackDays: 1 } })
+  t.is(site.log[0].stats[0].hashrate, 6e14 + 5e13, 'site view sums the per-account averages')
+})
+
+const PHASE_DCS_FEATURE = {
+  ...PHASES_FEATURE,
+  centralDCSSetup: { enabled: true },
+  phases: PHASES_FEATURE.phases.map(p => p.id === 'phase1' ? { ...p, consumption: { source: 'remainder', meterKey: 'CCM' } } : p)
+}
+
+// Serves the DCS meter rollup and the manual consumption log for the phase tests.
+function phaseConsumptionCtx ({ meter = [], manual = [], hashrate = [], historicalLogs, onCall } = {}) {
+  return phaseCtx(async (key, method, payload) => {
+    if (onCall) onCall(method, payload)
+    if (method === 'getHistoricalLogs') return historicalLogs ? historicalLogs(payload) : manual
+    if (method === 'tailLog') return payload.type === 'miner' ? hashrate : meter
+    if (method === 'getWrkExtData') return [{ hashrateHistory: phaseHistorySamples() }]
+    return []
+  }, PHASE_DCS_FEATURE)
+}
+
+test('getEfficiency - pool-only phase divides its manual consumption by its pool hashrate', async (t) => {
+  const ctx = phaseConsumptionCtx({ manual: [{ ts: PHASE_START, totalConsumptionMWh: 0.87 }] })
+
+  const res = await getEfficiency(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS - 1, interval: '1h', phase: 'phase1_5' }
+  })
+
+  const expectedThs = (5e13 / 1e6) / 1e6
+  t.is(res.log.length, 1)
+  t.is(res.log[0].efficiencyWThs, 870000 / expectedThs)
+  t.is(res.summary.missingHours, 0)
+})
+
+test('getEfficiency - telemetry phase divides ccm minus manual by the fleet hashrate', async (t) => {
+  const H = PHASE_HOUR_MS
+  const ctx = phaseConsumptionCtx({
+    meter: [
+      { ts: PHASE_START, by_meter_power_w: { ccm: 5000000, 'site-pm': 9000000 } },
+      { ts: PHASE_START + H, by_meter_power_w: { ccm: 4000000 } },
+      { ts: PHASE_START + 2 * H, by_meter_power_w: { ccm: 4000000 } }
+    ],
+    manual: [
+      { ts: PHASE_START, totalConsumptionMWh: 1 },
+      { ts: PHASE_START + H, totalConsumptionMWh: 1 },
+      { ts: PHASE_START + 2 * H, totalConsumptionMWh: 1 }
+    ],
+    // 100 TH/s and 200 TH/s; the third hour has no hashrate sample
+    hashrate: [
+      { ts: `${PHASE_START}-${PHASE_START + H - 1}`, hashrate_mhs_5m_sum_aggr: 1e8 },
+      { ts: `${PHASE_START + H}-${PHASE_START + 2 * H - 1}`, hashrate_mhs_5m_sum_aggr: 2e8 }
+    ]
+  })
+  const query = { start: PHASE_START, end: PHASE_START + 3 * H - 1, phase: 'phase1' }
+
+  const hourly = await getEfficiency(ctx, { query: { ...query, interval: '1h' } })
+  t.alike(hourly.log.map(e => e.efficiencyWThs), [4000000 / 100, 3000000 / 200], '(ccm - manual) W over fleet TH/s')
+  t.is(hourly.summary.missingHours, 1, 'the hour without hashrate is surfaced')
+
+  const daily = await getEfficiency(ctx, { query: { ...query, interval: '1d' } })
+  t.is(daily.log.length, 1)
+  t.is(daily.log[0].efficiencyWThs, 3500000 / 150, 'mean power over mean hashrate, like the site series')
+})
+
+test('getEfficiency - total divides site power by miner plus pool-only phase hashrate', async (t) => {
+  const H = PHASE_HOUR_MS
+  const ctx = phaseCtx(async (key, method, payload) => {
+    if (method === 'tailLog' && payload.type === 'miner') {
+      return [{ ts: `${PHASE_START}-${PHASE_START + H - 1}`, hashrate_mhs_5m_sum_aggr: 6e8 }]
+    }
+    if (method === 'tailLog') return [{ ts: `${PHASE_START}-${PHASE_START + H - 1}`, site_power_w: 13000000 }]
+    if (method === 'getWrkExtData') return [{ hashrateHistory: phaseHistorySamples() }]
+    return []
+  }, PHASE_DCS_FEATURE)
+  const query = { start: PHASE_START, end: PHASE_START + H - 1, interval: '1h' }
+
+  // 600 TH/s of miners + 50 TH/s at addr2 (phase1_5); addr1 belongs to the telemetry phase
+  const total = await getEfficiency(ctx, { query: { ...query, phase: 'total' } })
+  t.is(total.log.length, 1)
+  t.is(total.log[0].efficiencyWThs, 13000000 / 650)
+
+  const plain = await getEfficiency(phaseCtx(async (key, method, payload) => {
+    if (method === 'tailLog' && payload.type === 'miner') {
+      return [{ ts: `${PHASE_START}-${PHASE_START + H - 1}`, hashrate_mhs_5m_sum_aggr: 6e8 }]
+    }
+    if (method === 'tailLog') return [{ ts: `${PHASE_START}-${PHASE_START + H - 1}`, site_power_w: 13000000 }]
+    return []
+  }, { centralDCSSetup: { enabled: true } }), { query })
+  t.is(plain.log[0].efficiencyWThs, 13000000 / 600, 'without phases only the miners count')
+})
+
+test('getConsumption - manual phase reads the logged hours and rolls them up', async (t) => {
+  const calls = []
+  const ctx = phaseConsumptionCtx({
+    manual: [
+      { ts: PHASE_START, totalConsumptionMWh: 1.2, cduConsumptionMWh: 0.1 },
+      { ts: PHASE_START + PHASE_HOUR_MS, totalConsumptionMWh: 0.8 }
+    ],
+    onCall: (method, payload) => calls.push({ method, payload })
+  })
+  const query = { start: PHASE_START, end: PHASE_START + 2 * PHASE_HOUR_MS - 1, phase: 'phase1_5' }
+
+  const hourly = await getConsumption(ctx, { query: { ...query, interval: '1h' } })
+  t.alike(hourly.log.map(e => e.consumptionMWh), [1.2, 0.8])
+  t.alike(hourly.log.map(e => e.powerW), [1200000, 800000], 'an hour of MWh is its average power')
+  t.ok(calls.every(c => c.method === 'getHistoricalLogs'), 'no meter is read for a manual phase')
+  t.is(calls[0].payload.logType, 'consumption')
+
+  const daily = await getConsumption(ctx, { query: { ...query, interval: '1d' } })
+  t.is(daily.log.length, 1)
+  t.is(daily.log[0].consumptionMWh, 2)
+  t.is(daily.log[0].powerW, 1000000)
+  t.is(daily.summary.totalConsumptionMWh, 2)
+  t.is(daily.summary.missingHours, 0)
+})
+
+test('getConsumption - remainder phase is its meter minus the manual hours', async (t) => {
+  const ctx = phaseConsumptionCtx({
+    meter: [
+      { ts: PHASE_START, by_meter_power_w: { ccm: 5000000, 'site-pm': 9000000 } },
+      { ts: PHASE_START + PHASE_HOUR_MS, by_meter_power_w: { ccm: 4000000 } }
+    ],
+    manual: [
+      { ts: PHASE_START, totalConsumptionMWh: 1.5 },
+      { ts: PHASE_START + PHASE_HOUR_MS, totalConsumptionMWh: 1 }
+    ]
+  })
+
+  const res = await getConsumption(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + 2 * PHASE_HOUR_MS - 1, interval: '1h', phase: 'phase1' }
+  })
+
+  t.alike(res.log.map(e => e.consumptionMWh), [3.5, 3], 'configured CCM matches the ccm meter key')
+  t.is(res.summary.totalConsumptionMWh, 6.5)
+})
+
+test('getConsumption - an hour without a manual entry is missing, not zero', async (t) => {
+  const ctx = phaseConsumptionCtx({
+    meter: [
+      { ts: PHASE_START, by_meter_power_w: { ccm: 5000000 } },
+      { ts: PHASE_START + PHASE_HOUR_MS, by_meter_power_w: { ccm: 5000000 } }
+    ],
+    manual: [
+      { ts: PHASE_START, totalConsumptionMWh: 1 },
+      { ts: PHASE_START + PHASE_HOUR_MS, totalConsumptionMWh: null }
+    ]
+  })
+  const query = { start: PHASE_START, end: PHASE_START + 2 * PHASE_HOUR_MS - 1, interval: '1d' }
+
+  const remainder = await getConsumption(ctx, { query: { ...query, phase: 'phase1' } })
+  t.is(remainder.log[0].consumptionMWh, 4, 'the unlogged hour is not counted as the full meter')
+  t.is(remainder.log[0].powerW, 4000000, 'nor averaged in as zero')
+  t.is(remainder.summary.missingHours, 1)
+
+  const manual = await getConsumption(ctx, { query: { ...query, phase: 'phase1_5' } })
+  t.is(manual.summary.totalConsumptionMWh, 1)
+  t.is(manual.summary.missingHours, 1)
+})
+
+test('getConsumption - phase rejects groupBy, byMeter and racks, and needs a usable source', async (t) => {
+  const ctx = phaseConsumptionCtx()
+  const query = { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, phase: 'phase1_5' }
+
+  await t.exception(() => getConsumption(ctx, { query: { ...query, groupBy: 'miner' } }), /ERR_PHASE_NOT_SUPPORTED/)
+  await t.exception(() => getConsumption(ctx, { query: { ...query, byMeter: true } }), /ERR_PHASE_NOT_SUPPORTED/)
+  await t.exception(() => getConsumption(ctx, { query: { ...query, racks: 'r1' } }), /ERR_PHASE_NOT_SUPPORTED/)
+  await t.exception(() => getConsumption(ctx, { query: { ...query, phase: 'nope' } }), /ERR_PHASE_INVALID/)
+
+  // PHASES_FEATURE's remainder phase has no meterKey, and no central DCS
+  const unconfigured = phaseCtx(async () => [])
+  await t.exception(() => getConsumption(unconfigured, { query: { ...query, phase: 'phase1' } }), /ERR_PHASE_CONSUMPTION_UNCONFIGURED/)
+  await t.exception(() => getConsumption(unconfigured, { query }), /ERR_PHASE_CONSUMPTION_REQUIRES_CENTRAL_DCS/)
+})
+
+test('getConsumption/getDowntime - total stays the site view, downtime still rejects a phase', async (t) => {
+  const ctx = phaseCtx(async () => [])
+  const query = { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, phase: 'phase1_5' }
+
+  await t.exception(() => getDowntime(ctx, { query: { ...query, interval: '1h' } }), /ERR_PHASE_NOT_SUPPORTED/)
+
+  const total = await getConsumption(ctx, { query: { ...query, phase: 'total' } })
+  t.ok(total.log, 'phase=total passes through as the site view')
+  t.is(total.summary.missingHours, undefined, 'the site summary shape is unchanged')
+})
+
+test('getHashrate - synthetic group never overwrites a colliding telemetry key', async (t) => {
+  const colliding = {
+    phases: [
+      {
+        id: 'phase1_5',
+        pool: { accounts: [{ poolType: 'ocean', username: 'addr2' }] },
+        minerTelemetry: false,
+        groups: { minerType: 'miner-wm-m63' }
+      }
+    ]
+  }
+  const ctx = phaseCtx(async (key, method) => {
+    if (method === 'tailLog') {
+      return [{ ts: PHASE_START, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-wm-m63': 2e11 } }]
+    }
+    if (method === 'getWrkExtData') return [{ hashrateHistory: phaseHistorySamples() }]
+    return []
+  }, colliding)
+
+  const res = await getHashrate(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, interval: '1d', groupBy: 'miner' }
+  })
+
+  t.is(res.log[0].hashrateMhs['miner-wm-m63'], 2e11, 'telemetry value wins on a key collision')
 })
