@@ -124,6 +124,94 @@ test('AuthLib - resolveToken', async (t) => {
   t.pass()
 })
 
+const additionalIpsAuth = ({ conf, tokenData = { userId: 7, ips: ['10.0.0.1'] }, email = 'ops@company.com' } = {}) => {
+  const calls = { verify: 0, lastActive: [] }
+  const auth = {
+    conf,
+    resolveToken: async (token, ips) => (ips.some(ip => tokenData.ips.includes(ip)) ? tokenData : null),
+    _verifyToken: async (token) => {
+      calls.verify++
+      if (token !== 'good-token') throw new Error('ERR_TOKEN_INVALID')
+      return tokenData
+    },
+    getUserById: async (id) => (id === tokenData.userId ? { id, email } : undefined),
+    updateLastActive: async (id) => { calls.lastActive.push(id) }
+  }
+  return { authLib: new AuthLib({ httpc: {}, httpd: {}, userService: {}, auth }), calls }
+}
+
+test('AuthLib - resolveToken accepts an additional allowed ip for the configured email', async (t) => {
+  const { authLib, calls } = additionalIpsAuth({
+    conf: { additionalAllowedIps: { 'OPS@company.com': ['203.0.113.7'] } }
+  })
+
+  const res = await authLib.resolveToken('good-token', ['203.0.113.7'])
+  t.is(res?.userId, 7, 'token resolves from the extra ip')
+  t.alike(calls.lastActive, [7], 'updates last active')
+})
+
+test('AuthLib - resolveToken still accepts the issuing ip', async (t) => {
+  const { authLib, calls } = additionalIpsAuth({
+    conf: { additionalAllowedIps: { 'ops@company.com': ['203.0.113.7'] } }
+  })
+
+  const res = await authLib.resolveToken('good-token', ['10.0.0.1'])
+  t.is(res?.userId, 7)
+  t.is(calls.verify, 0, 'fallback not used')
+})
+
+test('AuthLib - resolveToken rejects an ip allowlisted for a different email', async (t) => {
+  const { authLib } = additionalIpsAuth({
+    conf: { additionalAllowedIps: { 'other@company.com': ['203.0.113.7'], 'ops@company.com': ['198.51.100.1'] } }
+  })
+
+  t.is(await authLib.resolveToken('good-token', ['203.0.113.7']), null)
+})
+
+test('AuthLib - resolveToken rejects an unlisted ip without looking up the token', async (t) => {
+  const { authLib, calls } = additionalIpsAuth({
+    conf: { additionalAllowedIps: { 'ops@company.com': ['203.0.113.7'] } }
+  })
+
+  t.is(await authLib.resolveToken('good-token', ['192.0.2.9']), null)
+  t.is(calls.verify, 0)
+})
+
+test('AuthLib - resolveToken rejects an invalid token from an allowlisted ip', async (t) => {
+  const { authLib, calls } = additionalIpsAuth({
+    conf: { additionalAllowedIps: { 'ops@company.com': ['203.0.113.7'] } }
+  })
+
+  t.is(await authLib.resolveToken('bad-token', ['203.0.113.7']), null)
+  t.alike(calls.lastActive, [])
+})
+
+test('AuthLib - resolveToken accepts any ip when the email has the "*" wildcard', async (t) => {
+  const { authLib } = additionalIpsAuth({
+    conf: { additionalAllowedIps: { 'ops@company.com': ['*'] } }
+  })
+
+  t.is((await authLib.resolveToken('good-token', ['192.0.2.9']))?.userId, 7)
+  t.is((await authLib.resolveToken('good-token', ['2001:db8::1']))?.userId, 7)
+  t.is(await authLib.resolveToken('bad-token', ['192.0.2.9']), null, 'token must still be valid')
+})
+
+test('AuthLib - "*" wildcard for one email does not extend to other users', async (t) => {
+  const { authLib } = additionalIpsAuth({
+    conf: { additionalAllowedIps: { 'other@company.com': ['*'] } }
+  })
+
+  t.is(await authLib.resolveToken('good-token', ['192.0.2.9']), null)
+})
+
+test('AuthLib - resolveToken without additionalAllowedIps keeps strict ip binding', async (t) => {
+  for (const conf of [undefined, {}, { additionalAllowedIps: [] }, { additionalAllowedIps: { 'ops@company.com': [] } }]) {
+    const { authLib, calls } = additionalIpsAuth({ conf })
+    t.is(await authLib.resolveToken('good-token', ['203.0.113.7']), null)
+    t.is(calls.verify, 0)
+  }
+})
+
 test('AuthLib - getTokenPerms with super admin', async (t) => {
   const mockAuth = {
     getTokenPerms: function (token) {

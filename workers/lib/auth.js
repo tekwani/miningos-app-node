@@ -35,7 +35,52 @@ class AuthLib {
   }
 
   async resolveToken (token, ips) {
-    return await this._auth.resolveToken(token, ips, { updateLastActive: true })
+    const res = await this._auth.resolveToken(token, ips, { updateLastActive: true })
+    if (res) return res
+
+    return await this._resolveTokenFromAdditionalIps(token, ips)
+  }
+
+  _ipAllowed (allowed, ips) {
+    return allowed.has('*') || ips.some(ip => allowed.has(ip))
+  }
+
+  // `additionalAllowedIps` in auth.config.json maps an email to extra ips its tokens are accepted from,
+  // on top of the ip the token was issued to: { "user@company.com": ["203.0.113.7"] }. "*" accepts any ip
+  _getAdditionalAllowedIps () {
+    const map = this._auth.conf?.additionalAllowedIps
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return null
+
+    const byEmail = new Map()
+    for (const [email, ips] of Object.entries(map)) {
+      if (!Array.isArray(ips) || !ips.length) continue
+      byEmail.set(email.trim().toLowerCase(), new Set(ips.filter(ip => typeof ip === 'string').map(ip => ip.trim())))
+    }
+    return byEmail.size ? byEmail : null
+  }
+
+  async _resolveTokenFromAdditionalIps (token, ips) {
+    const byEmail = this._getAdditionalAllowedIps()
+    if (!byEmail) return null
+
+    // skip the token and user lookups unless the request ip is allowlisted for someone
+    const allowedSomewhere = [...byEmail.values()].some(set => this._ipAllowed(set, ips))
+    if (!allowedSomewhere) return null
+
+    let res
+    try {
+      res = await this._auth._verifyToken(token)
+    } catch {
+      return null
+    }
+    if (!res?.userId) return null
+
+    const user = await this._auth.getUserById(res.userId)
+    const allowed = user?.email && byEmail.get(user.email.toLowerCase())
+    if (!allowed || !this._ipAllowed(allowed, ips)) return null
+
+    await this._auth.updateLastActive(res.userId)
+    return res
   }
 
   async getTokenPerms (token) {

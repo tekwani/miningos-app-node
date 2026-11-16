@@ -407,6 +407,7 @@ DEBUG="*" node worker.js --wtype wrk-node-http --env development --port 3000
 **Fields:**
 - `superAdmin`: Email of the super administrator (cannot be modified/deleted)
 - `ttl`: Token time-to-live in seconds (default: 86400 = 24 hours)
+- `additionalAllowedIps`: Optional map of user email to extra IPs that user's tokens are accepted from, regardless of the IP the token was issued to, e.g. `{ "ops@company.com": ["203.0.113.7", "198.51.100.20"] }`. Use `"*"` in the list to accept that user's tokens from any IP. Tokens of emails not listed stay bound to their issuing IP
 - `saltRounds`: BCrypt salt rounds for password hashing
 - `superAdminPerms`: Permissions granted to super administrator
 - `roles`: Role definitions with their associated permissions

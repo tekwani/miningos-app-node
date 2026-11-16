@@ -3,6 +3,7 @@
     "superAdmin": "",
     "ttl": 86400,
     "trustProxy": true,
+    "additionalAllowedIps": {},
     "superAdminPerms": [
       "miner:rw",
       "container:rw",
